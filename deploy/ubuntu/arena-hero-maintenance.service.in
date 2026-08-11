@@ -1,0 +1,9 @@
+[Unit]
+Description=Restart Arena Hero when active and remove old replay logs
+
+[Service]
+Type=oneshot
+# try-restart deliberately leaves a manually stopped tactic stopped.
+ExecStart=-/usr/bin/systemctl try-restart arena-hero.service
+# Keep the checkpoint and heartbeat; remove only session JSONL files older than 48 hours.
+ExecStart=/usr/bin/find @@LOG_DIR@@ -maxdepth 1 -type f -name arena_hero_*.jsonl -mmin +2880 -delete

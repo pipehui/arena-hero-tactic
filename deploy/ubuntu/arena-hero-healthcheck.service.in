@@ -1,0 +1,8 @@
+[Unit]
+Description=Check the Arena Hero tactic heartbeat
+After=arena-hero.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash @@APP_DIR@@/deploy/ubuntu/healthcheck.sh arena-hero.service @@LOG_DIR@@/watchdog/tactic_heartbeat.json 240
+

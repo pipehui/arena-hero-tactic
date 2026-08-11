@@ -1,0 +1,27 @@
+# Credentials and local environment
+key.txt
+.env
+*.env
+!deploy/ubuntu/arena-hero.env.example
+.venv/
+
+# Runtime state and logs
+logs/
+*.log
+*.pid
+
+# Python caches and tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+coverage.xml
+.coverage
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+

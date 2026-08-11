@@ -1,0 +1,1610 @@
+from __future__ import annotations
+
+from collections import Counter
+import math
+import unittest
+
+from arena_hero import (
+    DepositAction,
+    Direction,
+    HealAction,
+    MoveAction,
+    ResolutionEvent,
+    SpawnAction,
+    UnitType,
+    WaitAction,
+)
+
+from arena_tactic import (
+    BalancedTactic,
+    TacticConfig,
+    TacticMemory,
+    ThreatHeatCell,
+    UnitMission,
+)
+from arena_tactic.models import MissionState
+from arena_tactic.geometry import manhattan
+from arena_tactic.planning import weighted_route_to
+from arena_tactic.resource_allocator import minimum_cost_matching
+from arena_tactic.world import build_world_model
+from tests.helpers import enemy_core, friendly_core, make_turn, uid, unit
+
+
+class EconomyAndLogisticsTests(unittest.TestCase):
+    def test_full_storage_workers_leave_service_queue_for_distributed_home_guard(self) -> None:
+        workers = (
+            unit(1, UnitType.WORKER, (0, 0), cargo=1),
+            unit(2, UnitType.WORKER, (1, 0), cargo=1),
+            unit(3, UnitType.WORKER, (-1, 0), cargo=1),
+            unit(4, UnitType.WORKER, (0, 1), cargo=1),
+            unit(5, UnitType.WORKER, (0, -1)),
+        )
+        memory = TacticMemory(opening_complete=True)
+        memory.known_passable.update(
+            (x, y)
+            for x in range(-12, 13)
+            for y in range(-12, 13)
+            if abs(x) + abs(y) <= 12
+        )
+        tactic = BalancedTactic(memory=memory)
+        turn = make_turn(units=workers, resources=25)
+
+        tactic.choose_actions(turn)
+
+        worker_ids = {str(worker.id) for worker in workers}
+        tasks = [
+            task
+            for task in tactic.last_decision_trace["tasks"]
+            if task["actor_id"] in worker_ids
+        ]
+        self.assertTrue(tasks)
+        self.assertTrue(all(task["mission"] == "HOME_GUARD" for task in tasks))
+        self.assertFalse(
+            {
+                "RETURN_CARGO",
+                "DEPOSIT",
+                "HARVEST",
+                "EXPLORE",
+            }
+            & {task["mission"] for task in tasks}
+        )
+        service = tactic.last_decision_trace["economy"]["service_queue"]
+        self.assertEqual(service["admission_id"], None)
+        self.assertEqual(service["depositors"], [])
+        posts = tactic.memory.worker_home_guard_targets
+        self.assertEqual(set(posts), {worker.id for worker in workers})
+        self.assertEqual(len(set(posts.values())), len(workers))
+        self.assertTrue(all(manhattan((0, 0), post) in {6, 8} for post in posts.values()))
+
+    def test_full_storage_home_guard_yields_the_combat_exclusive_area(self) -> None:
+        workers = tuple(
+            unit(index, UnitType.WORKER, (0, 0), cargo=1)
+            for index in range(1, 7)
+        )
+        memory = TacticMemory(opening_complete=True)
+        memory.known_passable.update(
+            (x, y)
+            for x in range(-20, 21)
+            for y in range(-20, 21)
+            if abs(x) + abs(y) <= 20
+        )
+        tactic = BalancedTactic(memory=memory)
+        turn = make_turn(
+            units=workers,
+            enemies=(unit(100, UnitType.RANGER, (0, 20), controlled=False),),
+            resources=30,
+        )
+
+        tactic.choose_actions(turn)
+
+        distances = {
+            manhattan((0, 0), post)
+            for post in tactic.memory.worker_home_guard_targets.values()
+        }
+        self.assertTrue(distances)
+        self.assertTrue(all(distance > tactic.config.combat_exclusive_radius for distance in distances))
+        self.assertFalse(distances & set(tactic.config.peaceful_squad_radii))
+
+    def test_damage_heat_persists_and_decays_after_exact_tracks_expire(self) -> None:
+        worker = unit(1, UnitType.WORKER, (6, 0))
+        enemy = unit(100, UnitType.RANGER, (3, 0), controlled=False)
+        damaged = ResolutionEvent(
+            event_id=uid(90_020),
+            tick=1,
+            event_type="UNIT_DAMAGED",
+            actor_id=worker.id,
+            position=(6, 0),
+        )
+        memory = TacticMemory()
+        first = build_world_model(
+            make_turn(
+                tick=1,
+                units=(worker,),
+                enemies=(enemy,),
+                events=(damaged,),
+            ),
+            memory,
+        )
+        first_heat = dict(first.threat_heat)
+        self.assertEqual(first_heat[(6, 0)], 16)
+
+        later = None
+        for tick in range(2, 9):
+            later = build_world_model(
+                make_turn(tick=tick, units=(worker,), enemies=()),
+                memory,
+            )
+        self.assertIsNotNone(later)
+        self.assertEqual(memory.enemy_tracks, {})
+        self.assertGreater(dict(later.threat_heat).get((6, 0), 0), 0)
+        self.assertEqual(dict(later.danger_cells).get((6, 0), 0), 0)
+        midpoint = build_world_model(
+            make_turn(tick=21, units=(worker,), enemies=()),
+            memory,
+        )
+        self.assertEqual(dict(midpoint.threat_heat)[(6, 0)], 8)
+        expired = build_world_model(
+            make_turn(tick=41, units=(worker,), enemies=()),
+            memory,
+        )
+        self.assertNotIn((6, 0), dict(expired.threat_heat))
+
+    def test_threat_heat_capacity_keeps_only_highest_risk_cells(self) -> None:
+        config = TacticConfig(threat_heat_cell_limit=3)
+        enemy = unit(100, UnitType.RANGER, (3, 0), controlled=False)
+        memory = TacticMemory()
+
+        world = build_world_model(
+            make_turn(enemies=(enemy,)),
+            memory,
+            config,
+        )
+
+        self.assertLessEqual(len(world.threat_heat), 3)
+        self.assertTrue(all(risk == 8 for _, risk in world.threat_heat))
+
+    def test_unit_move_failure_uses_the_previous_destination_not_event_origin(self) -> None:
+        worker = unit(1, UnitType.WORKER, (1, 0))
+        tactic = BalancedTactic()
+        first = make_turn(tick=1, units=(worker,), resources=0)
+        tactic.choose_actions(first)
+        action = first.plan.unit_actions[worker.id]
+        self.assertIsInstance(action, MoveAction)
+        destination = (
+            worker.position[0] + action.direction.delta[0],
+            worker.position[1] + action.direction.delta[1],
+        )
+        event = ResolutionEvent(
+            event_id=uid(90_010),
+            tick=1,
+            event_type="UNIT_MOVE_FAILED",
+            actor_id=worker.id,
+            position=worker.position,
+            reason_code="MOVE_CONTESTED",
+        )
+
+        second_turn = make_turn(
+            tick=2,
+            units=(worker,),
+            resources=0,
+            events=(event,),
+        )
+        tactic.choose_actions(second_turn)
+
+        failure = tactic.memory.failed_unit_moves[worker.id]
+        self.assertEqual(failure.destination, destination)
+        second = second_turn.plan.unit_actions.get(worker.id)
+        self.assertFalse(
+            isinstance(second, MoveAction) and second.direction is action.direction
+        )
+
+    def test_weighted_route_prefers_a_longer_safe_path(self) -> None:
+        worker = unit(1, UnitType.WORKER, (0, 0))
+        world = build_world_model(
+            make_turn(
+                core=friendly_core(position=(10, 10)),
+                units=(worker,),
+                resources=0,
+            )
+        )
+
+        route = weighted_route_to(
+            world,
+            worker.position,
+            (2, 0),
+            node_limit=128,
+            cell_costs={(1, 0): 100},
+        )
+
+        self.assertIsNotNone(route)
+        self.assertNotEqual(route.first_direction, Direction.RIGHT)
+
+    def test_opening_builds_four_workers_then_vanguard_then_ranger(self) -> None:
+        tactic = BalancedTactic()
+        two_workers = (
+            unit(1, UnitType.WORKER, (1, 0)),
+            unit(2, UnitType.WORKER, (-1, 0)),
+        )
+        first = make_turn(units=two_workers, resources=5)
+        tactic.choose_actions(first)
+        self.assertEqual(first.plan.core_action.unit_type, UnitType.WORKER)
+
+        three_workers = (*two_workers, unit(3, UnitType.WORKER, (0, 1)))
+        second = make_turn(tick=2, units=three_workers, resources=5)
+        tactic.choose_actions(second)
+        self.assertEqual(second.plan.core_action.unit_type, UnitType.WORKER)
+
+        four_workers = (*three_workers, unit(4, UnitType.WORKER, (0, -1)))
+        third = make_turn(tick=3, units=four_workers, resources=10)
+        tactic.choose_actions(third)
+        self.assertEqual(third.plan.core_action.unit_type, UnitType.VANGUARD)
+
+        with_vanguard = (*four_workers, unit(5, UnitType.VANGUARD, (2, 0)))
+        fourth = make_turn(tick=4, units=with_vanguard, resources=12)
+        tactic.choose_actions(fourth)
+        self.assertEqual(fourth.plan.core_action.unit_type, UnitType.RANGER)
+
+    def test_visible_combat_threat_interrupts_worker_bootstrap(self) -> None:
+        workers = (
+            unit(1, UnitType.WORKER, (1, 0)),
+            unit(2, UnitType.WORKER, (-1, 0)),
+        )
+        enemy = unit(100, UnitType.VANGUARD, (3, 0), controlled=False)
+        turn = make_turn(units=workers, enemies=(enemy,), resources=10)
+
+        BalancedTactic().choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.core_action, SpawnAction)
+        self.assertEqual(turn.plan.core_action.unit_type, UnitType.VANGUARD)
+
+    def test_worker_target_is_population_half_rounded_up(self) -> None:
+        units = tuple(
+            unit(index, UnitType.WORKER if index <= 5 else UnitType.VANGUARD, (index, 0))
+            for index in range(1, 12)
+        )
+        tactic = BalancedTactic()
+        tactic.choose_actions(make_turn(units=units, resources=0))
+
+        self.assertEqual(tactic.last_decision_trace["economy"]["worker_target"], math.ceil(11 / 2))
+
+    def test_post_25_normal_production_is_worker_after_home_force_is_met(self) -> None:
+        units = tuple(
+            [unit(i, UnitType.WORKER, (20 + i, 0)) for i in range(1, 14)]
+            + [unit(100 + i, UnitType.VANGUARD, (i, 5)) for i in range(1, 7)]
+            + [unit(200 + i, UnitType.RANGER, (i, -5)) for i in range(1, 7)]
+        )
+        turn = make_turn(units=units, resources=8)
+
+        BalancedTactic(memory=TacticMemory(opening_complete=True)).choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.core_action, SpawnAction)
+        self.assertEqual(turn.plan.core_action.unit_type, UnitType.WORKER)
+
+    def test_population_35_stockpiles_instead_of_spawning_another_worker(self) -> None:
+        units = tuple(
+            [unit(i, UnitType.WORKER, (20 + i, 0)) for i in range(1, 24)]
+            + [unit(100 + i, UnitType.VANGUARD, (i, 5)) for i in range(1, 7)]
+            + [unit(200 + i, UnitType.RANGER, (i, -5)) for i in range(1, 7)]
+        )
+        turn = make_turn(units=units, resources=100)
+        tactic = BalancedTactic(memory=TacticMemory(opening_complete=True))
+
+        tactic.choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.core_action, WaitAction)
+        candidates = tactic.last_decision_trace["economy"]["production_candidates"]
+        self.assertFalse(any(item.get("selected") for item in candidates))
+        self.assertEqual(
+            {item["reason"] for item in candidates},
+            {"POPULATION_STOCKPILE"},
+        )
+
+    def test_cargo_on_stationary_core_always_deposits(self) -> None:
+        carrier = unit(1, UnitType.WORKER, (0, 0), cargo=1)
+        turn = make_turn(units=(carrier,), resources=0)
+
+        BalancedTactic().choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.unit_actions[carrier.id], DepositAction)
+
+    def test_delivery_admission_remains_stable(self) -> None:
+        tactic = BalancedTactic()
+        carriers = (
+            unit(1, UnitType.WORKER, (2, 0), cargo=1),
+            unit(2, UnitType.WORKER, (1, 1), cargo=1),
+        )
+        first = make_turn(units=carriers, resources=0)
+        tactic.choose_actions(first)
+        admitted = tactic.last_decision_trace["economy"]["service_queue"]["admission_id"]
+
+        second = make_turn(tick=2, units=carriers, resources=0)
+        tactic.choose_actions(second)
+
+        self.assertEqual(
+            tactic.last_decision_trace["economy"]["service_queue"]["admission_id"],
+            admitted,
+        )
+
+    def test_remote_old_cargo_does_not_block_a_ready_worker(self) -> None:
+        far = unit(1, UnitType.WORKER, (5, 0), cargo=1)
+        ready = unit(2, UnitType.WORKER, (0, 2), cargo=1)
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            service_admission_id=far.id,
+            service_kind="DEPOSIT",
+            service_entrance=(0, 1),
+            service_queue_cells=((0, 1), (0, 2)),
+            service_exit_cell=(0, -1),
+            cargo_arrival_ticks={far.id: 1, ready.id: 2},
+        )
+        turn = make_turn(
+            tick=3,
+            core=friendly_core(position=(0, 0)),
+            units=(far, ready),
+            resources=0,
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(turn)
+
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        self.assertEqual(queue["admission_id"], str(ready.id))
+        self.assertIsInstance(turn.plan.unit_actions[ready.id], MoveAction)
+        self.assertEqual(turn.plan.unit_actions[ready.id].direction, Direction.UP)
+
+    def test_front_of_lane_clears_before_an_older_outer_worker(self) -> None:
+        older_outer = unit(1, UnitType.WORKER, (0, 2), cargo=1)
+        front = unit(2, UnitType.WORKER, (0, 1), cargo=1)
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            service_admission_id=older_outer.id,
+            service_kind="DEPOSIT",
+            service_entrance=(0, 1),
+            service_queue_cells=((0, 1), (0, 2)),
+            service_exit_cell=(0, -1),
+            cargo_arrival_ticks={older_outer.id: 1, front.id: 2},
+        )
+        turn = make_turn(
+            tick=3,
+            core=friendly_core(position=(0, 0)),
+            units=(older_outer, front),
+            resources=0,
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(turn)
+
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        self.assertEqual(queue["admission_id"], str(front.id))
+        self.assertEqual(turn.plan.unit_actions[front.id].direction, Direction.UP)
+
+    def test_ready_queue_advances_as_a_single_tick_pipeline(self) -> None:
+        front = unit(1, UnitType.WORKER, (0, 1), cargo=1)
+        outer = unit(2, UnitType.WORKER, (0, 2), cargo=1)
+        approaching = unit(3, UnitType.WORKER, (0, 3), cargo=1)
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            service_admission_id=front.id,
+            service_kind="DEPOSIT",
+            service_entrance=(0, 1),
+            service_queue_cells=((0, 1), (0, 2)),
+            service_exit_cell=(0, -1),
+            cargo_arrival_ticks={front.id: 1, outer.id: 2},
+        )
+        turn = make_turn(
+            tick=3,
+            core=friendly_core(position=(0, 0)),
+            units=(front, outer, approaching),
+            resources=0,
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(turn)
+
+        for worker in (front, outer, approaching):
+            self.assertIsInstance(turn.plan.unit_actions[worker.id], MoveAction)
+            self.assertEqual(turn.plan.unit_actions[worker.id].direction, Direction.UP)
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        self.assertEqual(queue["ready_depositors"], [str(front.id), str(outer.id)])
+        self.assertEqual(queue["approaching_depositors"], [str(approaching.id)])
+
+    def test_blocked_pipeline_wait_keeps_its_service_reason(self) -> None:
+        depositing = unit(1, UnitType.WORKER, (0, 0), cargo=1)
+        front = unit(2, UnitType.WORKER, (0, 1), cargo=1)
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            service_admission_id=front.id,
+            service_kind="DEPOSIT",
+            service_entrance=(0, 1),
+            service_queue_cells=((0, 1), (0, 2)),
+            service_exit_cell=(0, -1),
+            cargo_arrival_ticks={front.id: 1},
+        )
+        turn = make_turn(units=(depositing, front), resources=0)
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.unit_actions[front.id], WaitAction)
+        task = next(
+            item
+            for item in tactic.last_decision_trace["tasks"]
+            if item["actor_id"] == str(front.id)
+        )
+        self.assertEqual(task["mission"], "RETURN_CARGO")
+        self.assertEqual(task["reason"], "WAITING_FOR_CORE_SLOT")
+
+    def test_remote_carrier_approaches_the_outer_slot_without_cutting_the_line(self) -> None:
+        carrier = unit(1, UnitType.WORKER, (0, -2), cargo=1)
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            service_entrance=(0, 1),
+            service_queue_cells=((0, 1), (0, 2)),
+            service_exit_cell=(0, -1),
+        )
+        turn = make_turn(
+            tick=2,
+            core=friendly_core(position=(0, 0)),
+            units=(carrier,),
+            resources=0,
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(turn)
+
+        action = turn.plan.unit_actions[carrier.id]
+        self.assertIsInstance(action, MoveAction)
+        self.assertIn(action.direction, {Direction.LEFT, Direction.RIGHT})
+
+    def test_side_adjacent_carrier_funds_urgent_recovery_without_joining_lane(self) -> None:
+        first = unit(1, UnitType.WORKER, (0, -1), cargo=1)
+        second = unit(2, UnitType.WORKER, (0, -1), cargo=1)
+        patient = unit(3, UnitType.RANGER, (3, -1), hp=1)
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            service_entrance=(1, 0),
+            service_queue_cells=((1, 0), (2, 0)),
+            service_exit_cell=(-1, 0),
+        )
+        turn = make_turn(
+            tick=20,
+            core=friendly_core(position=(0, 0)),
+            units=(first, second, patient),
+            resources=0,
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(turn)
+
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        self.assertEqual(queue["service"], "HEAL_FUNDING")
+        self.assertEqual(queue["admission_id"], str(first.id))
+        action = turn.plan.unit_actions[first.id]
+        self.assertIsInstance(action, MoveAction)
+        self.assertEqual(action.direction, Direction.DOWN)
+
+    def test_dead_end_persisted_lane_is_replanned_before_cargo_return(self) -> None:
+        carrier = unit(1, UnitType.WORKER, (4, 0), cargo=1)
+        stale_lane = ((0, 1), (0, 2))
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            service_entrance=stale_lane[0],
+            service_queue_cells=stale_lane,
+            service_exit_cell=(0, -1),
+        )
+        turn = make_turn(
+            tick=2,
+            core=friendly_core(position=(0, 0)),
+            units=(carrier,),
+            resources=0,
+            # The outer slot is a cul-de-sac: it is locally valid terrain but
+            # can only be entered through the protected inner queue cell.
+            obstacle_cells=((-1, 2), (1, 2), (0, 3)),
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(turn)
+
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        self.assertNotEqual(queue["queue_cells"], [list(cell) for cell in stale_lane])
+        self.assertIsInstance(turn.plan.unit_actions[carrier.id], MoveAction)
+        task = next(
+            item
+            for item in tactic.last_decision_trace["tasks"]
+            if item["actor_id"] == str(carrier.id)
+        )
+        self.assertNotEqual(task["reason"], "NO_RETURN_ROUTE")
+
+    def test_service_lane_change_restarts_ready_tick(self) -> None:
+        carrier = unit(1, UnitType.WORKER, (1, 0), cargo=1)
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            service_admission_id=carrier.id,
+            service_kind="DEPOSIT",
+            service_entrance=(0, 1),
+            service_queue_cells=((0, 1), (0, 2)),
+            service_exit_cell=(0, -1),
+            cargo_arrival_ticks={carrier.id: 1},
+        )
+        turn = make_turn(
+            tick=20,
+            core=friendly_core(position=(0, 0)),
+            units=(carrier,),
+            resources=0,
+            obstacle_cells=((0, 1),),
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(turn)
+
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        ready_ticks = {
+            item["worker_id"]: item["tick"] for item in queue["ready_ticks"]
+        }
+        self.assertEqual(ready_ticks[str(carrier.id)], 20)
+
+    def test_manual_position_change_releases_ready_admission(self) -> None:
+        first = unit(1, UnitType.WORKER, (0, 1), cargo=1)
+        second = unit(2, UnitType.WORKER, (0, 2), cargo=1)
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            service_admission_id=first.id,
+            service_kind="DEPOSIT",
+            service_entrance=(0, 1),
+            service_queue_cells=((0, 1), (0, 2)),
+            service_exit_cell=(0, -1),
+            cargo_arrival_ticks={first.id: 1, second.id: 2},
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(
+            make_turn(
+                tick=3,
+                units=(unit(1, UnitType.WORKER, (5, 0), cargo=1), second),
+                resources=0,
+            )
+        )
+
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        self.assertEqual(queue["admission_id"], str(second.id))
+        self.assertEqual(queue["release_reason"], "LEFT_READY_LINE")
+
+    def test_moving_core_clears_ready_fifo(self) -> None:
+        carrier = unit(1, UnitType.WORKER, (1, 0), cargo=1)
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            service_admission_id=carrier.id,
+            service_kind="DEPOSIT",
+            service_entrance=(1, 0),
+            service_queue_cells=((1, 0), (2, 0)),
+            service_exit_cell=(-1, 0),
+            cargo_arrival_ticks={carrier.id: 1},
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(
+            make_turn(
+                tick=4,
+                core=friendly_core(position=(0, 0), moving=True),
+                units=(carrier,),
+                resources=0,
+            )
+        )
+
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        self.assertIsNone(queue["admission_id"])
+        self.assertEqual(tactic.memory.cargo_arrival_ticks, {})
+
+    def test_cargo_routes_around_a_visible_enemy_core(self) -> None:
+        carrier = unit(1, UnitType.WORKER, (0, -2), cargo=1)
+        blocking_core = enemy_core(99, (0, -1))
+        turn = make_turn(
+            tick=1,
+            units=(carrier,),
+            enemies=(blocking_core,),
+            resources=0,
+        )
+        tactic = BalancedTactic()
+
+        tactic.choose_actions(turn)
+
+        action = turn.plan.unit_actions[carrier.id]
+        self.assertIsInstance(action, MoveAction)
+        self.assertIn(action.direction, {Direction.LEFT, Direction.RIGHT})
+
+    def test_resource_distance_field_routes_around_visible_enemy_occupancy(self) -> None:
+        worker = unit(1, UnitType.WORKER, (0, -2))
+        blocking_core = enemy_core(99, (0, -1))
+        turn = make_turn(
+            units=(worker,),
+            enemies=(blocking_core,),
+            resources=0,
+            resource_cells=((0, 2),),
+        )
+
+        BalancedTactic().choose_actions(turn)
+
+        action = turn.plan.unit_actions[worker.id]
+        self.assertIsInstance(action, MoveAction)
+        self.assertIn(action.direction, {Direction.LEFT, Direction.RIGHT})
+
+    def test_empty_worker_exits_as_the_next_carrier_enters_core(self) -> None:
+        empty = unit(1, UnitType.WORKER, (0, 0))
+        carrier = unit(2, UnitType.WORKER, (0, 1), cargo=1)
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            service_admission_id=carrier.id,
+            service_kind="DEPOSIT",
+            service_entrance=(0, 1),
+            service_queue_cells=((0, 1), (0, 2)),
+            service_exit_cell=(0, -1),
+            cargo_arrival_ticks={carrier.id: 1},
+        )
+        turn = make_turn(
+            tick=2,
+            core=friendly_core(position=(0, 0)),
+            units=(empty, carrier),
+            resources=0,
+            obstacle_cells=((-1, 0), (1, 0)),
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(turn)
+
+        empty_action = turn.plan.unit_actions[empty.id]
+        carrier_action = turn.plan.unit_actions[carrier.id]
+        self.assertIsInstance(empty_action, MoveAction)
+        self.assertEqual(empty_action.direction, Direction.UP)
+        self.assertIsInstance(carrier_action, MoveAction)
+        self.assertEqual(carrier_action.direction, Direction.UP)
+
+    def test_narrow_core_corridor_allows_only_the_service_handoff_swap(self) -> None:
+        empty = unit(1, UnitType.WORKER, (0, 0))
+        carrier = unit(2, UnitType.WORKER, (1, 0), cargo=1)
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            service_admission_id=carrier.id,
+            service_kind="DEPOSIT",
+            service_entrance=(1, 0),
+            service_queue_cells=((1, 0), (2, 0)),
+            service_exit_cell=(1, 0),
+            cargo_arrival_ticks={carrier.id: 1},
+        )
+        turn = make_turn(
+            tick=2,
+            units=(empty, carrier),
+            resources=0,
+            obstacle_cells=((-1, 0), (0, -1), (0, 1)),
+        )
+
+        BalancedTactic(memory=memory).choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.unit_actions[empty.id], MoveAction)
+        self.assertEqual(turn.plan.unit_actions[empty.id].direction, Direction.RIGHT)
+        self.assertIsInstance(turn.plan.unit_actions[carrier.id], MoveAction)
+        self.assertEqual(turn.plan.unit_actions[carrier.id].direction, Direction.LEFT)
+
+    def test_clear_core_worker_does_not_swap_with_an_exploring_worker(self) -> None:
+        clearing = unit(1, UnitType.WORKER, (0, 0))
+        exploring = unit(2, UnitType.WORKER, (1, 0))
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            service_entrance=(0, -1),
+            service_queue_cells=((0, -1), (0, -2)),
+            service_exit_cell=(1, 0),
+            unit_missions={
+                exploring.id: MissionState(UnitMission.EXPLORE, (-6, 0), 1)
+            },
+        )
+        memory.known_passable.update((x, 0) for x in range(-6, 2))
+        turn = make_turn(
+            tick=2,
+            units=(clearing, exploring),
+            resources=0,
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(turn)
+
+        clearing_action = turn.plan.unit_actions[clearing.id]
+        exploring_action = turn.plan.unit_actions[exploring.id]
+        self.assertIsInstance(clearing_action, MoveAction)
+        clear_dx, clear_dy = clearing_action.direction.delta
+        clearing_destination = (
+            clearing.position[0] + clear_dx,
+            clearing.position[1] + clear_dy,
+        )
+        exploring_destination = exploring.position
+        if isinstance(exploring_action, MoveAction):
+            explore_dx, explore_dy = exploring_action.direction.delta
+            exploring_destination = (
+                exploring.position[0] + explore_dx,
+                exploring.position[1] + explore_dy,
+            )
+        self.assertNotEqual(clearing_destination, clearing.position)
+        self.assertFalse(
+            clearing_destination == exploring.position
+            and exploring_destination == clearing.position,
+            "CLEAR_CORE and ordinary exploration must not exchange cells",
+        )
+
+    def test_empty_worker_reports_a_blocked_core_exit(self) -> None:
+        empty = unit(1, UnitType.WORKER, (0, 0))
+        turn = make_turn(
+            units=(empty,),
+            resources=0,
+            obstacle_cells=((-1, 0), (1, 0), (0, -1), (0, 1)),
+        )
+        tactic = BalancedTactic()
+
+        tactic.choose_actions(turn)
+
+        task = next(
+            item
+            for item in tactic.last_decision_trace["tasks"]
+            if item["actor_id"] == str(empty.id)
+        )
+        self.assertEqual(task["mission"], "CLEAR_CORE")
+        self.assertEqual(task["reason"], "CORE_EXIT_BLOCKED")
+
+    def test_four_readying_carriers_finish_within_ten_ticks(self) -> None:
+        positions = {1: (0, 1), 2: (0, 2), 3: (1, 3), 4: (-1, 3)}
+        cargo = {identifier: 1 for identifier in positions}
+        resources = 0
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            service_entrance=(0, 1),
+            service_queue_cells=((0, 1), (0, 2)),
+            service_exit_cell=(0, -1),
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        for tick in range(1, 11):
+            workers = tuple(
+                unit(
+                    identifier,
+                    UnitType.WORKER,
+                    positions[identifier],
+                    cargo=cargo[identifier],
+                )
+                for identifier in sorted(positions)
+            )
+            turn = make_turn(tick=tick, units=workers, resources=resources)
+            tactic.choose_actions(turn)
+            prior_positions = dict(positions)
+            for identifier in sorted(positions):
+                action = turn.plan.unit_actions[uid(identifier)]
+                if isinstance(action, MoveAction):
+                    dx, dy = action.direction.delta
+                    x, y = prior_positions[identifier]
+                    positions[identifier] = (x + dx, y + dy)
+                elif isinstance(action, DepositAction):
+                    cargo[identifier] = 0
+                    resources += 1
+            if not any(cargo.values()):
+                break
+
+        self.assertEqual(cargo, {1: 0, 2: 0, 3: 0, 4: 0})
+        self.assertLessEqual(tick, 10)
+
+    def test_full_core_does_not_repeat_a_failed_deposit(self) -> None:
+        carrier = unit(1, UnitType.WORKER, (0, 0), cargo=1)
+        turn = make_turn(units=(carrier,), resources=10)
+
+        BalancedTactic().choose_actions(turn)
+
+        self.assertNotIsInstance(turn.plan.unit_actions[carrier.id], DepositAction)
+        self.assertIsInstance(turn.plan.unit_actions[carrier.id], MoveAction)
+
+    def test_unit_can_leave_core_and_free_same_tick_spawn_slot(self) -> None:
+        workers = (
+            unit(1, UnitType.WORKER, (0, 0)),
+            unit(2, UnitType.WORKER, (2, 0)),
+            unit(3, UnitType.WORKER, (0, 2)),
+            unit(4, UnitType.WORKER, (-2, 0)),
+        )
+        turn = make_turn(units=workers, resources=10)
+
+        BalancedTactic().choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.unit_actions[workers[0].id], MoveAction)
+        self.assertIsInstance(turn.plan.core_action, SpawnAction)
+        self.assertEqual(turn.plan.core_action.unit_type, UnitType.VANGUARD)
+
+    def test_combat_unit_releases_core_for_ready_carrier_same_tick(self) -> None:
+        carrier = unit(1, UnitType.WORKER, (0, -1), cargo=1)
+        ranger = unit(2, UnitType.RANGER, (0, 0))
+        turn = make_turn(
+            units=(carrier, ranger),
+            resources=0,
+            obstacle_cells=((-1, 0), (0, 1)),
+        )
+        tactic = BalancedTactic()
+
+        tactic.choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.unit_actions[ranger.id], MoveAction)
+        self.assertEqual(turn.plan.unit_actions[ranger.id].direction, Direction.RIGHT)
+        self.assertIsInstance(turn.plan.unit_actions[carrier.id], MoveAction)
+
+    def test_safe_core_cargo_deposits_before_urgent_patient_enters(self) -> None:
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            service_entrance=(1, 0),
+            service_queue_cells=((1, 0), (2, 0)),
+            service_exit_cell=(-1, 0),
+        )
+        carrier = unit(1, UnitType.WORKER, (0, 0), cargo=1)
+        patient = unit(2, UnitType.RANGER, (1, 0), hp=1)
+        turn = make_turn(units=(carrier, patient), resources=1)
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(turn)
+
+        carrier_action = turn.plan.unit_actions[carrier.id]
+        self.assertIsInstance(carrier_action, DepositAction)
+        self.assertNotEqual(tactic.memory.service_admission_id, patient.id)
+
+    def test_patrol_routes_around_protected_service_cells(self) -> None:
+        ring = {
+            (x, y)
+            for x in range(-5, 6)
+            for y in range(-5, 6)
+            if abs(x) + abs(y) == 5
+        }
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            visit_counts=Counter({cell: 100 for cell in ring}),
+        )
+        memory.visit_counts[(-5, 0)] = 0
+        carrier = unit(1, UnitType.WORKER, (0, -1), cargo=1)
+        vanguard = unit(2, UnitType.VANGUARD, (2, 0))
+        turn = make_turn(units=(carrier, vanguard), resources=0)
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(turn)
+
+        action = turn.plan.unit_actions[vanguard.id]
+        self.assertIsInstance(action, MoveAction)
+        self.assertNotEqual(action.direction, Direction.LEFT)
+        rejected = tactic.last_decision_trace["resolution"]["rejected"]
+        self.assertFalse(
+            any(
+                row["intent"]["actor_id"] == str(vanguard.id)
+                and row["reason"] == "STATIC_CONFLICT"
+                for row in rejected
+            )
+        )
+
+    def test_patrol_cannot_reenter_core_after_service_egress(self) -> None:
+        ring = {
+            (x, y)
+            for x in range(-5, 6)
+            for y in range(-5, 6)
+            if abs(x) + abs(y) == 5
+        }
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            visit_counts=Counter({cell: 100 for cell in ring}),
+        )
+        # Force the squad's least-visited anchor to the far side of the Core.
+        # The shortest geometric route from (1, 0) starts LEFT through Core,
+        # which ordinary patrol is never allowed to use as a shortcut.
+        memory.visit_counts[(-5, 0)] = 0
+        carrier = unit(1, UnitType.WORKER, (0, -1), cargo=1)
+        vanguard = unit(2, UnitType.VANGUARD, (1, 0))
+        ranger = unit(3, UnitType.RANGER, (2, 1))
+        turn = make_turn(
+            units=(carrier, vanguard, ranger),
+            resources=0,
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(turn)
+
+        action = turn.plan.unit_actions[vanguard.id]
+        self.assertFalse(
+            isinstance(action, MoveAction) and action.direction is Direction.LEFT,
+            "ordinary patrol must not move back into the Core service slot",
+        )
+
+    def test_admitted_wounded_unit_cannot_fall_back_to_patrol_when_route_blocks(self) -> None:
+        wounded = unit(2, UnitType.VANGUARD, (2, 0), hp=3)
+        turn = make_turn(
+            units=(wounded,),
+            resources=5,
+            obstacle_cells=((1, 0), (3, 0), (2, -1), (2, 1)),
+        )
+        tactic = BalancedTactic()
+
+        tactic.choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.unit_actions[wounded.id], WaitAction)
+        task = next(
+            item
+            for item in tactic.last_decision_trace["tasks"]
+            if item["actor_id"] == str(wounded.id)
+        )
+        self.assertEqual(task["mission"], UnitMission.RECOVER.value)
+        self.assertEqual(task["reason"], "RECOVERY_ROUTE_BLOCKED_THIS_TICK")
+
+    def test_mildly_wounded_unit_is_admitted_from_outside_the_service_line(self) -> None:
+        wounded = unit(2, UnitType.VANGUARD, (3, 0), hp=3)
+        turn = make_turn(units=(wounded,), resources=1)
+        tactic = BalancedTactic()
+
+        tactic.choose_actions(turn)
+
+        self.assertEqual(tactic.memory.service_admission_id, wounded.id)
+        self.assertIsInstance(turn.plan.unit_actions[wounded.id], MoveAction)
+        task = next(
+            item
+            for item in tactic.last_decision_trace["tasks"]
+            if item["actor_id"] == str(wounded.id)
+        )
+        self.assertEqual(task["mission"], UnitMission.RECOVER.value)
+
+    def test_ready_cargo_precedes_mild_maintenance_treatment(self) -> None:
+        carrier = unit(1, UnitType.WORKER, (1, 0), cargo=1)
+        wounded = unit(2, UnitType.VANGUARD, (3, 0), hp=3)
+        turn = make_turn(units=(carrier, wounded), resources=1)
+        tactic = BalancedTactic()
+
+        tactic.choose_actions(turn)
+
+        self.assertEqual(tactic.memory.service_admission_id, carrier.id)
+
+    def test_remote_emergency_patient_reserves_funds_without_freezing_ready_cargo(self) -> None:
+        carrier = unit(1, UnitType.WORKER, (1, 0), cargo=1)
+        patient = unit(2, UnitType.RANGER, (8, 0), hp=1)
+        turn = make_turn(units=(carrier, patient), resources=1)
+        tactic = BalancedTactic()
+
+        tactic.choose_actions(turn)
+
+        self.assertEqual(tactic.memory.service_admission_id, carrier.id)
+        self.assertIsInstance(turn.plan.unit_actions[carrier.id], MoveAction)
+        patient_task = next(
+            item
+            for item in tactic.last_decision_trace["tasks"]
+            if item["actor_id"] == str(patient.id)
+        )
+        self.assertEqual(patient_task["mission"], UnitMission.RECOVER.value)
+
+    def test_admitted_patient_can_traverse_the_only_service_entrance(self) -> None:
+        patient = unit(2, UnitType.RANGER, (2, 0), hp=1)
+        turn = make_turn(
+            units=(patient,),
+            resources=1,
+            obstacle_cells=((0, -1), (-1, 0), (0, 1), (1, -1), (1, 1)),
+        )
+        tactic = BalancedTactic()
+
+        tactic.choose_actions(turn)
+
+        self.assertEqual(tactic.memory.service_admission_id, patient.id)
+        action = turn.plan.unit_actions[patient.id]
+        self.assertIsInstance(action, MoveAction)
+        self.assertEqual(action.direction, Direction.LEFT)
+
+    def test_pre25_combat_floor_fills_the_larger_type_gap(self) -> None:
+        memory = TacticMemory(opening_complete=True)
+        units = tuple(
+            [unit(index + 1, UnitType.WORKER, (index + 2, 2)) for index in range(4)]
+            + [
+                unit(20, UnitType.VANGUARD, (-2, 1)),
+                unit(21, UnitType.VANGUARD, (-2, 2)),
+            ]
+            + [unit(30, UnitType.RANGER, (2, 1))]
+        )
+        turn = make_turn(units=units, resources=20)
+
+        BalancedTactic(memory=memory).choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.core_action, SpawnAction)
+        self.assertEqual(turn.plan.core_action.unit_type, UnitType.RANGER)
+
+    def test_reinforcement_uses_configured_asymmetric_type_floors(self) -> None:
+        config = TacticConfig(minimum_vanguards=2, minimum_rangers=4)
+        units = tuple(
+            [unit(index + 1, UnitType.WORKER, (index + 4, 3)) for index in range(6)]
+            + [
+                unit(20, UnitType.VANGUARD, (-2, 1)),
+                unit(21, UnitType.VANGUARD, (-2, 2)),
+            ]
+            + [
+                unit(30, UnitType.RANGER, (2, 1)),
+                unit(31, UnitType.RANGER, (2, 2)),
+                unit(32, UnitType.RANGER, (2, 3)),
+            ]
+        )
+        turn = make_turn(units=units, resources=100)
+
+        BalancedTactic(
+            config,
+            memory=TacticMemory(opening_complete=True),
+        ).choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.core_action, SpawnAction)
+        self.assertEqual(turn.plan.core_action.unit_type, UnitType.RANGER)
+
+    def test_reinforcement_falls_back_to_affordable_missing_type_after_heal_reserve(self) -> None:
+        workers = [
+            unit(index, UnitType.WORKER, (20 + index, 0), hp=1 if index == 1 else 2)
+            for index in range(1, 6)
+        ]
+        units = tuple(
+            workers
+            + [
+                unit(20 + index, UnitType.VANGUARD, (-index, 2))
+                for index in range(1, 4)
+            ]
+            + [unit(30, UnitType.RANGER, (2, 2))]
+        )
+        turn = make_turn(units=units, resources=11)
+        tactic = BalancedTactic(memory=TacticMemory(opening_complete=True))
+
+        tactic.choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.core_action, SpawnAction)
+        self.assertEqual(turn.plan.core_action.unit_type, UnitType.VANGUARD)
+        selected = next(
+            item
+            for item in tactic.last_decision_trace["economy"]["production_candidates"]
+            if item.get("selected")
+        )
+        self.assertEqual(selected["unit_type"], UnitType.VANGUARD.value)
+        self.assertEqual(selected["reserved_for_recovery"], 1)
+        self.assertEqual(selected["fallback_reason"], "PRIMARY_UNAFFORDABLE")
+
+    def test_injured_empty_worker_enters_recovery_instead_of_exploring(self) -> None:
+        worker = unit(1, UnitType.WORKER, (2, 0), hp=1)
+        turn = make_turn(units=(worker,), resources=1)
+        tactic = BalancedTactic()
+
+        tactic.choose_actions(turn)
+
+        self.assertEqual(tactic.memory.service_admission_id, worker.id)
+        task = next(
+            item
+            for item in tactic.last_decision_trace["tasks"]
+            if item["actor_id"] == str(worker.id)
+        )
+        self.assertEqual(task["mission"], UnitMission.RECOVER.value)
+        self.assertEqual(
+            tactic.memory.unit_missions[worker.id].mission,
+            UnitMission.RECOVER,
+        )
+        self.assertNotIn(
+            str(worker.id),
+            {
+                item["worker_id"]
+                for item in tactic.last_decision_trace["economy"]["resource_assignments"]
+            },
+        )
+
+    def test_injured_loaded_worker_deposits_then_heals_next_tick(self) -> None:
+        worker = unit(1, UnitType.WORKER, (0, 0), hp=1, cargo=1)
+        tactic = BalancedTactic()
+        first = make_turn(tick=1, units=(worker,), resources=0)
+
+        tactic.choose_actions(first)
+
+        self.assertIsInstance(first.plan.unit_actions[worker.id], DepositAction)
+        second = make_turn(
+            tick=2,
+            units=(unit(1, UnitType.WORKER, (0, 0), hp=1, cargo=0),),
+            resources=1,
+        )
+        tactic.choose_actions(second)
+        self.assertIsInstance(second.plan.unit_actions[worker.id], HealAction)
+
+    def test_lethal_core_line_makes_injured_carrier_escape_before_deposit(self) -> None:
+        carrier = unit(1, UnitType.WORKER, (0, 0), hp=1, cargo=1)
+        enemy = unit(100, UnitType.RANGER, (0, 3), controlled=False)
+        turn = make_turn(units=(carrier,), enemies=(enemy,), resources=0)
+
+        BalancedTactic().choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.unit_actions[carrier.id], MoveAction)
+
+    def test_all_injured_workers_reserve_their_missing_healing_resources(self) -> None:
+        workers = (
+            unit(1, UnitType.WORKER, (2, 0), hp=1),
+            unit(2, UnitType.WORKER, (-2, 0), hp=1),
+        )
+        tactic = BalancedTactic()
+
+        tactic.choose_actions(make_turn(units=workers, resources=10))
+
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        self.assertEqual(queue["reserved_resources"], 2)
+
+    def test_injured_worker_with_no_survivable_step_waits_explicitly(self) -> None:
+        worker = unit(1, UnitType.WORKER, (2, 0), hp=1)
+        turn = make_turn(
+            units=(worker,),
+            resources=1,
+            obstacle_cells=((1, 0), (3, 0), (2, -1), (2, 1)),
+        )
+        tactic = BalancedTactic()
+
+        tactic.choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.unit_actions[worker.id], WaitAction)
+        task = next(
+            item
+            for item in tactic.last_decision_trace["tasks"]
+            if item["actor_id"] == str(worker.id)
+        )
+        self.assertEqual(task["reason"], "NO_SURVIVABLE_RECOVERY_STEP")
+
+    def test_loaded_worker_route_prefers_detour_around_persistent_heat(self) -> None:
+        core = friendly_core(position=(0, 0))
+        worker = unit(1, UnitType.WORKER, (2, 0), cargo=1)
+        memory = TacticMemory(
+            core_id=core.id,
+            core_position=core.position,
+            threat_heat={
+                (1, 0): ThreatHeatCell(
+                    position=(1, 0),
+                    risk=24,
+                    updated_tick=1,
+                    expires_tick=65,
+                    source="UNIT_DESTROYED",
+                )
+            },
+        )
+        turn = make_turn(tick=2, core=core, units=(worker,), resources=0)
+
+        BalancedTactic(memory=memory).choose_actions(turn)
+
+        action = turn.plan.unit_actions[worker.id]
+        self.assertIsInstance(action, MoveAction)
+        self.assertNotEqual(action.direction, Direction.LEFT)
+
+    def test_one_hp_recovery_avoids_a_single_forward_exit_when_detour_exists(self) -> None:
+        core = friendly_core(position=(0, 0))
+        passable = {
+            (4, 0),
+            (3, 0),
+            (2, 0),
+            (1, 0),
+            (0, 0),
+            (4, 1),
+            (4, 2),
+            (3, 2),
+            (2, 2),
+            (1, 2),
+            (0, 2),
+            (0, 1),
+        }
+        memory = TacticMemory(
+            core_id=core.id,
+            core_position=core.position,
+            known_passable=set(passable),
+            known_obstacles={(3, -1), (3, 1)},
+        )
+        worker = unit(1, UnitType.WORKER, (4, 0), hp=1)
+        turn = make_turn(
+            core=core,
+            units=(worker,),
+            resources=1,
+            obstacle_cells=((3, -1), (3, 1)),
+        )
+
+        BalancedTactic(memory=memory).choose_actions(turn)
+
+        action = turn.plan.unit_actions[worker.id]
+        self.assertIsInstance(action, MoveAction)
+        self.assertNotEqual(action.direction, Direction.LEFT)
+
+    def test_global_resource_matching_is_one_to_one_and_nearest(self) -> None:
+        workers = (
+            unit(1, UnitType.WORKER, (-1, 0)),
+            unit(2, UnitType.WORKER, (1, 0)),
+        )
+        turn = make_turn(
+            units=workers,
+            resources=0,
+            resource_cells=((-3, 0), (3, 0)),
+        )
+        tactic = BalancedTactic()
+
+        tactic.choose_actions(turn)
+
+        assignments = {
+            item["worker_id"]: tuple(item["target"])
+            for item in tactic.last_decision_trace["economy"]["resource_assignments"]
+        }
+        self.assertEqual(assignments[str(workers[0].id)], (-3, 0))
+        self.assertEqual(assignments[str(workers[1].id)], (3, 0))
+
+    def test_adjacent_visible_resource_preempts_exploration_when_return_field_is_capped(self) -> None:
+        core = friendly_core(position=(0, 0))
+        worker = unit(1, UnitType.WORKER, (59, 0))
+        resource = (60, 0)
+        memory = TacticMemory(
+            core_id=core.id,
+            core_position=core.position,
+            known_passable={
+                (x, y)
+                for x in range(-5, 66)
+                for y in range(-35, 36)
+            },
+            unit_missions={
+                worker.id: MissionState(UnitMission.EXPLORE, (59, -10), 1)
+            },
+            opening_complete=True,
+        )
+        turn = make_turn(
+            tick=10,
+            core=core,
+            units=(worker,),
+            resources=0,
+            resource_cells=(resource,),
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(turn)
+
+        task = next(
+            item
+            for item in tactic.last_decision_trace["tasks"]
+            if item["actor_id"] == str(worker.id)
+        )
+        self.assertEqual(task["mission"], UnitMission.HARVEST.value)
+        self.assertEqual(tuple(task["target"]), resource)
+        action = turn.plan.unit_actions[worker.id]
+        self.assertIsInstance(action, MoveAction)
+        self.assertEqual(action.direction, Direction.RIGHT)
+
+    def test_reachable_resource_work_order_does_not_thrash_for_a_new_nearby_node(self) -> None:
+        tactic = BalancedTactic()
+        worker = unit(1, UnitType.WORKER, (0, 0))
+        tactic.choose_actions(
+            make_turn(
+                tick=1,
+                core=friendly_core(position=(0, -2)),
+                units=(worker,),
+                resource_cells=((3, 0),),
+                resources=0,
+            )
+        )
+        self.assertEqual(tactic.memory.unit_missions[worker.id].target, (3, 0))
+
+        tactic.choose_actions(
+            make_turn(
+                tick=2,
+                core=friendly_core(position=(0, -2)),
+                units=(unit(1, UnitType.WORKER, (1, 0)),),
+                resource_cells=((3, 0), (1, 1)),
+                resources=0,
+            )
+        )
+
+        assignment = next(
+            item
+            for item in tactic.last_decision_trace["economy"]["resource_assignments"]
+            if item["worker_id"] == str(worker.id)
+        )
+        self.assertEqual(tuple(assignment["target"]), (3, 0))
+
+    def test_global_resource_matching_beats_uuid_ordered_greedy_choice(self) -> None:
+        worker_ids = (uid(1), uid(2))
+        resources = ((1, 0), (0, 2))
+        costs = {
+            (worker_ids[0], resources[0]): 1,
+            (worker_ids[0], resources[1]): 2,
+            (worker_ids[1], resources[0]): 1,
+            (worker_ids[1], resources[1]): 4,
+        }
+
+        result = minimum_cost_matching(worker_ids, resources, costs)
+
+        self.assertEqual(
+            {(worker_id, resource) for worker_id, resource, _ in result},
+            {
+                (worker_ids[0], resources[1]),
+                (worker_ids[1], resources[0]),
+            },
+        )
+        self.assertEqual(sum(cost for _, _, cost in result), 3)
+
+    def test_new_visible_resource_does_not_erase_a_fogged_remembered_node(self) -> None:
+        tactic = BalancedTactic()
+        first_worker = unit(1, UnitType.WORKER, (0, 0))
+        tactic.choose_actions(
+            make_turn(
+                tick=1,
+                core=friendly_core(position=(-10, 0)),
+                units=(first_worker,),
+                resources=0,
+                resource_cells=((3, 0),),
+            )
+        )
+
+        second_worker = unit(1, UnitType.WORKER, (-1, 0))
+        tactic.choose_actions(
+            make_turn(
+                tick=2,
+                core=friendly_core(position=(-10, 0)),
+                units=(second_worker,),
+                resources=0,
+                resource_cells=((-1, 2),),
+            )
+        )
+
+        self.assertIn((3, 0), tactic.memory.resource_memory)
+        self.assertIn((-1, 2), tactic.memory.resource_memory)
+
+    def test_information_gain_goal_persists_until_observed(self) -> None:
+        worker = unit(1, UnitType.WORKER, (1, 0))
+        tactic = BalancedTactic()
+        tactic.choose_actions(make_turn(tick=1, units=(worker,), resources=0))
+        first = tactic.memory.unit_missions[worker.id]
+
+        tactic.choose_actions(make_turn(tick=2, units=(worker,), resources=0))
+        second = tactic.memory.unit_missions[worker.id]
+
+        self.assertEqual(second.target, first.target)
+        self.assertEqual(second.assigned_tick, first.assigned_tick)
+
+    def test_every_worker_gets_a_scout_task_despite_the_precision_scan_budget(self) -> None:
+        workers = (
+            unit(1, UnitType.WORKER, (2, 0)),
+            unit(2, UnitType.WORKER, (0, 2)),
+            unit(3, UnitType.WORKER, (-2, 0)),
+        )
+        tactic = BalancedTactic()
+
+        tactic.choose_actions(make_turn(tick=1, units=workers, resources=0))
+        first_count = sum(
+            mission.mission is UnitMission.EXPLORE
+            for mission in tactic.memory.unit_missions.values()
+        )
+        tactic.choose_actions(make_turn(tick=2, units=workers, resources=0))
+        second_count = sum(
+            mission.mission is UnitMission.EXPLORE
+            for mission in tactic.memory.unit_missions.values()
+        )
+
+        self.assertEqual(first_count, 3)
+        self.assertEqual(second_count, 3)
+
+    def test_home_alert_keeps_a_sticky_explorer_on_a_safe_local_step(self) -> None:
+        worker = unit(1, UnitType.WORKER, (1, 0))
+        tactic = BalancedTactic()
+        tactic.choose_actions(make_turn(tick=1, units=(worker,), resources=0))
+        tactic.memory.unit_missions[worker.id] = MissionState(
+            UnitMission.EXPLORE,
+            (8, 0),
+            1,
+        )
+        distant_home_threat = unit(
+            100,
+            UnitType.RANGER,
+            (20, 0),
+            controlled=False,
+        )
+        turn = make_turn(
+            tick=2,
+            units=(unit(1, UnitType.WORKER, (2, 0)),),
+            enemies=(distant_home_threat,),
+            resources=0,
+        )
+
+        tactic.choose_actions(turn)
+
+        task = next(
+            item
+            for item in tactic.last_decision_trace["tasks"]
+            if item["actor_id"] == str(worker.id)
+        )
+        self.assertEqual(task["mission"], "EXPLORE")
+        self.assertEqual(task["reason"], "INFORMATION_GAIN")
+        self.assertEqual(task["target"], [3, 0])
+
+    def test_recent_fogged_threat_keeps_worker_in_escape_mission(self) -> None:
+        worker = unit(1, UnitType.WORKER, (0, 0))
+        enemy = unit(100, UnitType.RANGER, (0, 3), controlled=False)
+        tactic = BalancedTactic()
+        tactic.choose_actions(make_turn(tick=1, units=(worker,), enemies=(enemy,), resources=0))
+
+        second = make_turn(tick=2, units=(worker,), enemies=(), resources=0)
+        tactic.choose_actions(second)
+
+        task = next(item for item in tactic.last_decision_trace["tasks"] if item["actor_id"] == str(worker.id))
+        self.assertEqual(task["mission"], "ESCAPE")
+
+    def test_escape_preserves_fresh_threats_and_does_not_immediately_backtrack(self) -> None:
+        core = friendly_core(position=(40, -1))
+        worker_id = uid(1)
+        tactic = BalancedTactic()
+        first = make_turn(
+            tick=1,
+            core=core,
+            units=(unit(1, UnitType.WORKER, (0, 0), cargo=1),),
+            enemies=(
+                unit(100, UnitType.RANGER, (-1, 2), controlled=False),
+                unit(101, UnitType.VANGUARD, (0, 2), controlled=False),
+            ),
+            obstacle_cells=((-1, -2), (0, -2), (0, 3), (1, -1), (1, 1), (2, 0)),
+            resources=0,
+        )
+        tactic.choose_actions(first)
+        self.assertEqual(first.plan.unit_actions[worker_id].direction, Direction.UP)
+
+        second = make_turn(
+            tick=2,
+            core=core,
+            units=(unit(1, UnitType.WORKER, (0, -1), cargo=1),),
+            enemies=(
+                unit(102, UnitType.VANGUARD, (-2, -1), controlled=False),
+            ),
+            obstacle_cells=((-3, -1), (0, -2), (1, -1), (1, 1)),
+            resources=0,
+        )
+        tactic.choose_actions(second)
+
+        state = tactic.memory.worker_escape_states[worker_id]
+        self.assertEqual(set(state.threat_ids), {uid(100), uid(101), uid(102)})
+        action = second.plan.unit_actions[worker_id]
+        self.assertIsInstance(action, MoveAction)
+        self.assertNotEqual(action.direction, Direction.DOWN)
+
+    def test_deposited_worker_receives_scout_target_before_leaving_core(self) -> None:
+        worker_id = uid(1)
+        tactic = BalancedTactic()
+        first = make_turn(
+            tick=1,
+            units=(unit(1, UnitType.WORKER, (0, 0), cargo=1),),
+            resources=0,
+        )
+        tactic.choose_actions(first)
+        self.assertIsInstance(first.plan.unit_actions[worker_id], DepositAction)
+        deposited = ResolutionEvent(
+            event_id=uid(90_100),
+            tick=1,
+            event_type="DEPOSIT_SUCCEEDED",
+            actor_id=worker_id,
+            position=(0, 0),
+        )
+        second = make_turn(
+            tick=2,
+            units=(unit(1, UnitType.WORKER, (0, 0)),),
+            resources=1,
+            events=(deposited,),
+        )
+
+        tactic.choose_actions(second)
+
+        state = tactic.memory.worker_scout_states[worker_id]
+        target = state.target
+        self.assertIsNotNone(target)
+        self.assertIsInstance(second.plan.unit_actions[worker_id], MoveAction)
+        task = next(
+            item
+            for item in tactic.last_decision_trace["tasks"]
+            if item["actor_id"] == str(worker_id)
+        )
+        self.assertEqual(task["reason"], "SCOUT_CORE_EXIT")
+
+        direction = second.plan.unit_actions[worker_id].direction
+        position = direction.delta
+        third = make_turn(
+            tick=3,
+            units=(unit(1, UnitType.WORKER, position),),
+            resources=1,
+        )
+        tactic.choose_actions(third)
+        self.assertEqual(tactic.memory.worker_scout_states[worker_id].target, target)
+        self.assertEqual(
+            tactic.memory.unit_missions[worker_id].mission,
+            UnitMission.EXPLORE,
+        )
+
+    def test_remote_stale_cells_cannot_displace_reachable_frontier(self) -> None:
+        worker = unit(1, UnitType.WORKER, (8, 0))
+        tactic = BalancedTactic()
+        tactic.choose_actions(make_turn(tick=1, units=(worker,), resources=0))
+        tactic.memory.unit_missions.clear()
+        tactic.memory.worker_scout_states.clear()
+        for x in range(80, 90):
+            for y in range(80, 90):
+                tactic.memory.known_passable.add((x, y))
+                tactic.memory.cell_last_visible[(x, y)] = 0
+
+        turn = make_turn(tick=2, units=(worker,), resources=0)
+        tactic.choose_actions(turn)
+
+        action = turn.plan.unit_actions[worker.id]
+        state = tactic.memory.worker_scout_states[worker.id]
+        self.assertIsInstance(action, MoveAction)
+        self.assertIsNotNone(state.target)
+        self.assertLess(manhattan(worker.position, state.target), 40)
+        self.assertNotEqual(
+            next(
+                item["reason"]
+                for item in tactic.last_decision_trace["tasks"]
+                if item["actor_id"] == str(worker.id)
+            ),
+            "NO_REACHABLE_FRONTIER",
+        )
+
+    def test_failed_precision_scan_does_not_starve_other_workers(self) -> None:
+        workers = tuple(
+            unit(index, UnitType.WORKER, (index * 2, 0))
+            for index in range(1, 5)
+        )
+        tactic = BalancedTactic(TacticConfig(path_node_limit=1))
+        turn = make_turn(tick=1, units=workers, resources=0)
+
+        tactic.choose_actions(turn)
+
+        self.assertTrue(
+            all(isinstance(turn.plan.unit_actions[worker.id], MoveAction) for worker in workers)
+        )
+        self.assertEqual(len(tactic.memory.worker_scout_states), len(workers))
+        self.assertTrue(
+            all(state.target is not None for state in tactic.memory.worker_scout_states.values())
+        )
+
+    def test_scout_slots_remain_unique_while_workers_are_busy(self) -> None:
+        tactic = BalancedTactic()
+        tactic.choose_actions(
+            make_turn(
+                tick=1,
+                units=(
+                    unit(1, UnitType.WORKER, (2, 0)),
+                    unit(2, UnitType.WORKER, (4, 0), cargo=1),
+                ),
+                resources=0,
+            )
+        )
+        tactic.choose_actions(
+            make_turn(
+                tick=2,
+                units=(
+                    unit(1, UnitType.WORKER, (2, 0)),
+                    unit(2, UnitType.WORKER, (3, 0), cargo=1),
+                    unit(3, UnitType.WORKER, (6, 0)),
+                ),
+                resources=0,
+            )
+        )
+        tactic.choose_actions(
+            make_turn(
+                tick=3,
+                units=(
+                    unit(1, UnitType.WORKER, (2, 0)),
+                    unit(2, UnitType.WORKER, (2, 1)),
+                    unit(3, UnitType.WORKER, (6, 0)),
+                ),
+                resources=0,
+            )
+        )
+
+        slots = [state.slot for state in tactic.memory.worker_scout_states.values()]
+        self.assertEqual(len(slots), len(set(slots)))
+
+
+if __name__ == "__main__":
+    unittest.main()

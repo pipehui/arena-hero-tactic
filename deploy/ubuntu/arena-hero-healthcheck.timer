@@ -1,0 +1,13 @@
+[Unit]
+Description=Check the Arena Hero tactic heartbeat every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Persistent=true
+Unit=arena-hero-healthcheck.service
+
+[Install]
+WantedBy=timers.target
+

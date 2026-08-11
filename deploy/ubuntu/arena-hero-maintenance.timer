@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily Arena Hero restart and replay-log retention
+
+[Timer]
+OnCalendar=*-*-* 04:15:00
+RandomizedDelaySec=2min
+Persistent=true
+Unit=arena-hero-maintenance.service
+
+[Install]
+WantedBy=timers.target
+
