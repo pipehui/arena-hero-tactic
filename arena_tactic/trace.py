@@ -634,6 +634,7 @@ class DecisionTraceBuilder:
             "depositors": [str(item) for item in service.depositors],
             "ready_depositors": [str(item) for item in service.ready_depositors],
             "approaching_depositors": [str(item) for item in service.approaching_depositors],
+            "holding_depositors": [str(item) for item in service.holding_depositors],
             "ready_ticks": [
                 {"worker_id": str(worker_id), "tick": tick}
                 for worker_id, tick in service.ready_ticks

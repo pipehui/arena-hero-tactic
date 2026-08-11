@@ -89,7 +89,7 @@ class TacticalMapTests(unittest.TestCase):
         self.assertEqual(selected["mission"], "HARVEST")
         self.assertEqual(selected["reason"], "GLOBAL_RESOURCE_MATCH")
 
-    def test_worker_reacts_to_enemy_seen_by_another_friendly(self) -> None:
+    def test_worker_uses_shared_threat_as_risk_without_unrelated_escape(self) -> None:
         worker = unit(1, UnitType.WORKER, (8, 0))
         ranger = unit(2, UnitType.RANGER, (4, 0))
         enemy = unit(100, UnitType.RANGER, (4, 4), controlled=False)
@@ -107,22 +107,61 @@ class TacticalMapTests(unittest.TestCase):
         assert world is not None
         self.assertNotIn(worker.id, world.observers(enemy.position))
         self.assertIn(ranger.id, world.observers(enemy.position))
-        escape = tactic.memory.worker_escape_states[worker.id]
-        self.assertEqual(escape.phase, "GLOBAL_ALERT_RETREAT")
+        self.assertNotIn(worker.id, tactic.memory.worker_escape_states)
         tactical_map = tactic.last_tactical_map
         assert tactical_map is not None
-        self.assertGreater(
-            tactical_map.role_risk(UnitType.WORKER, worker.position),
-            tactical_map.role_risk(UnitType.VANGUARD, worker.position),
+        self.assertIsNotNone(tactical_map.enemy(enemy.id))
+        selected = next(
+            item
+            for item in tactic.last_decision_trace["tasks"]
+            if item["actor_id"] == str(worker.id)
         )
-        threat = tactical_map.threat_cells[worker.position]
-        self.assertIn(enemy.id, threat.source_enemy_ids)
+        self.assertNotEqual(selected["mission"], "ESCAPE")
+
+    def test_worker_escapes_a_shared_threat_within_two_worker_vision_radii(self) -> None:
+        worker = unit(1, UnitType.WORKER, (8, 0))
+        ranger = unit(2, UnitType.RANGER, (3, 0))
+        enemy = unit(100, UnitType.RANGER, (3, 1), controlled=False)
+        turn = make_turn(
+            core=friendly_core(position=(20, 0)),
+            units=(worker, ranger),
+            enemies=(enemy,),
+            resources=0,
+        )
+        tactic = BalancedTactic()
+
+        tactic.choose_actions(turn)
+
+        world = tactic._last_world
+        assert world is not None
+        self.assertNotIn(worker.id, world.observers(enemy.position))
+        self.assertIn(ranger.id, world.observers(enemy.position))
+        escape = tactic.memory.worker_escape_states[worker.id]
+        self.assertEqual(escape.phase, "GLOBAL_ALERT_RETREAT")
         selected = next(
             item
             for item in tactic.last_decision_trace["tasks"]
             if item["actor_id"] == str(worker.id)
         )
         self.assertEqual(selected["mission"], "ESCAPE")
+
+    def test_worker_does_not_take_an_ordinary_step_toward_a_remote_enemy(self) -> None:
+        worker = unit(1, UnitType.WORKER, (8, 0))
+        observer = unit(2, UnitType.RANGER, (0, 1))
+        enemy = unit(100, UnitType.VANGUARD, (0, 0), controlled=False)
+        turn = make_turn(
+            core=friendly_core(position=(20, 0)),
+            units=(worker, observer),
+            enemies=(enemy,),
+            resources=0,
+            resource_cells=((7, 0),),
+        )
+        tactic = BalancedTactic()
+
+        tactic.choose_actions(turn)
+
+        action = turn.plan.unit_actions[worker.id]
+        self.assertNotEqual(getattr(action, "direction", None), Direction.LEFT)
 
     def test_worker_discovery_triggers_combat_response(self) -> None:
         worker = unit(1, UnitType.WORKER, (10, 0))

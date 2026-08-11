@@ -129,6 +129,10 @@ class RecoveryPlanner:
                         blocked=route_block,
                         node_limit=self.config.path_node_limit,
                         lookahead_node_limit=self.config.worker_escape_lookahead_nodes,
+                        enemy_track_ttl=self.config.enemy_track_ttl,
+                        near_escape_radius=(
+                            self.config.global_worker_threat_awareness_radius
+                        ),
                     )
                     for step in steps:
                         intents.append(
@@ -155,6 +159,10 @@ class RecoveryPlanner:
                                     ("survival_terminals", step.survival_terminals),
                                     ("first_step_heat", step.heat),
                                     ("future_attackers", step.future_attackers),
+                                    (
+                                        "remote_enemy_approaches",
+                                        step.remote_enemy_approaches,
+                                    ),
                                     ("route_reachable", step.route_reachable),
                                 ),
                             )

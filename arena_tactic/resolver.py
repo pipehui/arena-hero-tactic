@@ -306,12 +306,18 @@ class IntentResolver:
                 and unit.id in selected
                 and selected[unit.id].action is IntentAction.MOVE
             ]
-            if self._combat_cell_is_exclusive(
+            service_overlap = any(
+                dict(intent.metadata).get("allow_service_overlap", False)
+                for intent in contenders
+            )
+            if not service_overlap and self._combat_cell_is_exclusive(
                 destination,
                 projected_core_position,
             ):
                 unit_capacity = 1
-            if any(intent.exclusive_destination for intent in contenders):
+            if not service_overlap and any(
+                intent.exclusive_destination for intent in contenders
+            ):
                 unit_capacity = min(unit_capacity, 1)
             if count <= unit_capacity:
                 continue

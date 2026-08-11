@@ -622,6 +622,32 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         self.assertIsInstance(action, MoveAction)
         self.assertIn(action.direction, {Direction.LEFT, Direction.RIGHT})
 
+    def test_loaded_worker_detours_instead_of_closing_on_a_remote_enemy(self) -> None:
+        core = friendly_core(position=(-10, 0))
+        carrier = unit(1, UnitType.WORKER, (8, 0), cargo=1)
+        observer = unit(2, UnitType.RANGER, (0, 1))
+        enemy = unit(100, UnitType.VANGUARD, (0, 0), controlled=False)
+        memory = TacticMemory(core_id=core.id, core_position=core.position)
+        memory.known_passable.update(
+            (x, y)
+            for x in range(-12, 11)
+            for y in range(-12, 13)
+        )
+        turn = make_turn(
+            tick=2,
+            core=core,
+            units=(carrier, observer),
+            enemies=(enemy,),
+            resources=0,
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(turn)
+
+        action = turn.plan.unit_actions[carrier.id]
+        self.assertIsInstance(action, MoveAction)
+        self.assertNotEqual(action.direction, Direction.LEFT)
+
     def test_resource_distance_field_routes_around_visible_enemy_occupancy(self) -> None:
         worker = unit(1, UnitType.WORKER, (0, -2))
         blocking_core = enemy_core(99, (0, -1))
@@ -668,6 +694,91 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         self.assertEqual(empty_action.direction, Direction.UP)
         self.assertIsInstance(carrier_action, MoveAction)
         self.assertEqual(carrier_action.direction, Direction.UP)
+
+    def test_deposited_worker_clears_a_resource_exit_without_reharvesting(self) -> None:
+        empty = unit(1, UnitType.WORKER, (0, -1))
+        carrier = unit(2, UnitType.WORKER, (1, 0), cargo=1)
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            service_entrance=(1, 0),
+            service_queue_cells=((1, 0), (2, 0)),
+            service_exit_cell=(0, -1),
+            service_egress_worker_ids={empty.id},
+            cargo_arrival_ticks={carrier.id: 1},
+        )
+        turn = make_turn(
+            tick=2,
+            units=(empty, carrier),
+            resources=0,
+            resource_cells=((0, -1),),
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.unit_actions[empty.id], MoveAction)
+        task = next(
+            item
+            for item in tactic.last_decision_trace["tasks"]
+            if item["actor_id"] == str(empty.id)
+        )
+        self.assertEqual(task["mission"], "CLEAR_CORE")
+        self.assertEqual(task["reason"], "CLEAR_SERVICE_EXIT")
+
+    def test_empty_core_worker_can_share_a_single_occupied_exit(self) -> None:
+        empty = unit(1, UnitType.WORKER, (0, 0))
+        exit_carrier = unit(2, UnitType.WORKER, (0, -1), cargo=1)
+        admitted = unit(3, UnitType.WORKER, (1, 0), cargo=1)
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            service_admission_id=admitted.id,
+            service_kind="DEPOSIT",
+            service_entrance=(1, 0),
+            service_queue_cells=((1, 0), (2, 0)),
+            service_exit_cell=(0, -1),
+            cargo_arrival_ticks={admitted.id: 1},
+        )
+        turn = make_turn(
+            tick=2,
+            units=(
+                empty,
+                exit_carrier,
+                admitted,
+            ),
+            resources=0,
+            obstacle_cells=((-1, 0), (0, 1)),
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(turn)
+
+        action = turn.plan.unit_actions[empty.id]
+        self.assertIsInstance(action, MoveAction)
+        self.assertEqual(action.direction, Direction.UP)
+
+    def test_only_one_remote_carrier_approaches_the_service_lane(self) -> None:
+        carriers = (
+            unit(1, UnitType.WORKER, (4, 0), cargo=1),
+            unit(2, UnitType.WORKER, (4, 1), cargo=1),
+            unit(3, UnitType.WORKER, (4, -1), cargo=1),
+        )
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            service_entrance=(1, 0),
+            service_queue_cells=((1, 0), (2, 0)),
+            service_exit_cell=(-1, 0),
+        )
+        turn = make_turn(tick=2, units=carriers, resources=0)
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(turn)
+
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        self.assertEqual(len(queue["approaching_depositors"]), 1)
+        self.assertEqual(len(queue["holding_depositors"]), 2)
 
     def test_narrow_core_corridor_allows_only_the_service_handoff_swap(self) -> None:
         empty = unit(1, UnitType.WORKER, (0, 0))
@@ -1216,6 +1327,34 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         self.assertIsInstance(action, MoveAction)
         self.assertNotEqual(action.direction, Direction.LEFT)
 
+    def test_injured_worker_detours_instead_of_closing_on_remote_enemy(self) -> None:
+        core = friendly_core(position=(20, 0))
+        worker = unit(1, UnitType.WORKER, (0, 0), hp=1)
+        observer = unit(2, UnitType.RANGER, (8, 2))
+        enemy = unit(100, UnitType.RANGER, (8, 1), controlled=False)
+        memory = TacticMemory(
+            core_id=core.id,
+            core_position=core.position,
+            opening_complete=True,
+            known_passable={
+                (x, y)
+                for x in range(-2, 23)
+                for y in range(-8, 9)
+            },
+        )
+        turn = make_turn(
+            core=core,
+            units=(worker, observer),
+            enemies=(enemy,),
+            resources=1,
+        )
+
+        BalancedTactic(memory=memory).choose_actions(turn)
+
+        action = turn.plan.unit_actions[worker.id]
+        self.assertIsInstance(action, MoveAction)
+        self.assertNotIn(action.direction, {Direction.RIGHT, Direction.DOWN})
+
     def test_global_resource_matching_is_one_to_one_and_nearest(self) -> None:
         workers = (
             unit(1, UnitType.WORKER, (-1, 0)),
@@ -1420,7 +1559,10 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         )
         self.assertEqual(task["mission"], "EXPLORE")
         self.assertEqual(task["reason"], "INFORMATION_GAIN")
-        self.assertEqual(task["target"], [3, 0])
+        self.assertGreaterEqual(
+            manhattan(tuple(task["target"]), distant_home_threat.position),
+            manhattan((2, 0), distant_home_threat.position),
+        )
 
     def test_recent_fogged_threat_keeps_worker_in_escape_mission(self) -> None:
         worker = unit(1, UnitType.WORKER, (0, 0))

@@ -151,11 +151,19 @@ class CoreServicePlanner:
         if previous_lane != (entrance, queue_cells):
             self.memory.cargo_arrival_ticks.clear()
 
+        emergency_ready_id = self._emergency_funding_carrier(
+            world,
+            carriers,
+            urgent,
+        )
         ready, approaching, lane_index, head = self._sync_ready_line(
             world,
             carriers,
             queue_cells,
+            emergency_ready_id=emergency_ready_id,
         )
+        active_approaching = approaching[:1]
+        holding = approaching[1:]
         ready_ids = {unit.id for unit in ready}
 
         # START_MOVE is validated before harvest/deposit and turns the Core
@@ -169,8 +177,9 @@ class CoreServicePlanner:
                 admission_id=None,
                 service_core_position=service_core_position,
                 depositors=tuple(unit.id for unit in (*ready, *approaching)),
-                approaching_depositors=tuple(unit.id for unit in (*ready, *approaching)),
-                queue_slots=tuple((unit.id, target) for unit in (*ready, *approaching)),
+                approaching_depositors=tuple(unit.id for unit in active_approaching),
+                holding_depositors=tuple(unit.id for unit in (*ready, *holding)),
+                queue_slots=tuple((unit.id, target) for unit in active_approaching),
                 wounded=tuple(unit.id for unit in wounded),
                 entrance=entrance,
                 queue_cells=queue_cells,
@@ -250,14 +259,15 @@ class CoreServicePlanner:
             service_core_position=service_core_position,
             depositors=tuple(unit.id for unit in (*ready, *approaching)),
             ready_depositors=tuple(unit.id for unit in ready),
-            approaching_depositors=tuple(unit.id for unit in approaching),
+            approaching_depositors=tuple(unit.id for unit in active_approaching),
+            holding_depositors=tuple(unit.id for unit in holding),
             ready_ticks=tuple(
                 (unit.id, self.memory.cargo_arrival_ticks[unit.id]) for unit in ready
             ),
             queue_slots=self._queue_slots(
                 core.position,
                 ready,
-                approaching,
+                active_approaching,
                 lane_index,
                 queue_cells,
                 exit_cell,
@@ -338,6 +348,36 @@ class CoreServicePlanner:
         )
         return carriers, wounded, urgent
 
+    @staticmethod
+    def _emergency_funding_carrier(
+        world: WorldModel,
+        carriers: tuple[EntitySnapshot, ...],
+        urgent: tuple[EntitySnapshot, ...],
+    ) -> UUID | None:
+        """Permit one side-adjacent carrier to fund an urgent heal.
+
+        Ordinary delivery is deliberately restricted to the selected ingress
+        lane.  The narrow exception retains treatment liveness without
+        turning every Core neighbor into a competing queue head.
+        """
+
+        if world.core is None or not urgent:
+            return None
+        patient = urgent[0]
+        missing = UNIT_MAX_HP[patient.unit_type] - patient.hp
+        if world.resources >= missing:
+            return None
+        adjacent = tuple(
+            carrier
+            for carrier in carriers
+            if manhattan(carrier.position, world.core.position) == 1
+        )
+        return (
+            min(adjacent, key=lambda unit: unit.id.bytes).id
+            if adjacent
+            else None
+        )
+
     def _sync_storage_saturation(self, world: WorldModel) -> None:
         """Maintain a small hysteresis around a completely full Core."""
 
@@ -356,6 +396,8 @@ class CoreServicePlanner:
         world: WorldModel,
         carriers: tuple[EntitySnapshot, ...],
         queue_cells: tuple[Position, ...],
+        *,
+        emergency_ready_id: UUID | None = None,
     ) -> tuple[
         tuple[EntitySnapshot, ...],
         tuple[EntitySnapshot, ...],
@@ -363,21 +405,15 @@ class CoreServicePlanner:
         EntitySnapshot | None,
     ]:
         assert world.core is not None
-        # A loaded Worker already beside the Core is physically one move from
-        # service even when it approached from a side other than the selected
-        # queue entrance.  Requiring it to walk around and join the nominal
-        # line can deadlock urgent healing: recovery waits for deposited
-        # funds while every adjacent carrier waits for an admission that only
-        # queue-line members could previously receive.
-        ready_positions = frozenset(
-            (
-                world.core.position,
-                *queue_cells,
-                *(cell for _, cell in cardinal_neighbors(world.core.position)),
-            )
-        )
+        # Only the directed ingress lane owns admission.  Treating all four
+        # Core neighbors as ready positions let a large cargo wave occupy the
+        # dedicated exit and every alternate egress cell at once.
+        ready_positions = frozenset((world.core.position, *queue_cells))
         for carrier in carriers:
-            if carrier.position in ready_positions:
+            if (
+                carrier.position in ready_positions
+                or carrier.id == emergency_ready_id
+            ):
                 self.memory.cargo_arrival_ticks.setdefault(carrier.id, world.tick)
             else:
                 self.memory.cargo_arrival_ticks.pop(carrier.id, None)
@@ -816,10 +852,13 @@ class CoreServicePlanner:
         world: WorldModel,
         projection: TacticalMap,
     ) -> Position:
+        resources = set(world.visible_resources)
+        resources.update(position for position, _ in world.remembered_resources)
         options = [
             (
                 projection.immediate_attackers(cell),
                 projection.future_attackers(cell),
+                int(cell in resources),
                 dict(world.occupied_cells).get(cell, 0),
                 index,
                 cell,

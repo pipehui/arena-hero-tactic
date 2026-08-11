@@ -373,6 +373,7 @@ class CoreServiceQueue:
     depositors: tuple[UUID, ...] = ()
     ready_depositors: tuple[UUID, ...] = ()
     approaching_depositors: tuple[UUID, ...] = ()
+    holding_depositors: tuple[UUID, ...] = ()
     ready_ticks: tuple[tuple[UUID, int], ...] = ()
     queue_slots: tuple[tuple[UUID, Position], ...] = ()
     wounded: tuple[UUID, ...] = ()

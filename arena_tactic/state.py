@@ -85,6 +85,7 @@ class TacticMemory:
     service_entrance: Position | None = None
     service_queue_cells: tuple[Position, ...] = ()
     service_exit_cell: Position | None = None
+    service_egress_worker_ids: set[UUID] = field(default_factory=set)
     storage_saturated: bool = False
     worker_home_guard_targets: dict[UUID, Position] = field(default_factory=dict)
 
@@ -150,6 +151,7 @@ class TacticMemory:
         self.service_entrance = None
         self.service_queue_cells = ()
         self.service_exit_cell = None
+        self.service_egress_worker_ids.clear()
         self.storage_saturated = False
         self.worker_home_guard_targets.clear()
         self.opening_complete = False

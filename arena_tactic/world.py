@@ -181,6 +181,7 @@ def _sync_events(
             # Worker's stable scout slot, but require a fresh target while it
             # is still on the Core so CLEAR_CORE becomes the first scout step.
             memory.unit_missions.pop(event.actor_id, None)
+            memory.service_egress_worker_ids.add(event.actor_id)
             scout = memory.worker_scout_states.get(event.actor_id)
             if scout is not None:
                 memory.worker_scout_states[event.actor_id] = replace(
@@ -379,6 +380,23 @@ def _sync_friendly_memory(
     for unit_id in tuple(memory.worker_scout_states):
         if unit_id not in living_ids:
             memory.worker_scout_states.pop(unit_id, None)
+    service_cells = {
+        *(
+            cell
+            for cell in (
+                memory.core_position,
+                memory.service_entrance,
+                memory.service_exit_cell,
+            )
+            if cell is not None
+        ),
+        *memory.service_queue_cells,
+    }
+    units_by_id = {unit.id: unit for unit in turn.units}
+    for unit_id in tuple(memory.service_egress_worker_ids):
+        unit = units_by_id.get(unit_id)
+        if unit is None or unit.position not in service_cells:
+            memory.service_egress_worker_ids.discard(unit_id)
     for unit_id in tuple(memory.manual_move_leases):
         if unit_id not in living_ids or turn.tick > memory.manual_move_leases[unit_id].expires_tick:
             memory.manual_move_leases.pop(unit_id, None)

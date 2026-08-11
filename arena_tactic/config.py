@@ -58,7 +58,10 @@ class TacticConfig:
     # around combat enemies seen by *any* friendly observer.  They influence
     # every Worker's route without pretending that a fogged enemy occupies a
     # concrete cell.
-    global_worker_threat_awareness_radius: int = 12
+    # Two Worker vision radii (Gameplay v0.14: 3 + 3).  Shared sightings
+    # inside this near field trigger retreat; farther sightings only bias the
+    # global risk map and route costs.
+    global_worker_threat_awareness_radius: int = 6
     global_worker_corridor_projection_ticks: int = 4
     global_worker_corridor_width: int = 2
     global_worker_corridor_risk: int = 12
