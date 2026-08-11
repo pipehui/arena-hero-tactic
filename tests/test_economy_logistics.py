@@ -536,7 +536,7 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         self.assertIsInstance(full_again.plan.core_action, SpawnAction)
         self.assertEqual(full_again.plan.core_action.unit_type, UnitType.RANGER)
 
-    def test_post_crisis_combat_allocation_is_rebuilt_before_full_storage_routine(self) -> None:
+    def test_high_population_post_crisis_rebuild_waits_for_full_storage(self) -> None:
         memory = TacticMemory(
             core_id=uid(10_000),
             core_position=(0, 0),
@@ -559,8 +559,18 @@ class EconomyAndLogisticsTests(unittest.TestCase):
 
         tactic.choose_actions(turn)
 
-        self.assertIsInstance(turn.plan.core_action, SpawnAction)
-        self.assertEqual(turn.plan.core_action.unit_type, UnitType.VANGUARD)
+        self.assertIsInstance(turn.plan.core_action, WaitAction)
+        candidates = tactic.last_decision_trace["economy"]["production_candidates"]
+        self.assertFalse(any(item.get("selected") for item in candidates))
+        self.assertEqual(
+            {item["reason"] for item in candidates},
+            {"WAIT_FOR_FULL_STORAGE"},
+        )
+
+        full = make_turn(tick=21, units=units, resources=175)
+        tactic.choose_actions(full)
+        self.assertIsInstance(full.plan.core_action, SpawnAction)
+        self.assertEqual(full.plan.core_action.unit_type, UnitType.VANGUARD)
         selected = next(
             item
             for item in tactic.last_decision_trace["economy"]["production_candidates"]
@@ -569,6 +579,57 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         self.assertEqual(selected["production_mode"], "POST_CRISIS_REBUILD")
         self.assertEqual(selected["vanguard_rebuild_gap"], 1)
         self.assertEqual(selected["ranger_rebuild_gap"], 0)
+
+    def test_high_population_active_crisis_waits_for_full_storage(self) -> None:
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            opening_complete=True,
+            home_force_high_water=17,
+            crisis_force_baseline=CrisisForceBaseline(
+                vanguards=8,
+                rangers=8,
+                started_tick=10,
+                phase="ACTIVE",
+            ),
+        )
+        units = tuple(
+            [unit(i, UnitType.WORKER, (30 + i, 0)) for i in range(1, 24)]
+            + [unit(100 + i, UnitType.VANGUARD, (i, 5)) for i in range(1, 9)]
+            + [unit(200 + i, UnitType.RANGER, (i, -5)) for i in range(1, 9)]
+        )
+        enemies = tuple(
+            unit(300 + i, UnitType.VANGUARD, (3 + i, 0), controlled=False)
+            for i in range(1, 5)
+        )
+        tactic = BalancedTactic(memory=memory)
+        turn = make_turn(tick=20, units=units, enemies=enemies, resources=31)
+
+        tactic.choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.core_action, WaitAction)
+        candidates = tactic.last_decision_trace["economy"]["production_candidates"]
+        self.assertFalse(any(item.get("selected") for item in candidates))
+        self.assertEqual(
+            {item["reason"] for item in candidates},
+            {"WAIT_FOR_FULL_STORAGE"},
+        )
+
+        full = make_turn(
+            tick=21,
+            units=units,
+            enemies=enemies,
+            resources=195,
+        )
+        tactic.choose_actions(full)
+        self.assertIsInstance(full.plan.core_action, SpawnAction)
+        self.assertEqual(full.plan.core_action.unit_type, UnitType.VANGUARD)
+        selected = next(
+            item
+            for item in tactic.last_decision_trace["economy"]["production_candidates"]
+            if item["selected"]
+        )
+        self.assertEqual(selected["production_mode"], "CRISIS_REINFORCEMENT")
 
     def test_cargo_on_stationary_core_always_deposits(self) -> None:
         carrier = unit(1, UnitType.WORKER, (0, 0), cargo=1)

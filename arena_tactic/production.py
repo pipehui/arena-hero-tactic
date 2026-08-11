@@ -98,7 +98,13 @@ class ProductionPlanner:
         chosen: UnitType | None = None
         reinforcement_order: tuple[UnitType, ...] = ()
         reason = "TARGETS_MET"
-        if not self.memory.opening_complete:
+        stockpile_gate_closed = (
+            world.population >= self.config.population_stockpile_threshold
+            and world.resources != world.resource_capacity
+        )
+        if stockpile_gate_closed:
+            reason = "WAIT_FOR_FULL_STORAGE"
+        if not stockpile_gate_closed and not self.memory.opening_complete:
             if urgent_defense:
                 chosen = UnitType.VANGUARD
                 reason = "OPENING_THREAT_INTERRUPT"
@@ -113,7 +119,11 @@ class ProductionPlanner:
                 reason = "OPENING_FIRST_RANGER"
             else:
                 self.memory.opening_complete = True
-        if self.memory.opening_complete and chosen is None:
+        if (
+            not stockpile_gate_closed
+            and self.memory.opening_complete
+            and chosen is None
+        ):
             rebuild_vanguard_gap = max(0, baseline.vanguards - vanguards)
             rebuild_ranger_gap = max(0, baseline.rangers - rangers)
             rebuild_active = baseline.phase == "REBUILD" and (
