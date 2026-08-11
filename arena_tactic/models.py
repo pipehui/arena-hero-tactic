@@ -385,6 +385,7 @@ class CoreServiceQueue:
     ready_ticks: tuple[tuple[UUID, int], ...] = ()
     queue_slots: tuple[tuple[UUID, Position], ...] = ()
     overflow_slots: tuple[tuple[UUID, Position], ...] = ()
+    scheduled_deposits: tuple[tuple[UUID, int], ...] = ()
     worker_progress: tuple[tuple[UUID, Position, int], ...] = ()
     wounded: tuple[UUID, ...] = ()
     entrance: Position | None = None

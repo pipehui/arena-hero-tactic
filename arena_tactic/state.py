@@ -93,6 +93,8 @@ class TacticMemory:
     service_exit_cell: Position | None = None
     service_egress_worker_ids: set[UUID] = field(default_factory=set)
     service_worker_progress: dict[UUID, tuple[Position, int]] = field(default_factory=dict)
+    service_cargo_first_seen_ticks: dict[UUID, int] = field(default_factory=dict)
+    service_deposit_ticks: dict[UUID, int] = field(default_factory=dict)
     patient_admission_progress: PatientAdmissionProgress | None = None
     storage_saturated: bool = False
     worker_home_guard_targets: dict[UUID, Position] = field(default_factory=dict)
@@ -171,6 +173,8 @@ class TacticMemory:
         self.service_exit_cell = None
         self.service_egress_worker_ids.clear()
         self.service_worker_progress.clear()
+        self.service_cargo_first_seen_ticks.clear()
+        self.service_deposit_ticks.clear()
         self.patient_admission_progress = None
         self.storage_saturated = False
         self.worker_home_guard_targets.clear()

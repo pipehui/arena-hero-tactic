@@ -1279,10 +1279,10 @@ class WorkerPlanner:
                     route.first_direction,
                     route.first_position,
                     risk=self._risk(projection, route.first_position),
-                    exclusive_destination=(
-                        route.first_position == world.core.position
-                        or route.first_position in service.queue_cells
-                    ),
+                    # Queue cells have the official two-entity capacity and
+                    # are deliberately used as a feeder pipeline.  Only the
+                    # Core service slot itself is exclusive.
+                    exclusive_destination=route.first_position == world.core.position,
                     tie_break=(route.distance,),
                     reason=reason,
                     metadata=(
@@ -1295,6 +1295,14 @@ class WorkerPlanner:
                         (
                             "service_slot",
                             world.core.position if fallback else target,
+                        ),
+                        (
+                            "allow_service_overlap",
+                            route.first_position in service.queue_cells,
+                        ),
+                        (
+                            "scheduled_deposit_tick",
+                            dict(service.scheduled_deposits).get(worker.id),
                         ),
                     ),
                 ),
@@ -1487,6 +1495,7 @@ class WorkerPlanner:
             *(cell for cell in (service.entrance, service.exit_cell) if cell is not None),
             *service.queue_cells,
         }
+        scheduled_tick = dict(service.scheduled_deposits).get(worker.id)
         assigned_overflow = dict(service.overflow_slots).get(worker.id)
         if assigned_overflow is not None:
             if worker.position == assigned_overflow:
@@ -1497,7 +1506,11 @@ class WorkerPlanner:
                         UnitMission.RETURN_CARGO,
                         52,
                         target_position=assigned_overflow,
-                        reason="WAITING_AT_ASSIGNED_OVERFLOW",
+                        reason="WAITING_FOR_SCHEDULED_DEPOSIT",
+                        metadata=(
+                            ("scheduled_deposit_tick", scheduled_tick),
+                            ("staging_cell", assigned_overflow),
+                        ),
                     )
                 ]
             overflow_route = self._route(
@@ -1521,8 +1534,11 @@ class WorkerPlanner:
                         risk=self._risk(projection, overflow_route.first_position),
                         exclusive_destination=True,
                         tie_break=(overflow_route.distance,),
-                        reason="MOVE_TO_ASSIGNED_OVERFLOW",
-                        metadata=(("overflow_slot", assigned_overflow),),
+                        reason="MOVE_TO_SCHEDULED_STAGING",
+                        metadata=(
+                            ("overflow_slot", assigned_overflow),
+                            ("scheduled_deposit_tick", scheduled_tick),
+                        ),
                     ),
                     ActionIntent.simple(
                         worker.id,

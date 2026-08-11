@@ -143,7 +143,17 @@ class CoreServicePlanner:
         for worker_id in tuple(self.memory.service_worker_progress):
             if worker_id not in living_carrier_ids:
                 self.memory.service_worker_progress.pop(worker_id, None)
+        for worker_id in tuple(self.memory.service_cargo_first_seen_ticks):
+            if worker_id not in living_carrier_ids:
+                self.memory.service_cargo_first_seen_ticks.pop(worker_id, None)
+        for worker_id in tuple(self.memory.service_deposit_ticks):
+            if worker_id not in living_carrier_ids:
+                self.memory.service_deposit_ticks.pop(worker_id, None)
         for carrier in carriers:
+            self.memory.service_cargo_first_seen_ticks.setdefault(
+                carrier.id,
+                world.tick,
+            )
             previous = self.memory.service_worker_progress.get(carrier.id)
             stalled = (
                 previous[1] + 1
@@ -192,6 +202,13 @@ class CoreServicePlanner:
             exit_cell,
             service_core_position,
         )
+        deposit_schedule = self._sync_deposit_schedule(
+            world,
+            projection,
+            carriers,
+            service_core_position,
+            queue_cells,
+        )
 
         emergency_ready_id = self._emergency_funding_carrier(
             world,
@@ -204,8 +221,11 @@ class CoreServicePlanner:
             queue_cells,
             emergency_ready_id=emergency_ready_id,
         )
-        active_approaching = approaching[:1]
-        holding = approaching[1:]
+        # Ordinary cells hold two entities.  Keep a two-wide feeder active so
+        # the queue can advance as a real pipeline instead of waiting for one
+        # remote carrier to complete its entire trip before releasing another.
+        active_approaching = approaching[:2]
+        holding = approaching[2:]
         overflow_slots = self._overflow_slots(
             world,
             projection,
@@ -214,6 +234,7 @@ class CoreServicePlanner:
             queue_cells,
             entrance,
             exit_cell,
+            deposit_schedule,
         )
         ready_ids = {unit.id for unit in ready}
 
@@ -232,6 +253,7 @@ class CoreServicePlanner:
                 holding_depositors=tuple(unit.id for unit in (*ready, *holding)),
                 overflow_slots=overflow_slots,
                 queue_slots=tuple((unit.id, target) for unit in active_approaching),
+                scheduled_deposits=deposit_schedule,
                 worker_progress=tuple(
                     (
                         unit.id,
@@ -348,6 +370,8 @@ class CoreServicePlanner:
             reserved,
             exit_cell,
             patient_gateway,
+            carriers,
+            deposit_schedule,
         )
         core_slot_reserved = timeline.current_slot_reserved
 
@@ -384,6 +408,12 @@ class CoreServicePlanner:
             approaching_depositors=tuple(unit.id for unit in active_approaching),
             holding_depositors=tuple(unit.id for unit in holding),
             overflow_slots=overflow_slots,
+            scheduled_deposits=tuple(
+                sorted(
+                    self.memory.service_deposit_ticks.items(),
+                    key=lambda item: (item[1], item[0].bytes),
+                )
+            ),
             ready_ticks=tuple(
                 (unit.id, self.memory.cargo_arrival_ticks[unit.id]) for unit in ready
             ),
@@ -429,6 +459,7 @@ class CoreServicePlanner:
         queue_cells: tuple[Position, ...],
         entrance: Position | None,
         exit_cell: Position | None,
+        deposit_schedule: tuple[tuple[UUID, int], ...],
     ) -> tuple[tuple[UUID, Position], ...]:
         if not holding:
             return ()
@@ -451,11 +482,27 @@ class CoreServicePlanner:
             and projection.immediate_attackers(cell) == 0
         )
         available = set(candidates)
+        schedule = dict(deposit_schedule)
+        minimum_radius = self.config.service_lane_depth + 2
+        maximum_radius = self.config.service_lane_depth + 6
         rows: list[tuple[UUID, Position]] = []
-        for worker in sorted(holding, key=lambda unit: unit.id.bytes):
+        for worker in sorted(
+            holding,
+            key=lambda unit: (
+                schedule.get(unit.id, world.tick),
+                self.memory.service_cargo_first_seen_ticks.get(unit.id, world.tick),
+                unit.id.bytes,
+            ),
+        ):
+            remaining = max(0, schedule.get(worker.id, world.tick) - world.tick)
+            preferred_radius = max(
+                minimum_radius,
+                min(maximum_radius, remaining - self.config.service_lane_depth),
+            )
             target = min(
                 available,
                 key=lambda cell: (
+                    abs(manhattan(core_position, cell) - preferred_radius),
                     manhattan(worker.position, cell),
                     projection.future_attackers(cell),
                     projection.threat_heat.get(cell, 0),
@@ -466,6 +513,118 @@ class CoreServicePlanner:
             rows.append((worker.id, target))
             available.discard(target)
         return tuple(rows)
+
+    def _sync_deposit_schedule(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        carriers: tuple[EntitySnapshot, ...],
+        core_position: Position,
+        queue_cells: tuple[Position, ...],
+    ) -> tuple[tuple[UUID, int], ...]:
+        """Assign stable future DEPOSIT Ticks to every cargo Worker.
+
+        Physical arrival and Core service are the same scheduling problem: a
+        Worker with a later appointment may stage farther out, while an
+        imminent appointment must keep moving.  Persisting the appointment in
+        session memory prevents the old failure where recomputing nearest-first
+        every Tick let new nearby cargo starve older Workers indefinitely.
+        """
+
+        lane_index = {cell: index for index, cell in enumerate(queue_cells)}
+        outer = queue_cells[-1] if queue_cells else core_position
+        rows: list[tuple[EntitySnapshot, int]] = []
+        for carrier in carriers:
+            if carrier.position == core_position:
+                eta = 0
+            elif carrier.position in lane_index:
+                eta = lane_index[carrier.position] + 1
+            else:
+                route = route_to(
+                    world,
+                    carrier.position,
+                    outer,
+                    node_limit=self.config.distance_field_node_limit,
+                    blocked=frozenset(
+                        (
+                            projection.hostile_occupied
+                            | {core_position, *queue_cells[:-1]}
+                        )
+                        - {carrier.position, outer}
+                    ),
+                )
+                # The appointment is the Tick on which DEPOSIT can execute,
+                # not merely a Manhattan arrival beside the Core.  Reaching
+                # the queue tail is followed by one move for every remaining
+                # lane cell before the Worker can act on the Core.
+                eta = (
+                    route.distance + len(queue_cells)
+                    if route is not None
+                    else manhattan(carrier.position, outer) + len(queue_cells)
+                )
+            rows.append((carrier, eta))
+
+        # First retain every appointment, including an overdue one.  Overdue
+        # means "move now", not "go to the back of the queue".  New cargo may
+        # fill an earlier unused future Tick, but it may not push an older
+        # Worker back merely because it appeared closer to home.
+        used_ticks: set[int] = set()
+
+        def next_available(requested: int) -> int:
+            assigned = requested
+            # A Worker enters the Core on the Tick before DEPOSIT, performs
+            # DEPOSIT on its appointment, and can leave on the following Tick.
+            # Consequently consecutive deposit appointments need a one-Tick
+            # gap even though egress and the next ingress may share a Tick.
+            while any(abs(assigned - other) < 2 for other in used_ticks):
+                assigned += 1
+            return assigned
+
+        schedule: dict[UUID, int] = {}
+        stable = sorted(
+            (
+                (carrier, self.memory.service_deposit_ticks[carrier.id])
+                for carrier, _ in rows
+                if carrier.id in self.memory.service_deposit_ticks
+            ),
+            key=lambda row: (
+                row[1],
+                self.memory.service_cargo_first_seen_ticks.get(
+                    row[0].id,
+                    world.tick,
+                ),
+                row[0].id.bytes,
+            ),
+        )
+        for carrier, requested in stable:
+            assigned = next_available(requested)
+            schedule[carrier.id] = assigned
+            used_ticks.add(assigned)
+
+        unscheduled = sorted(
+            (
+                (carrier, world.tick + eta)
+                for carrier, eta in rows
+                if carrier.id not in schedule
+            ),
+            key=lambda row: (
+                row[1],
+                self.memory.service_cargo_first_seen_ticks.get(
+                    row[0].id,
+                    world.tick,
+                ),
+                row[0].id.bytes,
+            ),
+        )
+        for carrier, earliest in unscheduled:
+            assigned = next_available(earliest)
+            schedule[carrier.id] = assigned
+            used_ticks.add(assigned)
+
+        self.memory.service_deposit_ticks.update(schedule)
+        return tuple(
+            sorted(schedule.items(), key=lambda item: (item[1], item[0].bytes))
+        )
 
     def _choose_patient_gateway(
         self,
@@ -717,6 +876,8 @@ class CoreServicePlanner:
                     if carrier.id not in self.memory.cargo_arrival_ticks
                 ),
                 key=lambda unit: (
+                    self.memory.service_deposit_ticks.get(unit.id, world.tick),
+                    self.memory.service_cargo_first_seen_ticks.get(unit.id, world.tick),
                     manhattan(unit.position, outer),
                     unit.id.bytes,
                 ),
@@ -896,6 +1057,8 @@ class CoreServicePlanner:
         reserved_resources: int,
         exit_cell: Position | None,
         patient_gateway: Position | None,
+        carriers: tuple[EntitySnapshot, ...],
+        deposit_schedule: tuple[tuple[UUID, int], ...],
     ) -> CoreOperationTimeline:
         assert world.core is not None
         core = world.core
@@ -921,33 +1084,53 @@ class CoreServicePlanner:
                     gateway=patient_gateway,
                 )
             )
-        if head is not None:
-            if head.position == core.position:
-                eta = 0
-            else:
-                route = route_to(
-                    world,
-                    head.position,
-                    core.position,
-                    node_limit=self.config.path_node_limit,
-                    blocked=frozenset(
-                        projection.hostile_occupied - {head.position, core.position}
-                    ),
+        # Deposits and treatment share the same physical Core slot.  Materialize
+        # every cargo appointment on the same future timeline so Core production
+        # can use free Ticks without stealing the Tick on which a Worker is due.
+        # A treatment appointment shifts colliding deposits but does not discard
+        # their stable order.
+        patient_ticks = {
+            request.occupy_tick
+            for request in requests
+            if request.operation == "HEAL"
+        }
+        scheduled = dict(deposit_schedule)
+        next_deposit_tick = world.tick - 2
+        carrier_rows = sorted(
+            carriers,
+            key=lambda unit: (
+                scheduled.get(unit.id, world.tick),
+                self.memory.service_cargo_first_seen_ticks.get(unit.id, world.tick),
+                unit.id.bytes,
+            ),
+        )
+        for carrier in carrier_rows:
+            assigned = max(
+                world.tick,
+                scheduled.get(carrier.id, world.tick),
+                next_deposit_tick + 2,
+            )
+            while assigned in patient_ticks or assigned - 1 in patient_ticks:
+                assigned += 1
+            self.memory.service_deposit_ticks[carrier.id] = assigned
+            occupy_tick = (
+                world.tick
+                if carrier.position == core.position
+                else max(world.tick, assigned - 1)
+            )
+            requests.append(
+                CoreOperationRequest(
+                    actor_id=carrier.id,
+                    operation="DEPOSIT",
+                    eta=occupy_tick - world.tick,
+                    occupy_tick=occupy_tick,
+                    release_tick=assigned + 1,
+                    priority=20,
+                    resource_gain=carrier.cargo,
+                    gateway=self.memory.service_entrance,
                 )
-                eta = None if route is None else route.distance
-            if eta is not None:
-                requests.append(
-                    CoreOperationRequest(
-                        actor_id=head.id,
-                        operation="DEPOSIT",
-                        eta=eta,
-                        occupy_tick=world.tick + eta,
-                        release_tick=world.tick + eta + 1,
-                        priority=20,
-                        resource_gain=head.cargo,
-                        gateway=self.memory.service_entrance,
-                    )
-                )
+            )
+            next_deposit_tick = assigned
         requests.sort(
             key=lambda item: (
                 item.eta,

@@ -859,6 +859,10 @@ class DecisionTraceBuilder:
                 {"worker_id": str(worker_id), "cell": list(cell)}
                 for worker_id, cell in service.overflow_slots
             ],
+            "scheduled_deposits": [
+                {"worker_id": str(worker_id), "tick": tick}
+                for worker_id, tick in service.scheduled_deposits
+            ],
             "worker_progress": [
                 {
                     "worker_id": str(worker_id),

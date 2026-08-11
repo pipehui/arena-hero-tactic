@@ -201,9 +201,11 @@ class EconomyAndLogisticsTests(unittest.TestCase):
 
         tactic.choose_actions(make_turn(units=carriers, resources=0))
 
-        overflow = tactic.last_decision_trace["economy"]["service_queue"]["overflow_slots"]
-        self.assertEqual(len(overflow), 3)
-        self.assertEqual(len({tuple(row["cell"]) for row in overflow}), 3)
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        overflow = queue["overflow_slots"]
+        self.assertEqual(len(queue["approaching_depositors"]), 2)
+        self.assertEqual(len(overflow), 2)
+        self.assertEqual(len({tuple(row["cell"]) for row in overflow}), 2)
 
     def test_local_emergency_patient_reserves_core_slot_and_blocks_spawn(self) -> None:
         memory = TacticMemory(opening_complete=True)
@@ -1108,8 +1110,8 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         tactic.choose_actions(turn)
 
         queue = tactic.last_decision_trace["economy"]["service_queue"]
-        self.assertEqual(len(queue["approaching_depositors"]), 1)
-        self.assertEqual(len(queue["holding_depositors"]), 1)
+        self.assertEqual(len(queue["approaching_depositors"]), 2)
+        self.assertEqual(len(queue["holding_depositors"]), 0)
         for carrier in carriers:
             action = turn.plan.unit_actions[carrier.id]
             if isinstance(action, WaitAction):
@@ -1128,6 +1130,122 @@ class EconomyAndLogisticsTests(unittest.TestCase):
                 manhattan(destination, (0, 0)),
                 manhattan(carrier.position, (0, 0)),
             )
+
+    def test_safe_empty_service_lane_advances_two_carriers_in_parallel(self) -> None:
+        carriers = (
+            unit(1, UnitType.WORKER, (4, 0), cargo=1),
+            unit(2, UnitType.WORKER, (0, 4), cargo=1),
+            unit(3, UnitType.WORKER, (-4, 0), cargo=1),
+            unit(4, UnitType.WORKER, (0, -4), cargo=1),
+        )
+        memory = TacticMemory(opening_complete=True)
+        memory.known_passable.update(
+            (x, y)
+            for x in range(-8, 9)
+            for y in range(-8, 9)
+        )
+        turn = make_turn(tick=100, units=carriers, resources=0)
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(turn)
+
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        self.assertEqual(len(queue["approaching_depositors"]), 2)
+        schedule = queue["scheduled_deposits"]
+        self.assertEqual(
+            {row["worker_id"] for row in schedule},
+            {str(carrier.id) for carrier in carriers},
+        )
+        scheduled_ticks = [row["tick"] for row in schedule]
+        self.assertEqual(scheduled_ticks, sorted(set(scheduled_ticks)))
+        self.assertTrue(
+            all(
+                later - earlier >= 2
+                for earlier, later in zip(scheduled_ticks, scheduled_ticks[1:])
+            )
+        )
+        timeline_deposits = [
+            request
+            for request in queue["timeline"]["requests"]
+            if request["operation"] == "DEPOSIT"
+        ]
+        self.assertEqual(len(timeline_deposits), len(carriers))
+        progressing = [
+            carrier
+            for carrier in carriers
+            if isinstance(turn.plan.unit_actions[carrier.id], MoveAction)
+        ]
+        self.assertGreaterEqual(len(progressing), 2)
+
+        # A future appointment must remain fixed while an early Worker is
+        # staging.  Sliding every Tick recreates permanent overflow WAIT.
+        next_turn = make_turn(tick=101, units=carriers, resources=0)
+        tactic.choose_actions(next_turn)
+        next_schedule = tactic.last_decision_trace["economy"]["service_queue"][
+            "scheduled_deposits"
+        ]
+        self.assertEqual(next_schedule, schedule)
+
+    def test_new_nearby_cargo_fills_free_tick_without_delaying_old_appointment(self) -> None:
+        far = unit(1, UnitType.WORKER, (8, 0), cargo=1)
+        memory = TacticMemory(opening_complete=True)
+        memory.known_passable.update(
+            (x, y)
+            for x in range(-10, 11)
+            for y in range(-10, 11)
+        )
+        tactic = BalancedTactic(memory=memory)
+        tactic.choose_actions(make_turn(tick=100, units=(far,), resources=0))
+        first_schedule = {
+            row["worker_id"]: row["tick"]
+            for row in tactic.last_decision_trace["economy"]["service_queue"][
+                "scheduled_deposits"
+            ]
+        }
+
+        near = unit(2, UnitType.WORKER, (1, 0), cargo=1)
+        tactic.choose_actions(
+            make_turn(tick=101, units=(far, near), resources=0)
+        )
+        second_schedule = {
+            row["worker_id"]: row["tick"]
+            for row in tactic.last_decision_trace["economy"]["service_queue"][
+                "scheduled_deposits"
+            ]
+        }
+
+        self.assertEqual(second_schedule[str(far.id)], first_schedule[str(far.id)])
+        self.assertLess(second_schedule[str(near.id)], second_schedule[str(far.id)])
+
+    def test_overdue_cargo_keeps_approach_lease_instead_of_rejoining_back(self) -> None:
+        far = unit(1, UnitType.WORKER, (8, 0), cargo=1)
+        near_a = unit(2, UnitType.WORKER, (2, 0), cargo=1)
+        near_b = unit(3, UnitType.WORKER, (0, 2), cargo=1)
+        memory = TacticMemory(
+            opening_complete=True,
+            service_deposit_ticks={far.id: 99},
+            service_cargo_first_seen_ticks={far.id: 90},
+        )
+        memory.known_passable.update(
+            (x, y)
+            for x in range(-10, 11)
+            for y in range(-10, 11)
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(
+            make_turn(tick=101, units=(far, near_a, near_b), resources=0)
+        )
+
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        self.assertIn(str(far.id), queue["approaching_depositors"])
+        far_task = next(
+            task
+            for task in tactic.last_decision_trace["tasks"]
+            if task["actor_id"] == str(far.id)
+        )
+        self.assertEqual(far_task["action"], "MOVE")
+        self.assertEqual(far_task["reason"], "SERVICE_QUEUE_APPROACH")
 
     def test_narrow_core_corridor_allows_only_the_service_handoff_swap(self) -> None:
         empty = unit(1, UnitType.WORKER, (0, 0))
