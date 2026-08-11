@@ -808,11 +808,10 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         self.assertIsInstance(action, MoveAction)
         self.assertEqual(action.direction, Direction.UP)
 
-    def test_only_one_remote_carrier_approaches_the_service_lane(self) -> None:
+    def test_remote_holding_carriers_keep_advancing_to_distributed_staging(self) -> None:
         carriers = (
-            unit(1, UnitType.WORKER, (4, 0), cargo=1),
-            unit(2, UnitType.WORKER, (4, 1), cargo=1),
-            unit(3, UnitType.WORKER, (4, -1), cargo=1),
+            unit(1, UnitType.WORKER, (6, 0), cargo=1),
+            unit(2, UnitType.WORKER, (6, 1), cargo=1),
         )
         memory = TacticMemory(
             core_id=uid(10_000),
@@ -828,7 +827,18 @@ class EconomyAndLogisticsTests(unittest.TestCase):
 
         queue = tactic.last_decision_trace["economy"]["service_queue"]
         self.assertEqual(len(queue["approaching_depositors"]), 1)
-        self.assertEqual(len(queue["holding_depositors"]), 2)
+        self.assertEqual(len(queue["holding_depositors"]), 1)
+        for carrier in carriers:
+            action = turn.plan.unit_actions[carrier.id]
+            self.assertIsInstance(action, MoveAction)
+            destination = (
+                carrier.position[0] + action.direction.delta[0],
+                carrier.position[1] + action.direction.delta[1],
+            )
+            self.assertLess(
+                manhattan(destination, (0, 0)),
+                manhattan(carrier.position, (0, 0)),
+            )
 
     def test_narrow_core_corridor_allows_only_the_service_handoff_swap(self) -> None:
         empty = unit(1, UnitType.WORKER, (0, 0))

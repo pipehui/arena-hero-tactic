@@ -1283,7 +1283,7 @@ class WorkerPlanner:
         return intents
 
     def _hold_cargo_outside_service_lane(self, world, projection, worker, service):
-        """Keep non-active carriers from filling the Core's four neighbors."""
+        """Stage non-active carriers near home without freezing them in place."""
 
         assert world.core is not None
         protected = {
@@ -1291,17 +1291,20 @@ class WorkerPlanner:
             *(cell for cell in (service.entrance, service.exit_cell) if cell is not None),
             *service.queue_cells,
         }
-        if worker.position not in protected and manhattan(
-            worker.position,
-            world.core.position,
-        ) > self.config.service_lane_depth:
+        current_distance = manhattan(worker.position, world.core.position)
+        staging_radius = self.config.service_lane_depth + 2
+        if (
+            worker.position not in protected
+            and current_distance <= staging_radius
+        ):
             return [
                 ActionIntent.simple(
                     worker.id,
                     IntentAction.WAIT,
                     UnitMission.RETURN_CARGO,
                     52,
-                    reason="WAITING_OUTSIDE_SERVICE_LANE",
+                    target_position=worker.position,
+                    reason="WAITING_AT_SERVICE_STAGING",
                 )
             ]
         occupied = dict(world.occupied_cells)
@@ -1310,7 +1313,19 @@ class WorkerPlanner:
             projection,
             worker.position,
         )
-        current_distance = manhattan(worker.position, world.core.position)
+        route = self._route(
+            world,
+            projection,
+            worker,
+            service.queue_cells[-1]
+            if service.queue_cells
+            else world.core.position,
+            service,
+            logistics=True,
+            allow_directional_fallback=True,
+        )
+        preferred_direction = None if route is None else route.first_direction
+        returning_to_stage = current_distance > staging_radius
         for index, (direction, destination) in enumerate(
             cardinal_neighbors(worker.position)
         ):
@@ -1321,13 +1336,27 @@ class WorkerPlanner:
                 or projection.immediate_attackers(destination) >= worker.hp
             ):
                 continue
+            destination_distance = manhattan(destination, world.core.position)
             score = (
                 int(destination in directional_avoid),
-                int(manhattan(destination, world.core.position) <= current_distance),
                 projection.future_attackers(destination),
                 projection.worker_exposure(destination)[2],
+                int(
+                    destination_distance >= current_distance
+                    if returning_to_stage
+                    else destination_distance <= current_distance
+                ),
+                int(
+                    returning_to_stage
+                    and preferred_direction is not None
+                    and direction is not preferred_direction
+                ),
                 occupied.get(destination, 0),
-                -manhattan(destination, world.core.position),
+                (
+                    destination_distance
+                    if returning_to_stage
+                    else -destination_distance
+                ),
                 index,
             )
             rows.append((score, direction, destination))
@@ -1338,9 +1367,13 @@ class WorkerPlanner:
                 48,
                 direction,
                 destination,
-                risk=score[2] * 10 + score[3],
+                risk=score[1] * 10 + score[2],
                 tie_break=score,
-                reason="CLEAR_SERVICE_APPROACH",
+                reason=(
+                    "RETURN_TO_SERVICE_STAGING"
+                    if returning_to_stage
+                    else "CLEAR_SERVICE_APPROACH"
+                ),
                 metadata=(("allow_protected", False),),
             )
             for score, direction, destination in sorted(rows)
@@ -1354,7 +1387,11 @@ class WorkerPlanner:
                 reason=(
                     "SERVICE_APPROACH_DRAIN_BLOCKED"
                     if not rows
-                    else "WAITING_OUTSIDE_SERVICE_LANE"
+                    else (
+                        "WAITING_FOR_STAGING_STEP"
+                        if returning_to_stage
+                        else "WAITING_OUTSIDE_SERVICE_LANE"
+                    )
                 ),
             )
         )

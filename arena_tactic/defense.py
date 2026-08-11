@@ -569,6 +569,8 @@ class DefensePlanner:
                     self._squad_patrol_intents(
                         world,
                         projection,
+                        (squad.vanguard_id, squad.ranger_id),
+                        squad,
                         vanguard,
                         ranger,
                         sector,
@@ -583,6 +585,8 @@ class DefensePlanner:
         self,
         world: WorldModel,
         projection: TacticalMap,
+        squad_key: tuple[UUID, UUID],
+        squad: SquadState,
         vanguard: EntitySnapshot,
         ranger: EntitySnapshot,
         sector: tuple[Position, ...],
@@ -600,15 +604,36 @@ class DefensePlanner:
             radius,
             protected,
         )
-        anchor = min(
-            anchors,
-            key=lambda cell: (
-                self.memory.visit_counts.get(cell, 0),
-                projection.future_attackers(cell),
-                cell,
-            ),
-            default=None,
+        anchor_set = set(anchors)
+        anchor = (
+            squad.patrol_anchor
+            if squad.patrol_anchor in anchor_set
+            else None
         )
+        support = squad.support_target if anchor is not None else None
+        completed = bool(
+            anchor is not None
+            and vanguard.position == anchor
+            and (support is None or ranger.position == support)
+        )
+        if completed:
+            anchor = None
+            support = None
+        if anchor is None:
+            recent_anchor_cells = set(
+                self.memory.position_history.get(vanguard.id, ())[-4:]
+            )
+            anchor = min(
+                anchors,
+                key=lambda cell: (
+                    int(cell in recent_anchor_cells),
+                    self.memory.visit_counts.get(cell, 0),
+                    projection.future_attackers(cell),
+                    manhattan(vanguard.position, cell),
+                    cell,
+                ),
+                default=None,
+            )
         if anchor is None:
             return [
                 ActionIntent.simple(
@@ -640,27 +665,43 @@ class DefensePlanner:
             protected,
             "VANGUARD_ANCHOR",
         )
-        support = min(
-            (
-                cell
-                for cell in self._firing_band(
-                    world,
-                    projection,
-                    anchor,
-                    protected,
-                )
-                if manhattan(cell, anchor) <= self.config.squad_max_separation
+        firing_band = tuple(
+            cell
+            for cell in self._firing_band(
+                world,
+                projection,
+                anchor,
+                protected,
+            )
+            if manhattan(cell, anchor) <= self.config.squad_max_separation
+        )
+        if support not in firing_band:
+            recent_support_cells = set(
+                self.memory.position_history.get(ranger.id, ())[-4:]
+            )
+            support = min(
+                firing_band,
+                key=lambda cell: (
+                    projection.immediate_attackers(cell),
+                    projection.future_attackers(cell),
+                    int(cell in recent_support_cells),
+                    self.memory.visit_counts.get(cell, 0),
+                    manhattan(ranger.position, cell),
+                    manhattan(cell, world.core.position),
+                    cell,
+                ),
+                default=None,
+            )
+        self.memory.squad_states[squad_key] = replace(
+            squad,
+            patrol_anchor=anchor,
+            support_target=support,
+            target_assigned_tick=(
+                squad.target_assigned_tick
+                if squad.patrol_anchor == anchor
+                and squad.support_target == support
+                else world.tick
             ),
-            key=lambda cell: (
-                projection.immediate_attackers(cell),
-                projection.future_attackers(cell),
-                self.memory.visit_counts.get(cell, 0),
-                int(cell == ranger.position),
-                manhattan(ranger.position, cell),
-                manhattan(cell, world.core.position),
-                cell,
-            ),
-            default=None,
         )
         if support is not None:
             intents.extend(

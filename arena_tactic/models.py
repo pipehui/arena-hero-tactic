@@ -523,6 +523,9 @@ class SquadState:
     ranger_id: UUID
     radius: int
     sector_index: int
+    patrol_anchor: Position | None = None
+    support_target: Position | None = None
+    target_assigned_tick: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

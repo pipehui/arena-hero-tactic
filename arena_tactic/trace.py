@@ -568,6 +568,17 @@ class DecisionTraceBuilder:
                     "ranger_id": str(squad.ranger_id),
                     "radius": squad.radius,
                     "sector_index": squad.sector_index,
+                    "patrol_anchor": (
+                        None
+                        if squad.patrol_anchor is None
+                        else list(squad.patrol_anchor)
+                    ),
+                    "support_target": (
+                        None
+                        if squad.support_target is None
+                        else list(squad.support_target)
+                    ),
+                    "target_assigned_tick": squad.target_assigned_tick,
                 }
                 for squad in sorted(
                     self.memory.squad_states.values(),

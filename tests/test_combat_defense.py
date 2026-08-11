@@ -725,16 +725,23 @@ class CombatDefenseTests(unittest.TestCase):
         vanguard_position = (0, -2)
         ranger_position = (-1, 0)
         ranger_actions = []
+        ranger_positions = []
+        vanguard_positions = []
+        patrol_leases = []
 
-        for tick in range(1, 9):
+        for tick in range(1, 15):
             vanguard = unit(1, UnitType.VANGUARD, vanguard_position)
             ranger = unit(2, UnitType.RANGER, ranger_position)
+            vanguard_positions.append(vanguard_position)
+            ranger_positions.append(ranger_position)
             turn = make_turn(
                 tick=tick,
                 units=(vanguard, ranger),
                 resources=0,
             )
             tactic.choose_actions(turn)
+            squad = tactic.memory.squad_states[(vanguard.id, ranger.id)]
+            patrol_leases.append((squad.patrol_anchor, squad.support_target))
             vanguard_action = turn.plan.unit_actions[vanguard.id]
             ranger_action = turn.plan.unit_actions[ranger.id]
             ranger_actions.append(ranger_action)
@@ -754,6 +761,22 @@ class CombatDefenseTests(unittest.TestCase):
         self.assertTrue(
             any(isinstance(action, MoveAction) for action in ranger_actions[2:]),
             "a healthy Ranger must not become a permanent inner support turret",
+        )
+        for index in range(1, len(patrol_leases)):
+            if patrol_leases[index] == patrol_leases[index - 1]:
+                continue
+            previous_anchor, previous_support = patrol_leases[index - 1]
+            self.assertEqual(vanguard_positions[index], previous_anchor)
+            self.assertEqual(ranger_positions[index], previous_support)
+        self.assertFalse(
+            any(
+                ranger_positions[index] == ranger_positions[index - 2]
+                == ranger_positions[index - 4]
+                and ranger_positions[index - 1] == ranger_positions[index - 3]
+                and ranger_positions[index] != ranger_positions[index - 1]
+                for index in range(4, len(ranger_positions))
+            ),
+            "a peaceful Ranger must not remain in a two-cell support loop",
         )
 
     def test_distant_core_is_confirmed_then_raid_returns_for_home_threat(self) -> None:
