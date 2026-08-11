@@ -12,6 +12,7 @@ from .models import (
     CoreServiceQueue,
     FireMission,
     HomeCombatAssignment,
+    HomeCounterSiegeDecision,
     IntentAction,
     IntentResolution,
     UnitMission,
@@ -40,6 +41,7 @@ class DecisionTraceBuilder:
         evacuation: CoreEvacuationCampaign | None,
         production_candidates: tuple[dict[str, object], ...],
         home_combat_assignment: HomeCombatAssignment = HomeCombatAssignment(),
+        counter_siege: HomeCounterSiegeDecision = HomeCounterSiegeDecision(),
     ) -> dict[str, object]:
         return {
             "schema_version": STRATEGY_LOG_SCHEMA_VERSION,
@@ -62,6 +64,7 @@ class DecisionTraceBuilder:
                 fire_missions,
                 legal_opportunities,
                 home_combat_assignment,
+                counter_siege,
             ),
             "core_safety": self._core_safety_dict(evacuation),
         }
@@ -347,7 +350,21 @@ class DecisionTraceBuilder:
             "opening_complete": self.memory.opening_complete,
             "service_queue": self.service_dict(service),
             "worker_path_hard_blocks": [
-                list(cell) for cell in sorted(projection.hostile_occupied)
+                list(cell)
+                for cell in sorted(
+                    projection.hostile_occupied
+                    | {
+                        cell
+                        for cell in (
+                            service.service_core_position,
+                            service.entrance,
+                            service.exit_cell,
+                            *service.queue_cells,
+                            *dict(service.overflow_slots).values(),
+                        )
+                        if cell is not None
+                    }
+                )
             ],
             "production_candidates": list(production_candidates),
             "recovery_reserved_resources": service.reserved_resources,
@@ -450,6 +467,32 @@ class DecisionTraceBuilder:
                 )
                 if mission.mission in {UnitMission.HARVEST, UnitMission.EXPLORE}
             ],
+            "worker_task_progress": [
+                {
+                    "worker_id": str(worker_id),
+                    "target": list(progress.target),
+                    "route_distance": progress.route_distance,
+                    "last_progress_tick": progress.last_progress_tick,
+                    "stalled_ticks": progress.stalled_ticks,
+                    "rejection_reason": progress.rejection_reason,
+                    "backoff_until": progress.backoff_until,
+                    "selected_action": (
+                        None
+                        if worker_id not in selected_by_actor
+                        else selected_by_actor[worker_id].action.value
+                    ),
+                    "selected_reason": (
+                        None
+                        if worker_id not in selected_by_actor
+                        else selected_by_actor[worker_id].reason
+                    ),
+                }
+                for worker_id, progress in sorted(
+                    self.memory.worker_task_progress.items(),
+                    key=lambda item: item[0].bytes,
+                )
+                if world.friendly(worker_id) is not None
+            ],
             "worker_escapes": [
                 {
                     "worker_id": str(worker_id),
@@ -473,6 +516,7 @@ class DecisionTraceBuilder:
         fire_missions: tuple[FireMission, ...],
         legal_opportunities,
         home_combat_assignment: HomeCombatAssignment,
+        counter_siege: HomeCounterSiegeDecision,
     ) -> dict[str, object]:
         selected_attackers = {
             intent.actor_id
@@ -492,6 +536,28 @@ class DecisionTraceBuilder:
             if intent.reason == "ROUTE_INTERCEPT_ADVANCE"
         ]
         return {
+            "counter_siege": {
+                "phase": counter_siege.phase,
+                "target_id": (
+                    None
+                    if counter_siege.target_id is None
+                    else str(counter_siege.target_id)
+                ),
+                "target_position": (
+                    None
+                    if counter_siege.target_position is None
+                    else list(counter_siege.target_position)
+                ),
+                "members": [str(item) for item in counter_siege.member_ids],
+                "home_reserve": [str(item) for item in counter_siege.reserve_ids],
+                "last_seen_tick": counter_siege.last_seen_tick,
+                "reason": counter_siege.reason,
+                "actions": [
+                    self.intent_dict(intent)
+                    for intent in resolution.selected
+                    if intent.mission is UnitMission.COUNTER_SIEGE
+                ],
+            },
             "fire_missions": [self.fire_mission_dict(item) for item in fire_missions],
             "enemy_action_candidates": [
                 {
@@ -789,6 +855,10 @@ class DecisionTraceBuilder:
                 {"worker_id": str(worker_id), "cell": list(cell)}
                 for worker_id, cell in service.queue_slots
             ],
+            "overflow_slots": [
+                {"worker_id": str(worker_id), "cell": list(cell)}
+                for worker_id, cell in service.overflow_slots
+            ],
             "worker_progress": [
                 {
                     "worker_id": str(worker_id),
@@ -807,6 +877,51 @@ class DecisionTraceBuilder:
                 else list(service.patient_gateway)
             ),
             "core_slot_reserved": service.core_slot_reserved,
+            "timeline": (
+                None
+                if service.timeline is None
+                else {
+                    "tick": service.timeline.tick,
+                    "current_slot_owner": (
+                        None
+                        if service.timeline.current_slot_owner is None
+                        else str(service.timeline.current_slot_owner)
+                    ),
+                    "current_slot_reserved": service.timeline.current_slot_reserved,
+                    "next_service_eta": service.timeline.next_service_eta,
+                    "next_service_tick": service.timeline.next_service_tick,
+                    "next_release_tick": service.timeline.next_release_tick,
+                    "production_allowed": service.timeline.production_allowed,
+                    "spawn_egress": (
+                        None
+                        if service.timeline.spawn_egress_cell is None
+                        else list(service.timeline.spawn_egress_cell)
+                    ),
+                    "reason": service.timeline.reason,
+                    "requests": [
+                        {
+                            "actor_id": (
+                                None
+                                if request.actor_id is None
+                                else str(request.actor_id)
+                            ),
+                            "operation": request.operation,
+                            "eta": request.eta,
+                            "occupy_tick": request.occupy_tick,
+                            "release_tick": request.release_tick,
+                            "priority": request.priority,
+                            "resource_cost": request.resource_cost,
+                            "resource_gain": request.resource_gain,
+                            "gateway": (
+                                None
+                                if request.gateway is None
+                                else list(request.gateway)
+                            ),
+                        }
+                        for request in service.timeline.requests
+                    ],
+                }
+            ),
             "patient_progress": (
                 None
                 if service.patient_progress is None

@@ -55,7 +55,155 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         self.assertEqual(action.direction, Direction.RIGHT)
         queue = tactic.last_decision_trace["economy"]["service_queue"]
         self.assertEqual(queue["patient_gateway"], [0, -1])
-        self.assertTrue(queue["core_slot_reserved"])
+        self.assertFalse(queue["core_slot_reserved"])
+        self.assertEqual(queue["timeline"]["next_service_eta"], 3)
+
+    def test_patient_eta_three_does_not_block_current_core_work(self) -> None:
+        memory = TacticMemory(
+            opening_complete=True,
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            service_entrance=(1, 0),
+            service_queue_cells=((1, 0), (2, 0)),
+            service_exit_cell=(0, -1),
+        )
+        patient = unit(2, UnitType.RANGER, (-1, -2), hp=1)
+        tactic = BalancedTactic(memory=memory)
+        turn = make_turn(
+            units=(patient,),
+            resources=25,
+            obstacle_cells=((-1, -1), (-2, -2), (-1, -3), (0, -3), (1, -2)),
+        )
+
+        tactic.choose_actions(turn)
+
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        self.assertEqual(queue["timeline"]["next_service_eta"], 3)
+        self.assertTrue(queue["timeline"]["production_allowed"])
+        self.assertIsInstance(turn.plan.core_action, SpawnAction)
+
+    def test_stalled_remote_patient_keeps_funds_without_owning_current_slot(self) -> None:
+        memory = TacticMemory(
+            opening_complete=True,
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            service_entrance=(1, 0),
+            service_queue_cells=((1, 0), (2, 0)),
+            service_exit_cell=(0, -1),
+        )
+        patient = unit(2, UnitType.RANGER, (-1, -2), hp=1)
+        tactic = BalancedTactic(memory=memory)
+        for tick in (1, 2, 3):
+            turn = make_turn(
+                tick=tick,
+                units=(patient,),
+                resources=25,
+                obstacle_cells=((-1, -1), (-2, -2), (-1, -3), (0, -3), (1, -2)),
+            )
+            tactic.choose_actions(turn)
+
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        self.assertGreaterEqual(queue["patient_progress"]["stalled_ticks"], 2)
+        self.assertEqual(queue["reserved_resources"], 1)
+        self.assertFalse(queue["core_slot_reserved"])
+        self.assertTrue(queue["timeline"]["production_allowed"])
+
+    def test_resource_route_uses_safe_detour_before_waiting_on_service_zone(self) -> None:
+        memory = TacticMemory(
+            opening_complete=True,
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            service_entrance=(1, 0),
+            service_queue_cells=((1, 0), (2, 0)),
+            service_exit_cell=(-1, 0),
+        )
+        memory.known_passable.update(
+            (x, y) for x in range(-1, 5) for y in range(-2, 3)
+        )
+        worker = unit(1, UnitType.WORKER, (1, 1))
+        tactic = BalancedTactic(memory=memory)
+        turn = make_turn(
+            units=(worker,),
+            resource_cells=((3, 0),),
+            resources=0,
+        )
+
+        tactic.choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.unit_actions[worker.id], MoveAction)
+        task = next(
+            item
+            for item in tactic.last_decision_trace["tasks"]
+            if item["actor_id"] == str(worker.id)
+        )
+        self.assertNotEqual(task["reason"], "RESOURCE_ROUTE_BLOCKED_THIS_TICK")
+
+    def test_stalled_resource_job_releases_target_and_backs_off_same_tick(self) -> None:
+        memory = TacticMemory(opening_complete=True)
+        memory.known_passable.update((x, 0) for x in range(0, 8))
+        worker = unit(1, UnitType.WORKER, (4, 0))
+        tactic = BalancedTactic(memory=memory)
+
+        for tick in (1, 2, 3):
+            turn = make_turn(
+                tick=tick,
+                units=(worker,),
+                resource_cells=((6, 0),),
+                resources=0,
+            )
+            tactic.choose_actions(turn)
+
+        task = next(
+            item
+            for item in tactic.last_decision_trace["tasks"]
+            if item["actor_id"] == str(worker.id)
+        )
+        self.assertEqual(task["reason"], "RESOURCE_STALL_SCOUT_FALLBACK")
+        progress = tactic.last_decision_trace["economy"]["worker_task_progress"][0]
+        self.assertEqual(progress["rejection_reason"], "RESOURCE_TASK_STALLED")
+        self.assertGreaterEqual(progress["backoff_until"], 11)
+
+    def test_far_patient_does_not_preempt_loaded_worker_already_on_core(self) -> None:
+        memory = TacticMemory(
+            opening_complete=True,
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            service_entrance=(1, 0),
+            service_queue_cells=((1, 0), (2, 0)),
+            service_exit_cell=(0, -1),
+        )
+        carrier = unit(1, UnitType.WORKER, (0, 0), cargo=1)
+        patient = unit(2, UnitType.RANGER, (-1, -2), hp=1)
+        turn = make_turn(
+            units=(carrier, patient),
+            resources=1,
+            obstacle_cells=((-1, -1), (-2, -2), (-1, -3), (0, -3), (1, -2)),
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.unit_actions[carrier.id], DepositAction)
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        self.assertEqual(queue["admission_id"], str(carrier.id))
+        self.assertEqual(queue["timeline"]["next_service_eta"], 0)
+
+    def test_waiting_carriers_receive_distinct_overflow_positions(self) -> None:
+        carriers = tuple(
+            unit(index, UnitType.WORKER, (8 + index, 0), cargo=1)
+            for index in range(1, 5)
+        )
+        memory = TacticMemory(opening_complete=True)
+        memory.known_passable.update(
+            (x, y) for x in range(-12, 13) for y in range(-12, 13)
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(make_turn(units=carriers, resources=0))
+
+        overflow = tactic.last_decision_trace["economy"]["service_queue"]["overflow_slots"]
+        self.assertEqual(len(overflow), 3)
+        self.assertEqual(len({tuple(row["cell"]) for row in overflow}), 3)
 
     def test_local_emergency_patient_reserves_core_slot_and_blocks_spawn(self) -> None:
         memory = TacticMemory(opening_complete=True)
@@ -70,7 +218,7 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         self.assertTrue(queue["core_slot_reserved"])
         self.assertEqual(
             tactic.last_decision_trace["economy"]["production_candidates"][0]["reason"],
-            "URGENT_PATIENT_CORE_SLOT_RESERVED",
+            "SERVICE_DUE_THIS_TICK",
         )
 
     def test_all_half_health_combat_patients_reserve_missing_hp(self) -> None:
@@ -903,6 +1051,13 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         self.assertEqual(len(queue["holding_depositors"]), 1)
         for carrier in carriers:
             action = turn.plan.unit_actions[carrier.id]
+            if isinstance(action, WaitAction):
+                overflow = {
+                    row["worker_id"]: tuple(row["cell"])
+                    for row in queue["overflow_slots"]
+                }
+                self.assertEqual(overflow[str(carrier.id)], carrier.position)
+                continue
             self.assertIsInstance(action, MoveAction)
             destination = (
                 carrier.position[0] + action.direction.delta[0],
@@ -1243,7 +1398,9 @@ class EconomyAndLogisticsTests(unittest.TestCase):
 
         tactic.choose_actions(turn)
 
-        self.assertEqual(tactic.memory.service_admission_id, patient.id)
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        self.assertEqual(queue["timeline"]["requests"][0]["actor_id"], str(patient.id))
+        self.assertEqual(queue["timeline"]["requests"][0]["operation"], "HEAL")
         action = turn.plan.unit_actions[patient.id]
         self.assertIsInstance(action, MoveAction)
         self.assertEqual(action.direction, Direction.LEFT)
@@ -1325,7 +1482,8 @@ class EconomyAndLogisticsTests(unittest.TestCase):
 
         tactic.choose_actions(turn)
 
-        self.assertEqual(tactic.memory.service_admission_id, worker.id)
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        self.assertEqual(queue["timeline"]["requests"][0]["actor_id"], str(worker.id))
         task = next(
             item
             for item in tactic.last_decision_trace["tasks"]
@@ -1490,13 +1648,13 @@ class EconomyAndLogisticsTests(unittest.TestCase):
 
     def test_global_resource_matching_is_one_to_one_and_nearest(self) -> None:
         workers = (
-            unit(1, UnitType.WORKER, (-1, 0)),
-            unit(2, UnitType.WORKER, (1, 0)),
+            unit(1, UnitType.WORKER, (-5, 0)),
+            unit(2, UnitType.WORKER, (5, 0)),
         )
         turn = make_turn(
             units=workers,
             resources=0,
-            resource_cells=((-3, 0), (3, 0)),
+            resource_cells=((-7, 0), (7, 0)),
         )
         tactic = BalancedTactic()
 
@@ -1506,8 +1664,8 @@ class EconomyAndLogisticsTests(unittest.TestCase):
             item["worker_id"]: tuple(item["target"])
             for item in tactic.last_decision_trace["economy"]["resource_assignments"]
         }
-        self.assertEqual(assignments[str(workers[0].id)], (-3, 0))
-        self.assertEqual(assignments[str(workers[1].id)], (3, 0))
+        self.assertEqual(assignments[str(workers[0].id)], (-7, 0))
+        self.assertEqual(assignments[str(workers[1].id)], (7, 0))
 
     def test_adjacent_visible_resource_preempts_exploration_when_return_field_is_capped(self) -> None:
         core = friendly_core(position=(0, 0))

@@ -11,10 +11,13 @@ from arena_tactic import (
     ActionIntent,
     BalancedTactic,
     CoreServiceQueue,
+    CoreOperationRequest,
+    CoreOperationTimeline,
     CrisisForceBaseline,
     EnemyRangerFireEstimate,
     FireMission,
     HomeCombatAssignment,
+    HomeCounterSiegeDecision,
     IntentResolution,
     PatientAdmissionProgress,
     TacticalMap,
@@ -23,6 +26,7 @@ from arena_tactic import (
     VanguardIntentEstimate,
     VanguardAssignmentCandidate,
     VanguardInterceptTask,
+    WorkerTaskProgress,
     WorldModel,
 )
 from tests.helpers import make_turn, unit
@@ -35,6 +39,8 @@ class PublicContractTests(unittest.TestCase):
             ActionIntent,
             IntentResolution,
             CoreServiceQueue,
+            CoreOperationRequest,
+            CoreOperationTimeline,
             FireMission,
             ThreatHeatCell,
             TacticalMap,
@@ -42,9 +48,11 @@ class PublicContractTests(unittest.TestCase):
             EnemyRangerFireEstimate,
             CrisisForceBaseline,
             HomeCombatAssignment,
+            HomeCounterSiegeDecision,
             PatientAdmissionProgress,
             VanguardAssignmentCandidate,
             VanguardInterceptTask,
+            WorkerTaskProgress,
         ):
             self.assertTrue(dataclasses.is_dataclass(value_type))
             self.assertTrue(value_type.__dataclass_params__.frozen)
@@ -93,14 +101,14 @@ class PublicContractTests(unittest.TestCase):
 
         self.assertIsInstance(turn.plan.unit_actions[worker.id], WaitAction)
 
-    def test_decision_trace_is_detached_schema_26_data(self) -> None:
+    def test_decision_trace_is_detached_schema_27_data(self) -> None:
         turn = make_turn(units=(unit(1, UnitType.WORKER, (1, 0)),))
         tactic = BalancedTactic()
         tactic.choose_actions(turn)
 
         trace = tactic.last_decision_trace
 
-        self.assertEqual(trace["schema_version"], 26)
+        self.assertEqual(trace["schema_version"], 27)
         self.assertIn("resolution", trace)
         self.assertIn("world", trace)
         global_map = trace["world"]["global_map"]

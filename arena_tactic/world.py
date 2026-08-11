@@ -181,6 +181,7 @@ def _sync_events(
             # Worker's stable scout slot, but require a fresh target while it
             # is still on the Core so CLEAR_CORE becomes the first scout step.
             memory.unit_missions.pop(event.actor_id, None)
+            memory.worker_task_progress.pop(event.actor_id, None)
             memory.service_egress_worker_ids.add(event.actor_id)
             scout = memory.worker_scout_states.get(event.actor_id)
             if scout is not None:
@@ -191,6 +192,25 @@ def _sync_events(
                     stalled_ticks=0,
                     assigned_tick=turn.tick,
                 )
+        elif (
+            event.event_type == "DESTRUCTION_PARTICIPATION"
+            and event.reason_code == "CORE"
+            and event.target_id is not None
+        ):
+            memory.enemy_core_intel.pop(event.target_id, None)
+            if memory.counter_siege_target_id == event.target_id:
+                memory.counter_siege_target_id = None
+                memory.counter_siege_last_seen_tick = None
+                memory.counter_siege_last_position = None
+                memory.counter_siege_member_ids = ()
+                memory.counter_siege_reserve_ids = ()
+                memory.counter_siege_phase = "IDLE"
+            if memory.raid_target_id == event.target_id:
+                memory.raid_target_id = None
+                memory.raid_last_seen_tick = None
+                memory.raid_last_position = None
+                memory.raid_member_ids = ()
+                memory.raid_phase = "IDLE"
         elif event.event_type == "HARVEST_SUCCEEDED":
             if event.position is not None:
                 memory.resource_harvest_count[event.position] += 1
@@ -207,6 +227,7 @@ def _sync_events(
                 if mission is not None and mission.target is not None:
                     memory.resource_memory.pop(mission.target, None)
                     memory.unit_missions.pop(event.actor_id, None)
+                    memory.worker_task_progress.pop(event.actor_id, None)
         elif event.event_type in {
             "UNIT_MOVE_FAILED",
             "CORE_MOVE_FAILED",
@@ -380,6 +401,12 @@ def _sync_friendly_memory(
     for unit_id in tuple(memory.worker_scout_states):
         if unit_id not in living_ids:
             memory.worker_scout_states.pop(unit_id, None)
+    for unit_id in tuple(memory.worker_task_progress):
+        if unit_id not in living_ids:
+            memory.worker_task_progress.pop(unit_id, None)
+    for key in tuple(memory.worker_resource_backoff):
+        if key[0] not in living_ids:
+            memory.worker_resource_backoff.pop(key, None)
     service_cells = {
         *(
             cell

@@ -15,6 +15,7 @@ from .models import (
     MoveAttempt,
     MoveFailure,
     PatientAdmissionProgress,
+    WorkerTaskProgress,
     SquadState,
     WorkerEscapeState,
     WorkerPatrolMode,
@@ -65,6 +66,8 @@ class TacticMemory:
     last_positions: dict[UUID, Position] = field(default_factory=dict)
     worker_escape_states: dict[UUID, WorkerEscapeState] = field(default_factory=dict)
     worker_scout_states: dict[UUID, WorkerScoutState] = field(default_factory=dict)
+    worker_task_progress: dict[UUID, WorkerTaskProgress] = field(default_factory=dict)
+    worker_resource_backoff: dict[tuple[UUID, Position], int] = field(default_factory=dict)
     manual_move_leases: dict[UUID, ManualMoveLease] = field(default_factory=dict)
     last_move_attempts: dict[UUID, MoveAttempt] = field(default_factory=dict)
     failed_unit_moves: dict[UUID, MoveFailure] = field(default_factory=dict)
@@ -126,6 +129,12 @@ class TacticMemory:
     raid_phase: str = "IDLE"
     raid_interrupted_tick: int | None = None
     raid_containment_mode: bool = False
+    counter_siege_target_id: UUID | None = None
+    counter_siege_last_seen_tick: int | None = None
+    counter_siege_last_position: Position | None = None
+    counter_siege_member_ids: tuple[UUID, ...] = ()
+    counter_siege_reserve_ids: tuple[UUID, ...] = ()
+    counter_siege_phase: str = "IDLE"
     beacon_mission_actor_id: UUID | None = None
     beacon_mission_target: Position | None = None
 
@@ -143,6 +152,8 @@ class TacticMemory:
         self.last_positions.clear()
         self.worker_escape_states.clear()
         self.worker_scout_states.clear()
+        self.worker_task_progress.clear()
+        self.worker_resource_backoff.clear()
         self.engaged_enemy_until.clear()
         self.manual_move_leases.clear()
         self.last_move_attempts.clear()
@@ -191,6 +202,12 @@ class TacticMemory:
         self.raid_phase = "IDLE"
         self.raid_interrupted_tick = None
         self.raid_containment_mode = False
+        self.counter_siege_target_id = None
+        self.counter_siege_last_seen_tick = None
+        self.counter_siege_last_position = None
+        self.counter_siege_member_ids = ()
+        self.counter_siege_reserve_ids = ()
+        self.counter_siege_phase = "IDLE"
         self.beacon_mission_actor_id = None
         self.beacon_mission_target = None
 

@@ -66,6 +66,13 @@ class RecoveryPlanner:
                 )
             urgent = unit.hp * 2 <= UNIT_MAX_HP[unit.unit_type]
             priority = 40 if urgent else 45
+            scheduled = bool(
+                service.timeline is not None
+                and any(
+                    request.actor_id == unit.id and request.operation == "HEAL"
+                    for request in service.timeline.requests
+                )
+            )
             admitted = service.admission_id == unit.id
             missing = UNIT_MAX_HP[unit.unit_type] - unit.hp
             if (
@@ -87,7 +94,7 @@ class RecoveryPlanner:
                 continue
 
             target = None
-            if admitted and service.paused_reason is None:
+            if (admitted or scheduled) and service.paused_reason is None:
                 target = (
                     service.patient_gateway
                     if service.patient_gateway is not None
@@ -115,7 +122,7 @@ class RecoveryPlanner:
                     and cell not in {unit.position, target, world.core.position}
                 )
                 allowed_service_cells = {unit.position, target, world.core.position}
-                if admitted:
+                if admitted or scheduled:
                     # An admitted patient must be able to use the same narrow
                     # corridor that cargo normally occupies.  The resolver
                     # still arbitrates capacity and same-Tick handoffs.
@@ -166,12 +173,12 @@ class RecoveryPlanner:
                                 tie_break=step.score,
                                 reason=(
                                     service.service
-                                    if admitted
+                                    if admitted or scheduled
                                     else "WORKER_RECOVERY_SAFE_APPROACH"
                                 ),
                                 metadata=(
-                                    ("allow_protected", admitted),
-                                    ("allow_head_on_swap", admitted),
+                                    ("allow_protected", admitted or scheduled),
+                                    ("allow_head_on_swap", admitted or scheduled),
                                     ("forward_exits", step.forward_exits),
                                     ("survival_terminals", step.survival_terminals),
                                     ("first_step_heat", step.heat),
@@ -207,12 +214,12 @@ class RecoveryPlanner:
                                 tie_break=(route.distance,),
                                 reason=(
                                     service.service
-                                    if admitted
+                                    if admitted or scheduled
                                     else "RECOVERY_STAGING_APPROACH"
                                 ),
                                 metadata=(
-                                    ("allow_protected", admitted),
-                                    ("allow_head_on_swap", admitted),
+                                    ("allow_protected", admitted or scheduled),
+                                    ("allow_head_on_swap", admitted or scheduled),
                                 ),
                             )
                         )

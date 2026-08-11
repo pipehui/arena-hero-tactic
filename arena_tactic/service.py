@@ -7,9 +7,11 @@ from uuid import UUID
 from arena_hero import CoreState, Position, UnitType
 
 from .config import TacticConfig
-from .geometry import DIRECTION_ORDER, add_direction, cardinal_neighbors, manhattan
+from .geometry import DIRECTION_ORDER, add_direction, cardinal_neighbors, manhattan, manhattan_ring
 from .models import (
     ActionIntent,
+    CoreOperationRequest,
+    CoreOperationTimeline,
     CoreServiceQueue,
     EntitySnapshot,
     IntentAction,
@@ -185,7 +187,7 @@ class CoreServicePlanner:
         patient_gateway = self._choose_patient_gateway(
             world,
             projection,
-            urgent[0] if urgent else None,
+            urgent[0] if urgent else wounded[0] if wounded else None,
             entrance,
             exit_cell,
             service_core_position,
@@ -204,6 +206,15 @@ class CoreServicePlanner:
         )
         active_approaching = approaching[:1]
         holding = approaching[1:]
+        overflow_slots = self._overflow_slots(
+            world,
+            projection,
+            holding,
+            service_core_position,
+            queue_cells,
+            entrance,
+            exit_cell,
+        )
         ready_ids = {unit.id for unit in ready}
 
         # START_MOVE is validated before harvest/deposit and turns the Core
@@ -219,6 +230,7 @@ class CoreServicePlanner:
                 depositors=tuple(unit.id for unit in (*ready, *approaching)),
                 approaching_depositors=tuple(unit.id for unit in active_approaching),
                 holding_depositors=tuple(unit.id for unit in (*ready, *holding)),
+                overflow_slots=overflow_slots,
                 queue_slots=tuple((unit.id, target) for unit in active_approaching),
                 worker_progress=tuple(
                     (
@@ -268,6 +280,8 @@ class CoreServicePlanner:
             lane_index,
             head,
             units_by_id,
+            patient_gateway,
+            projection,
         )
         if (
             self.memory.storage_saturated
@@ -311,20 +325,31 @@ class CoreServicePlanner:
             if lane_threatened and not treatment_service
             else None
         )
-        core_slot_reserved = bool(
-            treatment_service
-            and admitted_unit is not None
-            and (
-                admitted_unit.position == core.position
-                or patient_gateway is not None
-                and manhattan(admitted_unit.position, patient_gateway) <= 2
-            )
-        )
         patient_progress = self._patient_progress(
             world,
-            admitted_unit if treatment_service else None,
+            projection,
+            (
+                urgent[0]
+                if urgent
+                else admitted_unit
+                if treatment_service
+                else None
+            ),
             patient_gateway,
         )
+        timeline = self._operation_timeline(
+            world,
+            projection,
+            admission,
+            service,
+            patient_progress,
+            ready,
+            head,
+            reserved,
+            exit_cell,
+            patient_gateway,
+        )
+        core_slot_reserved = timeline.current_slot_reserved
 
         release_reason = self._release_reason(
             previous_admission,
@@ -346,6 +371,7 @@ class CoreServicePlanner:
         )
         allow_advance = not lane_threatened and service in {
             "DEPOSIT",
+            "DEPOSIT_BEFORE_PATIENT",
             "HEAL_FUNDING",
             "WOUNDED_CARGO_DEPOSIT",
         }
@@ -357,6 +383,7 @@ class CoreServicePlanner:
             ready_depositors=tuple(unit.id for unit in ready),
             approaching_depositors=tuple(unit.id for unit in active_approaching),
             holding_depositors=tuple(unit.id for unit in holding),
+            overflow_slots=overflow_slots,
             ready_ticks=tuple(
                 (unit.id, self.memory.cargo_arrival_ticks[unit.id]) for unit in ready
             ),
@@ -385,12 +412,60 @@ class CoreServicePlanner:
             patient_gateway=patient_gateway,
             core_slot_reserved=core_slot_reserved,
             patient_progress=patient_progress,
+            timeline=timeline,
             reserved_resources=reserved,
             paused_reason=paused_reason,
             previous_admission_id=previous_admission,
             admission_reason=admission_reason,
             release_reason=release_reason,
         )
+
+    def _overflow_slots(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        holding: tuple[EntitySnapshot, ...],
+        core_position: Position,
+        queue_cells: tuple[Position, ...],
+        entrance: Position | None,
+        exit_cell: Position | None,
+    ) -> tuple[tuple[UUID, Position], ...]:
+        if not holding:
+            return ()
+        protected = {
+            core_position,
+            *queue_cells,
+            *(cell for cell in (entrance, exit_cell) if cell is not None),
+        }
+        candidates = tuple(
+            cell
+            for radius in range(
+                self.config.service_lane_depth + 2,
+                self.config.service_lane_depth + 7,
+            )
+            for cell in manhattan_ring(core_position, radius)
+            if cell in world.known_passable
+            and cell not in world.known_obstacles
+            and cell not in projection.hostile_occupied
+            and cell not in protected
+            and projection.immediate_attackers(cell) == 0
+        )
+        available = set(candidates)
+        rows: list[tuple[UUID, Position]] = []
+        for worker in sorted(holding, key=lambda unit: unit.id.bytes):
+            target = min(
+                available,
+                key=lambda cell: (
+                    manhattan(worker.position, cell),
+                    projection.future_attackers(cell),
+                    projection.threat_heat.get(cell, 0),
+                    cell,
+                ),
+                default=worker.position,
+            )
+            rows.append((worker.id, target))
+            available.discard(target)
+        return tuple(rows)
 
     def _choose_patient_gateway(
         self,
@@ -441,6 +516,7 @@ class CoreServicePlanner:
     def _patient_progress(
         self,
         world: WorldModel,
+        projection: TacticalMap,
         patient: EntitySnapshot | None,
         gateway: Position | None,
     ) -> PatientAdmissionProgress | None:
@@ -455,6 +531,22 @@ class CoreServicePlanner:
             and previous.last_position == patient.position
             else 0
         )
+        entry_distance: int | None
+        if world.core is not None and patient.position == world.core.position:
+            entry_distance = 0
+        elif gateway is None:
+            entry_distance = None
+        else:
+            route = route_to(
+                world,
+                patient.position,
+                gateway,
+                node_limit=self.config.path_node_limit,
+                blocked=frozenset(
+                    projection.hostile_occupied - {patient.position, gateway}
+                ),
+            )
+            entry_distance = None if route is None else route.distance + 1
         progress = PatientAdmissionProgress(
             patient_id=patient.id,
             gateway=gateway,
@@ -465,13 +557,7 @@ class CoreServicePlanner:
             ),
             last_position=patient.position,
             stalled_ticks=stalled,
-            entry_distance=(
-                0
-                if world.core is not None and patient.position == world.core.position
-                else None
-                if gateway is None
-                else manhattan(patient.position, gateway) + 1
-            ),
+            entry_distance=entry_distance,
         )
         self.memory.patient_admission_progress = progress
         return progress
@@ -684,6 +770,8 @@ class CoreServicePlanner:
         lane_index: dict[Position, int],
         head: EntitySnapshot | None,
         units_by_id: dict[UUID, EntitySnapshot],
+        patient_gateway: Position | None,
+        projection: TacticalMap,
     ) -> tuple[UUID | None, str, int]:
         admission: UUID | None = None
         service = "IDLE"
@@ -731,12 +819,30 @@ class CoreServicePlanner:
                 else:
                     service = "EMERGENCY_APPROACH"
             elif world.resources >= missing:
-                if manhattan(
-                    patient.position,
-                    service_core_position,
-                ) <= self.config.service_patient_ready_radius:
+                # Funding is reserved immediately, but the physical Core slot
+                # is admitted only when the patient can actually enter this
+                # Tick.  A distant patient keeps approaching through its
+                # dedicated gateway while ready cargo continues to flow.
+                patient_can_enter = (
+                    patient.position == service_core_position
+                    or manhattan(patient.position, service_core_position) == 1
+                    and projection.immediate_attackers(service_core_position) < patient.hp
+                )
+                if patient_can_enter:
                     admission = patient.id
                     service = "EMERGENCY_HEAL"
+                elif head is not None:
+                    admission = (
+                        previous_admission
+                        if self._existing_is_front(
+                            previous_admission,
+                            ready,
+                            ready_ids,
+                            lane_index,
+                        )
+                        else head.id
+                    )
+                    service = "DEPOSIT_BEFORE_PATIENT"
                 else:
                     service = "EMERGENCY_APPROACH"
             elif head is not None:
@@ -777,6 +883,150 @@ class CoreServicePlanner:
         if admission is None and carriers and service == "IDLE":
             service = "DEPOSIT_APPROACH"
         return admission, service, reserved
+
+    def _operation_timeline(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        admission_id: UUID | None,
+        service: str,
+        patient_progress: PatientAdmissionProgress | None,
+        ready: tuple[EntitySnapshot, ...],
+        head: EntitySnapshot | None,
+        reserved_resources: int,
+        exit_cell: Position | None,
+        patient_gateway: Position | None,
+    ) -> CoreOperationTimeline:
+        assert world.core is not None
+        core = world.core
+        units = {unit.id: unit for unit in world.friendlies}
+        requests: list[CoreOperationRequest] = []
+        patient = (
+            None
+            if patient_progress is None
+            else units.get(patient_progress.patient_id)
+        )
+        if patient is not None and patient_progress.entry_distance is not None:
+            missing = UNIT_MAX_HP[patient.unit_type] - patient.hp
+            eta = patient_progress.entry_distance
+            requests.append(
+                CoreOperationRequest(
+                    actor_id=patient.id,
+                    operation="HEAL",
+                    eta=eta,
+                    occupy_tick=world.tick + eta,
+                    release_tick=world.tick + eta + 1,
+                    priority=10,
+                    resource_cost=missing,
+                    gateway=patient_gateway,
+                )
+            )
+        if head is not None:
+            if head.position == core.position:
+                eta = 0
+            else:
+                route = route_to(
+                    world,
+                    head.position,
+                    core.position,
+                    node_limit=self.config.path_node_limit,
+                    blocked=frozenset(
+                        projection.hostile_occupied - {head.position, core.position}
+                    ),
+                )
+                eta = None if route is None else route.distance
+            if eta is not None:
+                requests.append(
+                    CoreOperationRequest(
+                        actor_id=head.id,
+                        operation="DEPOSIT",
+                        eta=eta,
+                        occupy_tick=world.tick + eta,
+                        release_tick=world.tick + eta + 1,
+                        priority=20,
+                        resource_gain=head.cargo,
+                        gateway=self.memory.service_entrance,
+                    )
+                )
+        requests.sort(
+            key=lambda item: (
+                item.eta,
+                item.priority,
+                b"" if item.actor_id is None else item.actor_id.bytes,
+            )
+        )
+        current_occupant = next(
+            (unit.id for unit in world.friendlies if unit.position == core.position),
+            None,
+        )
+        occupant_unit = (
+            units.get(current_occupant)
+            if current_occupant is not None
+            else None
+        )
+        admission = units.get(admission_id) if admission_id is not None else None
+        current_slot_reserved = bool(
+            current_occupant is not None
+            or admission is not None
+            and (
+                admission.position == core.position
+                or manhattan(admission.position, core.position) == 1
+            )
+        )
+        next_request = requests[0] if requests else None
+        protected_next = {
+            cell
+            for cell in (self.memory.service_entrance, *self.memory.service_queue_cells)
+            if cell is not None
+        }
+        egress_rows = tuple(
+            cell
+            for _, cell in cardinal_neighbors(core.position)
+            if cell in world.known_passable
+            and cell not in world.known_obstacles
+            and cell not in projection.hostile_occupied
+            and cell not in protected_next
+            and projection.immediate_attackers(cell) == 0
+        )
+        occupant_can_egress = bool(
+            occupant_unit is not None
+            and occupant_unit.id != admission_id
+            and (
+                occupant_unit.unit_type is not UnitType.WORKER
+                or occupant_unit.cargo == 0
+            )
+            and egress_rows
+        )
+        production_allowed = (
+            (not current_slot_reserved or occupant_can_egress)
+            and bool(egress_rows)
+        )
+        reason = "SAFE_BEFORE_FUTURE_SERVICE"
+        if not egress_rows:
+            production_allowed = False
+            reason = "NO_SAFE_SPAWN_EGRESS"
+        elif next_request is not None and next_request.eta <= 1:
+            # A service actor adjacent to the Core resolves movement before
+            # heal/deposit in this Tick, so a spawn would contend for the same
+            # two-entity cell even if an exit exists for the following Tick.
+            production_allowed = False
+            reason = "SERVICE_DUE_THIS_TICK"
+        elif current_slot_reserved and occupant_can_egress:
+            reason = "CURRENT_OCCUPANT_CAN_EGRESS"
+        elif current_slot_reserved:
+            reason = "CURRENT_TICK_SERVICE_SLOT"
+        return CoreOperationTimeline(
+            tick=world.tick,
+            requests=tuple(requests),
+            current_slot_owner=current_occupant,
+            current_slot_reserved=current_slot_reserved,
+            next_service_eta=None if next_request is None else next_request.eta,
+            next_service_tick=None if next_request is None else next_request.occupy_tick,
+            next_release_tick=None if next_request is None else next_request.release_tick,
+            production_allowed=production_allowed,
+            spawn_egress_cell=min(egress_rows, default=exit_cell),
+            reason=reason,
+        )
 
     @staticmethod
     def _queue_slots(

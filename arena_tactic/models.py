@@ -33,6 +33,7 @@ class UnitMission(str, Enum):
     HARVEST = "HARVEST"
     HOME_GUARD = "HOME_GUARD"
     HOME_DEFENSE = "HOME_DEFENSE"
+    COUNTER_SIEGE = "COUNTER_SIEGE"
     RAID = "RAID"
     EXPLORE = "EXPLORE"
     PATROL = "PATROL"
@@ -383,6 +384,7 @@ class CoreServiceQueue:
     holding_depositors: tuple[UUID, ...] = ()
     ready_ticks: tuple[tuple[UUID, int], ...] = ()
     queue_slots: tuple[tuple[UUID, Position], ...] = ()
+    overflow_slots: tuple[tuple[UUID, Position], ...] = ()
     worker_progress: tuple[tuple[UUID, Position, int], ...] = ()
     wounded: tuple[UUID, ...] = ()
     entrance: Position | None = None
@@ -390,6 +392,7 @@ class CoreServiceQueue:
     exit_cell: Position | None = None
     patient_gateway: Position | None = None
     core_slot_reserved: bool = False
+    timeline: "CoreOperationTimeline | None" = None
     patient_progress: "PatientAdmissionProgress | None" = None
     reserved_resources: int = 0
     paused_reason: str | None = None
@@ -406,6 +409,55 @@ class PatientAdmissionProgress:
     last_position: Position
     stalled_ticks: int = 0
     entry_distance: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CoreOperationRequest:
+    actor_id: UUID | None
+    operation: str
+    eta: int
+    occupy_tick: int
+    release_tick: int
+    priority: int
+    resource_cost: int = 0
+    resource_gain: int = 0
+    gateway: Position | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CoreOperationTimeline:
+    tick: int
+    requests: tuple[CoreOperationRequest, ...] = ()
+    current_slot_owner: UUID | None = None
+    current_slot_reserved: bool = False
+    next_service_eta: int | None = None
+    next_service_tick: int | None = None
+    next_release_tick: int | None = None
+    production_allowed: bool = True
+    spawn_egress_cell: Position | None = None
+    reason: str = "NO_CURRENT_SERVICE"
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerTaskProgress:
+    worker_id: UUID
+    target: Position
+    route_distance: int | None
+    last_progress_tick: int
+    stalled_ticks: int = 0
+    rejection_reason: str | None = None
+    backoff_until: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class HomeCounterSiegeDecision:
+    phase: str = "IDLE"
+    target_id: UUID | None = None
+    target_position: Position | None = None
+    member_ids: tuple[UUID, ...] = ()
+    reserve_ids: tuple[UUID, ...] = ()
+    last_seen_tick: int | None = None
+    reason: str = "NO_LOCAL_ENEMY_CORE"
 
 
 @dataclass(frozen=True, slots=True)

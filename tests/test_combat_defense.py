@@ -8,6 +8,7 @@ from arena_hero import (
     ChampionBeacon,
     Direction,
     MoveAction,
+    ResolutionEvent,
     ShootAction,
     SpawnAction,
     SweepAction,
@@ -17,7 +18,7 @@ from arena_hero import (
 
 from arena_tactic import BalancedTactic, TacticMemory
 from arena_tactic.geometry import manhattan_ring, ranger_firing_positions, ranger_line_is_clear
-from tests.helpers import enemy_core, friendly_core, make_turn, unit
+from tests.helpers import enemy_core, friendly_core, make_turn, uid, unit
 
 
 class CombatDefenseTests(unittest.TestCase):
@@ -147,6 +148,86 @@ class CombatDefenseTests(unittest.TestCase):
             if item["actor_id"] in {str(unit.id) for unit in defenders}
         }
         self.assertIn("PATROL", missions)
+
+    def test_home_defenders_counter_siege_exposed_enemy_core_after_units_clear(self) -> None:
+        defenders = (
+            unit(1, UnitType.VANGUARD, (4, 0)),
+            unit(2, UnitType.RANGER, (3, 0)),
+            unit(3, UnitType.VANGUARD, (0, 1)),
+            unit(4, UnitType.RANGER, (0, -1)),
+        )
+        hostile_core = enemy_core(500, (5, 0), shield=0)
+        tactic = BalancedTactic(memory=TacticMemory(opening_complete=True))
+
+        tactic.choose_actions(
+            make_turn(
+                tick=1,
+                units=defenders,
+                enemies=(
+                    hostile_core,
+                    unit(600, UnitType.VANGUARD, (5, 1), controlled=False),
+                ),
+                resources=0,
+            )
+        )
+        turn = make_turn(
+            tick=2,
+            units=defenders,
+            enemies=(hostile_core,),
+            resources=0,
+        )
+
+        tactic.choose_actions(turn)
+
+        attacks = tuple(
+            task
+            for task in tactic.last_decision_trace["tasks"]
+            if task["target_id"] == str(hostile_core.id)
+        )
+        self.assertTrue(attacks)
+        self.assertTrue(
+            any(task["reason"].startswith("COUNTER_SIEGE") for task in attacks)
+        )
+        counter = tactic.last_decision_trace["combat"]["counter_siege"]
+        self.assertEqual(counter["phase"], "PRESSING")
+        self.assertEqual(counter["target_id"], str(hostile_core.id))
+
+    def test_counter_siege_releases_destroyed_enemy_core_immediately(self) -> None:
+        defenders = (
+            unit(1, UnitType.VANGUARD, (4, 0)),
+            unit(2, UnitType.RANGER, (3, 0)),
+            unit(3, UnitType.VANGUARD, (0, 1)),
+            unit(4, UnitType.RANGER, (0, -1)),
+        )
+        hostile_core = enemy_core(500, (5, 0), shield=0)
+        tactic = BalancedTactic(memory=TacticMemory(opening_complete=True))
+        tactic.choose_actions(
+            make_turn(
+                tick=1,
+                units=defenders,
+                enemies=(
+                    hostile_core,
+                    unit(600, UnitType.VANGUARD, (5, 1), controlled=False),
+                ),
+                resources=0,
+            )
+        )
+        destroyed = ResolutionEvent(
+            event_id=uid(901),
+            tick=2,
+            event_type="DESTRUCTION_PARTICIPATION",
+            target_id=hostile_core.id,
+            reason_code="CORE",
+        )
+
+        tactic.choose_actions(
+            make_turn(tick=2, units=defenders, events=(destroyed,), resources=0)
+        )
+
+        self.assertEqual(
+            tactic.last_decision_trace["combat"]["counter_siege"]["phase"],
+            "IDLE",
+        )
 
     def test_home_alert_freezes_worker_production_after_contact_vanishes(self) -> None:
         units = tuple(

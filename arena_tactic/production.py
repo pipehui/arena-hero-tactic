@@ -9,6 +9,7 @@ from .combat import CombatPlanner
 from .config import TacticConfig
 from .models import (
     ActionIntent,
+    CoreOperationTimeline,
     CrisisForceBaseline,
     EntitySnapshot,
     IntentAction,
@@ -39,16 +40,18 @@ class ProductionPlanner:
         projection: TacticalMap,
         *,
         reserved_resources: int = 0,
-        core_slot_reserved: bool = False,
+        timeline: CoreOperationTimeline | None = None,
     ) -> tuple[list[ActionIntent], tuple[dict[str, object], ...]]:
         if world.core is None or world.core.state is CoreState.MOVING:
             return [], ()
-        if core_slot_reserved:
+        if timeline is not None and not timeline.production_allowed:
             return [], (
                 {
                     "unit_type": None,
-                    "reason": "URGENT_PATIENT_CORE_SLOT_RESERVED",
+                    "reason": timeline.reason,
                     "reserved_resources": reserved_resources,
+                    "next_service_eta": timeline.next_service_eta,
+                    "spawn_egress": timeline.spawn_egress_cell,
                 },
             )
         counts = Counter(unit.unit_type for unit in world.friendlies)

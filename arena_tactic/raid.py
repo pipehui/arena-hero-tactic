@@ -12,7 +12,15 @@ from .geometry import (
     ranger_firing_positions,
     ranger_line_is_clear,
 )
-from .models import ActionIntent, EnemyCoreIntel, EntitySnapshot, IntentAction, UnitMission, WorldModel
+from .models import (
+    ActionIntent,
+    EnemyCoreIntel,
+    EntitySnapshot,
+    HomeCounterSiegeDecision,
+    IntentAction,
+    UnitMission,
+    WorldModel,
+)
 from .planning import route_to
 from .projection import TacticalMap
 from .rules import UNIT_MAX_HP
@@ -127,6 +135,279 @@ class RaidPlanner:
             self.memory.raid_last_position,
             protected,
         )
+
+    def counter_siege_intents(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        protected: frozenset[Position],
+    ) -> tuple[HomeCounterSiegeDecision, list[ActionIntent]]:
+        """Continue a local battle into the hostile Core that supplied it.
+
+        This deliberately is not a normal expedition: the target has already
+        entered the home-defense envelope, so the force-surplus launch gate
+        would create a blind spot exactly when freshly spawned defenders are
+        being cleared.  One healthy V+R pair remains at home and every other
+        healthy combatant keeps pressure on the source Core.
+        """
+
+        if world.core is None:
+            self._clear_counter_siege()
+            return HomeCounterSiegeDecision(reason="CORE_UNAVAILABLE"), []
+        visible = {
+            core.id: core
+            for core in world.enemy_cores
+            if manhattan(core.position, world.core.position) <= 24
+        }
+        active = visible.get(self.memory.counter_siege_target_id)
+        if active is None and self.memory.counter_siege_target_id is not None:
+            age = world.tick - (
+                self.memory.counter_siege_last_seen_tick or world.tick
+            )
+            if age > 4 or self.memory.counter_siege_last_position is None:
+                self._clear_counter_siege()
+            elif (
+                manhattan(
+                    self.memory.counter_siege_last_position,
+                    world.core.position,
+                )
+                > 24
+            ):
+                self._clear_counter_siege()
+        if self.memory.counter_siege_target_id is None:
+            if self.memory.home_defense_alert_until < world.tick:
+                return HomeCounterSiegeDecision(reason="NO_RECENT_HOME_BATTLE"), []
+            candidates = tuple(
+                sorted(
+                    (
+                        core
+                        for core in visible.values()
+                        if manhattan(core.position, world.core.position) <= 18
+                    ),
+                    key=lambda core: (
+                        manhattan(core.position, world.core.position),
+                        core.hp + core.shield,
+                        core.id.bytes,
+                    ),
+                )
+            )
+            if not candidates:
+                return HomeCounterSiegeDecision(reason="NO_LOCAL_ENEMY_CORE"), []
+            active = candidates[0]
+            self.memory.counter_siege_target_id = active.id
+            self.memory.counter_siege_phase = "PRESSING"
+        if active is not None:
+            self.memory.counter_siege_last_seen_tick = world.tick
+            self.memory.counter_siege_last_position = active.position
+        target_id = self.memory.counter_siege_target_id
+        target_position = (
+            active.position
+            if active is not None
+            else self.memory.counter_siege_last_position
+        )
+        if target_id is None or target_position is None:
+            self._clear_counter_siege()
+            return HomeCounterSiegeDecision(reason="TARGET_LOST"), []
+
+        healthy_vanguards = tuple(
+            sorted(
+                (
+                    unit
+                    for unit in world.friendlies
+                    if unit.unit_type is UnitType.VANGUARD
+                    and unit.hp * 2 > UNIT_MAX_HP[UnitType.VANGUARD]
+                    and unit.id != world.beacon.carrier_id
+                ),
+                key=lambda unit: (
+                    manhattan(unit.position, world.core.position),
+                    unit.id.bytes,
+                ),
+            )
+        )
+        healthy_rangers = tuple(
+            sorted(
+                (
+                    unit
+                    for unit in world.friendlies
+                    if unit.unit_type is UnitType.RANGER
+                    and unit.hp * 2 > UNIT_MAX_HP[UnitType.RANGER]
+                    and unit.id != world.beacon.carrier_id
+                ),
+                key=lambda unit: (
+                    manhattan(unit.position, world.core.position),
+                    unit.id.bytes,
+                ),
+            )
+        )
+        if not healthy_vanguards or not healthy_rangers:
+            decision = HomeCounterSiegeDecision(
+                phase="HOLDING",
+                target_id=target_id,
+                target_position=target_position,
+                last_seen_tick=self.memory.counter_siege_last_seen_tick,
+                reason="HOME_RESERVE_UNAVAILABLE",
+            )
+            return decision, []
+        living_vanguard_ids = {unit.id for unit in healthy_vanguards}
+        living_ranger_ids = {unit.id for unit in healthy_rangers}
+        previous_reserve = tuple(
+            item
+            for item in self.memory.counter_siege_reserve_ids
+            if item in living_vanguard_ids | living_ranger_ids
+        )
+        reserve_vanguard = next(
+            (item for item in previous_reserve if item in living_vanguard_ids),
+            healthy_vanguards[0].id,
+        )
+        reserve_ranger = next(
+            (item for item in previous_reserve if item in living_ranger_ids),
+            healthy_rangers[0].id,
+        )
+        reserve = (reserve_vanguard, reserve_ranger)
+        self.memory.counter_siege_reserve_ids = reserve
+        members = tuple(
+            unit
+            for unit in (*healthy_vanguards, *healthy_rangers)
+            if unit.id not in reserve
+        )
+        if not members:
+            decision = HomeCounterSiegeDecision(
+                phase="HOLDING",
+                target_id=target_id,
+                target_position=target_position,
+                reserve_ids=reserve,
+                last_seen_tick=self.memory.counter_siege_last_seen_tick,
+                reason="ONLY_HOME_PAIR_AVAILABLE",
+            )
+            return decision, []
+        self.memory.counter_siege_member_ids = tuple(unit.id for unit in members)
+        intents: list[ActionIntent] = []
+        for unit in sorted(members, key=lambda item: item.id.bytes):
+            intents.extend(
+                self._counter_siege_unit_intents(
+                    world,
+                    projection,
+                    unit,
+                    target_id,
+                    target_position,
+                    protected,
+                )
+            )
+        decision = HomeCounterSiegeDecision(
+            phase="PRESSING",
+            target_id=target_id,
+            target_position=target_position,
+            member_ids=tuple(unit.id for unit in members),
+            reserve_ids=reserve,
+            last_seen_tick=self.memory.counter_siege_last_seen_tick,
+            reason="LOCAL_THREAT_SOURCE",
+        )
+        return decision, intents
+
+    def _counter_siege_unit_intents(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        unit: EntitySnapshot,
+        target_id,
+        target: Position,
+        protected: frozenset[Position],
+    ) -> list[ActionIntent]:
+        if unit.unit_type is UnitType.RANGER and ranger_line_is_clear(
+            unit.position, target, world.known_obstacles
+        ):
+            return [
+                ActionIntent.simple(
+                    unit.id,
+                    IntentAction.SHOOT,
+                    UnitMission.COUNTER_SIEGE,
+                    37,
+                    target_id=target_id,
+                    expected_cell=target,
+                    target_position=target,
+                    reason="COUNTER_SIEGE_CORE_FIRE",
+                )
+            ]
+        if unit.unit_type is UnitType.VANGUARD and manhattan(unit.position, target) == 1:
+            direction = direction_between(unit.position, target)
+            if direction is not None:
+                return [
+                    ActionIntent(
+                        actor_id=unit.id,
+                        action=IntentAction.SWEEP,
+                        mission=UnitMission.COUNTER_SIEGE,
+                        priority=37,
+                        direction=direction,
+                        target_id=target_id,
+                        target_position=target,
+                        reason="COUNTER_SIEGE_CORE_SWEEP",
+                    )
+                ]
+        destinations = (
+            tuple(
+                cell
+                for cell in ranger_firing_positions(target)
+                if ranger_line_is_clear(cell, target, world.known_obstacles)
+            )
+            if unit.unit_type is UnitType.RANGER
+            else tuple(cell for _, cell in cardinal_neighbors(target))
+        )
+        routes = []
+        for destination in destinations:
+            if (
+                destination not in world.known_passable
+                or destination in world.known_obstacles
+                or destination in projection.hostile_occupied
+                or destination in protected
+            ):
+                continue
+            route = route_to(
+                world,
+                unit.position,
+                destination,
+                node_limit=self.config.path_node_limit,
+                blocked=frozenset(
+                    (projection.hostile_occupied | protected)
+                    - {unit.position, destination}
+                ),
+            )
+            if route is not None and route.first_direction is not None:
+                routes.append((route.distance, destination, route))
+        if not routes:
+            return [
+                ActionIntent.simple(
+                    unit.id,
+                    IntentAction.WAIT,
+                    UnitMission.COUNTER_SIEGE,
+                    53,
+                    target_id=target_id,
+                    target_position=target,
+                    reason="COUNTER_SIEGE_NO_REACHABLE_POSITION",
+                )
+            ]
+        _, destination, route = min(routes)
+        return [
+            ActionIntent.move(
+                unit.id,
+                UnitMission.COUNTER_SIEGE,
+                52,
+                route.first_direction,
+                route.first_position,
+                risk=projection.future_attackers(route.first_position) * 10,
+                exclusive_destination=True,
+                tie_break=(route.distance,),
+                reason="COUNTER_SIEGE_ADVANCE",
+                metadata=(("target_id", str(target_id)),),
+            )
+        ]
+
+    def _clear_counter_siege(self) -> None:
+        self.memory.counter_siege_target_id = None
+        self.memory.counter_siege_last_seen_tick = None
+        self.memory.counter_siege_last_position = None
+        self.memory.counter_siege_member_ids = ()
+        self.memory.counter_siege_reserve_ids = ()
+        self.memory.counter_siege_phase = "IDLE"
 
     def _choose_target(
         self,

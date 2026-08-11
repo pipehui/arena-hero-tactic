@@ -144,6 +144,8 @@ class ResourceAllocator:
         world: WorldModel,
         projection: TacticalMap,
         workers: tuple[EntitySnapshot, ...],
+        *,
+        hard_blocked: frozenset[Position] = frozenset(),
     ) -> ResourceAllocation:
         if not workers or not projection.resources or world.core is None:
             return ResourceAllocation(())
@@ -153,7 +155,7 @@ class ResourceAllocator:
             resource.position: resource.last_seen_tick
             for resource in projection.resources
         }
-        blocked = self._blocked_positions(world, projection)
+        blocked = self._blocked_positions(world, projection) | hard_blocked
         stable, workers, resources = self._retain_work_orders(
             world,
             projection,
@@ -175,6 +177,10 @@ class ResourceAllocator:
         unreachable = 0
         for worker in sorted(workers, key=lambda item: item.id.bytes):
             for resource in resources:
+                if self.memory.worker_resource_backoff.get(
+                    (worker.id, resource), -1
+                ) >= world.tick:
+                    continue
                 outbound = route_distances.get((worker.id, resource))
                 if outbound is None:
                     unreachable += 1
@@ -257,6 +263,9 @@ class ResourceAllocator:
                 or target not in resource_set
                 or target in claimed
                 or target in blocked
+                or self.memory.worker_resource_backoff.get(
+                    (worker.id, target), -1
+                ) >= world.tick
             ):
                 remaining_workers.append(worker)
                 continue

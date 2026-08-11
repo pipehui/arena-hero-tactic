@@ -17,6 +17,7 @@ from .models import (
     WorkerEscapeState,
     WorkerScoutPhase,
     WorkerScoutState,
+    WorkerTaskProgress,
     WorldModel,
 )
 from .planning import (
@@ -489,11 +490,29 @@ class WorkerPlanner:
         dict[UUID, tuple[Position, Route, int]],
     ]:
         assert world.core is not None
+        for key, expires_tick in tuple(self.memory.worker_resource_backoff.items()):
+            if expires_tick < world.tick:
+                self.memory.worker_resource_backoff.pop(key, None)
         resource_workers = tuple(
             worker for worker in available if worker.position != world.core.position
         )
+        service_blocks = frozenset(
+            cell
+            for cell in (
+                world.core.position,
+                service.service_core_position,
+                service.entrance,
+                service.exit_cell,
+                *service.queue_cells,
+                *dict(service.overflow_slots).values(),
+            )
+            if cell is not None
+        )
         resources = self.resources.allocate(
-            world, projection, resource_workers
+            world,
+            projection,
+            resource_workers,
+            hard_blocked=service_blocks,
         ).as_dict()
         explorers = tuple(
             worker for worker in available if worker.id not in resources
@@ -595,14 +614,62 @@ class WorkerPlanner:
     ) -> list[ActionIntent]:
         if resource is None:
             return []
+        route = self._route(world, projection, worker, resource, service)
+        previous_progress = self.memory.worker_task_progress.get(worker.id)
+        route_distance = None if route is None else route.distance
+        improved = bool(
+            previous_progress is None
+            or previous_progress.target != resource
+            or route_distance is not None
+            and (
+                previous_progress.route_distance is None
+                or route_distance < previous_progress.route_distance
+            )
+        )
+        stalled = 0 if improved else previous_progress.stalled_ticks + 1
+        progress = WorkerTaskProgress(
+            worker_id=worker.id,
+            target=resource,
+            route_distance=route_distance,
+            last_progress_tick=(
+                world.tick
+                if improved or previous_progress is None
+                else previous_progress.last_progress_tick
+            ),
+            stalled_ticks=stalled,
+            rejection_reason=None if route is not None else "NO_SAFE_RESOURCE_ROUTE",
+        )
+        if stalled >= 2:
+            backoff_until = world.tick + 8
+            progress = replace(
+                progress,
+                rejection_reason="RESOURCE_TASK_STALLED",
+                backoff_until=backoff_until,
+            )
+            self.memory.worker_resource_backoff[(worker.id, resource)] = backoff_until
+            self.memory.unit_missions.pop(worker.id, None)
+            self.memory.worker_task_progress[worker.id] = progress
+            return self._resource_stall_fallback(
+                world,
+                projection,
+                service,
+                worker,
+                resource,
+            )
+        self.memory.worker_task_progress[worker.id] = progress
         self.memory.unit_missions[worker.id] = MissionState(
             UnitMission.HARVEST,
             resource,
             world.tick,
         )
-        route = self._route(world, projection, worker, resource, service)
         if route is None or route.first_direction is None:
-            return []
+            return self._resource_stall_fallback(
+                world,
+                projection,
+                service,
+                worker,
+                resource,
+            )
         if not self._manual_allowed(worker.id, route.first_direction, world.tick):
             return [
                 ActionIntent.simple(
@@ -614,7 +681,7 @@ class WorkerPlanner:
                     reason="RESOURCE_MANUAL_LEASE_HOLD",
                 )
             ]
-        return [
+        intents = [
             ActionIntent.move(
                 worker.id,
                 UnitMission.HARVEST,
@@ -625,15 +692,129 @@ class WorkerPlanner:
                 tie_break=(route.distance,),
                 reason="GLOBAL_RESOURCE_MATCH",
             ),
+        ]
+        blocked, _ = self._exploration_navigation(
+            world,
+            projection,
+            worker,
+            service,
+        )
+        alternatives = []
+        for index, (direction, destination) in enumerate(
+            cardinal_neighbors(worker.position)
+        ):
+            if (
+                direction is route.first_direction
+                or destination in blocked
+                or destination in world.known_obstacles
+                or destination not in world.known_passable
+                or projection.immediate_attackers(destination) >= worker.hp
+                or not self._manual_allowed(worker.id, direction, world.tick)
+            ):
+                continue
+            score = (
+                projection.immediate_attackers(destination),
+                projection.future_attackers(destination),
+                projection.worker_exposure(destination)[2],
+                manhattan(destination, resource),
+                self.memory.congestion_counts.get(destination, 0),
+                index,
+            )
+            alternatives.append((score, direction, destination))
+        intents.extend(
+            ActionIntent.move(
+                worker.id,
+                UnitMission.HARVEST,
+                51,
+                direction,
+                destination,
+                risk=score[0] * 100 + score[1] * 10 + score[2],
+                tie_break=score,
+                reason="RESOURCE_SAFE_DETOUR",
+                metadata=(("goal", resource),),
+            )
+            for score, direction, destination in sorted(alternatives)[:3]
+        )
+        intents.append(
             ActionIntent.simple(
                 worker.id,
                 IntentAction.WAIT,
                 UnitMission.HARVEST,
-                51,
+                54,
                 target_position=resource,
                 reason="RESOURCE_ROUTE_BLOCKED_THIS_TICK",
-            ),
+            )
+        )
+        return intents
+
+    def _resource_stall_fallback(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        service: CoreServiceQueue,
+        worker: EntitySnapshot,
+        old_target: Position,
+    ) -> list[ActionIntent]:
+        blocked, _ = self._exploration_navigation(
+            world,
+            projection,
+            worker,
+            service,
+        )
+        rows = []
+        for index, (direction, destination) in enumerate(
+            cardinal_neighbors(worker.position)
+        ):
+            if (
+                destination in blocked
+                or destination not in world.known_passable
+                or destination in world.known_obstacles
+                or projection.immediate_attackers(destination) >= worker.hp
+                or not self._manual_allowed(worker.id, direction, world.tick)
+            ):
+                continue
+            gain = information_gain(
+                destination,
+                tick=world.tick,
+                last_visible=dict(world.cell_last_visible),
+            )
+            score = (
+                projection.future_attackers(destination),
+                projection.worker_exposure(destination)[2],
+                -gain,
+                self.memory.congestion_counts.get(destination, 0),
+                index,
+            )
+            rows.append((score, direction, destination, gain))
+        intents = [
+            ActionIntent.move(
+                worker.id,
+                UnitMission.EXPLORE,
+                69,
+                direction,
+                destination,
+                risk=score[0] * 10 + score[1],
+                tie_break=score,
+                reason="RESOURCE_STALL_SCOUT_FALLBACK",
+                metadata=(("released_target", old_target), ("information_gain", gain)),
+            )
+            for score, direction, destination, gain in sorted(rows)[:3]
         ]
+        intents.append(
+            ActionIntent.simple(
+                worker.id,
+                IntentAction.WAIT,
+                UnitMission.EXPLORE,
+                73,
+                target_position=old_target,
+                reason=(
+                    "ALL_SCOUT_TARGETS_BLOCKED"
+                    if rows
+                    else "NO_SURVIVABLE_MOVE"
+                ),
+            )
+        )
+        return intents
 
     def _exploration_work_intents(
         self,
@@ -1306,6 +1487,52 @@ class WorkerPlanner:
             *(cell for cell in (service.entrance, service.exit_cell) if cell is not None),
             *service.queue_cells,
         }
+        assigned_overflow = dict(service.overflow_slots).get(worker.id)
+        if assigned_overflow is not None:
+            if worker.position == assigned_overflow:
+                return [
+                    ActionIntent.simple(
+                        worker.id,
+                        IntentAction.WAIT,
+                        UnitMission.RETURN_CARGO,
+                        52,
+                        target_position=assigned_overflow,
+                        reason="WAITING_AT_ASSIGNED_OVERFLOW",
+                    )
+                ]
+            overflow_route = self._route(
+                world,
+                projection,
+                worker,
+                assigned_overflow,
+                service,
+                logistics=True,
+                allow_directional_fallback=True,
+                extra_blocked=frozenset(protected - {assigned_overflow}),
+            )
+            if overflow_route is not None and overflow_route.first_direction is not None:
+                return [
+                    ActionIntent.move(
+                        worker.id,
+                        UnitMission.RETURN_CARGO,
+                        51,
+                        overflow_route.first_direction,
+                        overflow_route.first_position,
+                        risk=self._risk(projection, overflow_route.first_position),
+                        exclusive_destination=True,
+                        tie_break=(overflow_route.distance,),
+                        reason="MOVE_TO_ASSIGNED_OVERFLOW",
+                        metadata=(("overflow_slot", assigned_overflow),),
+                    ),
+                    ActionIntent.simple(
+                        worker.id,
+                        IntentAction.WAIT,
+                        UnitMission.RETURN_CARGO,
+                        53,
+                        target_position=assigned_overflow,
+                        reason="OVERFLOW_MOVE_BLOCKED_THIS_TICK",
+                    ),
+                ]
         current_distance = manhattan(worker.position, world.core.position)
         staging_radius = self.config.service_lane_depth + 2
         if (
