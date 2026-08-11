@@ -17,6 +17,7 @@ from arena_hero import (
 
 from arena_tactic import (
     BalancedTactic,
+    CrisisForceBaseline,
     TacticConfig,
     TacticMemory,
     ThreatHeatCell,
@@ -280,7 +281,7 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         self.assertIsInstance(turn.plan.core_action, SpawnAction)
         self.assertEqual(turn.plan.core_action.unit_type, UnitType.WORKER)
 
-    def test_population_35_stockpiles_instead_of_spawning_another_worker(self) -> None:
+    def test_population_35_waits_until_exactly_full_then_balances_combat(self) -> None:
         units = tuple(
             [unit(i, UnitType.WORKER, (20 + i, 0)) for i in range(1, 24)]
             + [unit(100 + i, UnitType.VANGUARD, (i, 5)) for i in range(1, 7)]
@@ -296,8 +297,57 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         self.assertFalse(any(item.get("selected") for item in candidates))
         self.assertEqual(
             {item["reason"] for item in candidates},
-            {"POPULATION_STOCKPILE"},
+            {"WAIT_FOR_FULL_STORAGE"},
         )
+
+        full = make_turn(tick=2, units=units, resources=175)
+        tactic.choose_actions(full)
+        self.assertIsInstance(full.plan.core_action, SpawnAction)
+        self.assertEqual(full.plan.core_action.unit_type, UnitType.VANGUARD)
+
+        with_vanguard = (*units, unit(500, UnitType.VANGUARD, (10, 10)))
+        not_full = make_turn(tick=3, units=with_vanguard, resources=175)
+        tactic.choose_actions(not_full)
+        self.assertIsInstance(not_full.plan.core_action, WaitAction)
+
+        full_again = make_turn(tick=4, units=with_vanguard, resources=180)
+        tactic.choose_actions(full_again)
+        self.assertIsInstance(full_again.plan.core_action, SpawnAction)
+        self.assertEqual(full_again.plan.core_action.unit_type, UnitType.RANGER)
+
+    def test_post_crisis_combat_allocation_is_rebuilt_before_full_storage_routine(self) -> None:
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            opening_complete=True,
+            crisis_force_baseline=CrisisForceBaseline(
+                vanguards=6,
+                rangers=6,
+                started_tick=10,
+                phase="REBUILD",
+                safe_ticks=4,
+            ),
+        )
+        units = tuple(
+            [unit(i, UnitType.WORKER, (30 + i, 0)) for i in range(1, 25)]
+            + [unit(100 + i, UnitType.VANGUARD, (i, 5)) for i in range(1, 6)]
+            + [unit(200 + i, UnitType.RANGER, (i, -5)) for i in range(1, 7)]
+        )
+        turn = make_turn(tick=20, units=units, resources=100)
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.core_action, SpawnAction)
+        self.assertEqual(turn.plan.core_action.unit_type, UnitType.VANGUARD)
+        selected = next(
+            item
+            for item in tactic.last_decision_trace["economy"]["production_candidates"]
+            if item["selected"]
+        )
+        self.assertEqual(selected["production_mode"], "POST_CRISIS_REBUILD")
+        self.assertEqual(selected["vanguard_rebuild_gap"], 1)
+        self.assertEqual(selected["ranger_rebuild_gap"], 0)
 
     def test_cargo_on_stationary_core_always_deposits(self) -> None:
         carrier = unit(1, UnitType.WORKER, (0, 0), cargo=1)

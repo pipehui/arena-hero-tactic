@@ -26,6 +26,7 @@ from arena_hero import (
 import balanced_tactic
 from arena_tactic import (
     BalancedTactic,
+    CrisisForceBaseline,
     TacticMemory,
     ThreatHeatCell,
     WorkerScoutPhase,
@@ -57,8 +58,8 @@ class _EventGame:
 
 class RuntimeAndPersistenceTests(unittest.TestCase):
     def test_schema_versions_are_upgraded(self) -> None:
-        self.assertEqual(LOG_SCHEMA_VERSION, 23)
-        self.assertEqual(EXPLORATION_MEMORY_SCHEMA_VERSION, 11)
+        self.assertEqual(LOG_SCHEMA_VERSION, 24)
+        self.assertEqual(EXPLORATION_MEMORY_SCHEMA_VERSION, 12)
 
     def test_main_translates_sigterm_into_a_graceful_service_stop(self) -> None:
         previous_handler = object()
@@ -98,6 +99,13 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
         memory.cell_last_visible[(1, 2)] = 99
         memory.resource_seen_count[(3, 3)] = 7
         memory.home_force_high_water = 14
+        memory.crisis_force_baseline = CrisisForceBaseline(
+            vanguards=7,
+            rangers=6,
+            started_tick=97,
+            phase="REBUILD",
+            safe_ticks=4,
+        )
         memory.core_position = (2, 2)
         memory.core_position_history = ((1, 2), (2, 2))
         memory.last_congestion_decay_tick = 90
@@ -150,6 +158,7 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
         self.assertEqual(restored.cell_last_visible[(1, 2)], 99)
         self.assertEqual(restored.resource_seen_count[(3, 3)], 7)
         self.assertEqual(restored.home_force_high_water, 14)
+        self.assertEqual(restored.crisis_force_baseline, memory.crisis_force_baseline)
         self.assertEqual(restored.core_position_history, ((1, 2), (2, 2)))
         self.assertEqual(restored.last_congestion_decay_tick, 90)
         self.assertIsNone(restored.service_entrance)
@@ -375,7 +384,7 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
         queue = tactic.last_decision_trace["economy"]["service_queue"]
         self.assertEqual(queue["admission_id"], str(ready.id))
 
-    def test_replay_logger_writes_schema_23_and_redacts_secret(self) -> None:
+    def test_replay_logger_writes_schema_24_and_redacts_secret(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             logger = ReplayLogger(directory)
             logger.record_error(
@@ -388,10 +397,10 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
             text = logger.path.read_text(encoding="utf-8")
             first = json.loads(text.splitlines()[0])
 
-        self.assertEqual(first["schema_version"], 23)
+        self.assertEqual(first["schema_version"], 24)
         self.assertNotIn("hidden-token", text)
 
-    def test_turn_log_contains_detached_schema_23_strategy(self) -> None:
+    def test_turn_log_contains_detached_schema_24_strategy(self) -> None:
         turn = make_turn(tick=9, units=(unit(1, UnitType.WORKER, (1, 0)),))
         tactic = BalancedTactic()
         tactic.choose_actions(turn)
@@ -413,9 +422,9 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
             logger.close(status="completed", last_tick=9)
             records = [json.loads(line) for line in logger.path.read_text(encoding="utf-8").splitlines()]
 
-        self.assertEqual(records[0]["schema_version"], 23)
+        self.assertEqual(records[0]["schema_version"], 24)
         record = next(item for item in records if item["record_type"] == "turn")
-        self.assertEqual(record["strategy"]["schema_version"], 23)
+        self.assertEqual(record["strategy"]["schema_version"], 24)
         self.assertIn("resolution", record["strategy"])
 
     def test_single_instance_lock_rejects_overlap_and_releases(self) -> None:

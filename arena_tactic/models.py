@@ -59,6 +59,13 @@ class IntentAction(str, Enum):
     SELF_DESTRUCT = "SELF_DESTRUCT"
 
 
+class VanguardIntent(str, Enum):
+    ATTACKING = "ATTACKING"
+    RETREATING = "RETREATING"
+    BLIND_SPOT_APPROACH = "BLIND_SPOT_APPROACH"
+    UNCERTAIN = "UNCERTAIN"
+
+
 @dataclass(frozen=True, slots=True)
 class EntitySnapshot:
     id: UUID
@@ -396,8 +403,63 @@ class FireMission:
     confidence: str
     candidate_cells: tuple[Position, ...]
     required_hits: int
+    prediction_mode: str = "GENERIC"
+    candidate_roles: tuple[str, ...] = ()
+    evidence: tuple[str, ...] = ()
+    split_fire: bool = False
     assigned_shooters: tuple[UUID, ...] = ()
     assignments: tuple[tuple[UUID, Position], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class VanguardIntentEstimate:
+    target_id: UUID
+    intent: VanguardIntent
+    confidence: str
+    candidate_cells: tuple[Position, ...]
+    candidate_roles: tuple[str, ...]
+    evidence: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class EnemyRangerFireEstimate:
+    target_id: UUID
+    confidence: str
+    current_cell: Position
+    firing_position: Position | None
+    candidate_cells: tuple[Position, ...]
+    candidate_roles: tuple[str, ...]
+    evidence: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class EnemyActionEstimate:
+    target_id: UUID
+    confidence: str
+    candidate_cells: tuple[Position, ...]
+    candidate_roles: tuple[str, ...]
+    evidence: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ScreeningGroupState:
+    target_id: UUID
+    vanguard_ids: tuple[UUID, UUID]
+    ranger_ids: tuple[UUID, UUID]
+    started_tick: int
+    last_seen_tick: int
+    last_distance: int
+    outward_ticks: int = 0
+    phase: str = "INTERCEPTING"
+
+
+@dataclass(frozen=True, slots=True)
+class CrisisForceBaseline:
+    vanguards: int
+    rangers: int
+    started_tick: int | None
+    phase: str = "SAFE"
+    safe_ticks: int = 0
 
 
 @dataclass(frozen=True, slots=True)

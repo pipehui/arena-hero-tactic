@@ -9,6 +9,7 @@ from arena_hero import Position
 from .models import (
     EnemyTrack,
     EnemyCoreIntel,
+    CrisisForceBaseline,
     ManualMoveLease,
     MissionState,
     MoveAttempt,
@@ -19,6 +20,7 @@ from .models import (
     WorkerScoutState,
     ShotFeedback,
     ShotPlan,
+    ScreeningGroupState,
     ThreatHeatCell,
 )
 
@@ -96,6 +98,7 @@ class TacticMemory:
     home_defense_alert_until: int = 0
     last_combat_unit_ids: set[UUID] = field(default_factory=set)
     recent_combat_loss_ticks: tuple[int, ...] = ()
+    crisis_force_baseline: CrisisForceBaseline | None = None
 
     evacuation_active: bool = False
     evacuation_started_tick: int | None = None
@@ -109,6 +112,7 @@ class TacticMemory:
     recent_home_threat_position: Position | None = None
 
     squad_states: dict[tuple[UUID, UUID], SquadState] = field(default_factory=dict)
+    screening_groups: dict[UUID, ScreeningGroupState] = field(default_factory=dict)
     defense_sector_anchors: dict[str, tuple[Position, int]] = field(
         default_factory=dict
     )
@@ -161,6 +165,7 @@ class TacticMemory:
         self.home_defense_alert_until = 0
         self.last_combat_unit_ids.clear()
         self.recent_combat_loss_ticks = ()
+        self.crisis_force_baseline = None
         self.evacuation_active = False
         self.evacuation_started_tick = None
         self.evacuation_safe_ticks = 0
@@ -172,6 +177,7 @@ class TacticMemory:
         self.strategic_relocation_goal = None
         self.recent_home_threat_position = None
         self.squad_states.clear()
+        self.screening_groups.clear()
         self.defense_sector_anchors.clear()
         self.raid_target_id = None
         self.raid_last_seen_tick = None

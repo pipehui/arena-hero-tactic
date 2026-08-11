@@ -7,7 +7,14 @@ from arena_hero import CoreState, UnitType, unit_cost
 
 from .combat import CombatPlanner
 from .config import TacticConfig
-from .models import ActionIntent, EntitySnapshot, IntentAction, UnitMission, WorldModel
+from .models import (
+    ActionIntent,
+    CrisisForceBaseline,
+    EntitySnapshot,
+    IntentAction,
+    UnitMission,
+    WorldModel,
+)
 from .geometry import manhattan
 from .projection import TacticalMap
 from .state import TacticMemory
@@ -68,6 +75,13 @@ class ProductionPlanner:
         next_worker_target = ceil(
             (world.population + 1) * self.config.worker_ratio_percent / 100
         )
+        baseline = self._sync_crisis_baseline(
+            world,
+            vanguards,
+            rangers,
+            threat_active=bool(home_enemies) or self.memory.evacuation_active,
+            loss_crisis=len(self.memory.recent_combat_loss_ticks) >= 2,
+        )
 
         chosen: UnitType | None = None
         reinforcement_order: tuple[UnitType, ...] = ()
@@ -88,13 +102,42 @@ class ProductionPlanner:
             else:
                 self.memory.opening_complete = True
         if self.memory.opening_complete and chosen is None:
-            if home_alert and combat_count < home_target:
-                reinforcement_order = self._reinforcement_candidates(
-                    vanguards, rangers, home_enemies, combat_count, home_target
+            rebuild_vanguard_gap = max(0, baseline.vanguards - vanguards)
+            rebuild_ranger_gap = max(0, baseline.rangers - rangers)
+            rebuild_active = baseline.phase == "REBUILD" and (
+                rebuild_vanguard_gap > 0 or rebuild_ranger_gap > 0
+            )
+            crisis_target = max(
+                home_target,
+                baseline.vanguards + baseline.rangers,
+            )
+            if baseline.phase == "ACTIVE" and (
+                combat_count < crisis_target
+                or rebuild_vanguard_gap > 0
+                or rebuild_ranger_gap > 0
+            ):
+                reinforcement_order = (
+                    self._rebuild_candidates(vanguards, rangers, baseline)
+                    if rebuild_vanguard_gap > 0 or rebuild_ranger_gap > 0
+                    else self._reinforcement_candidates(
+                        vanguards,
+                        rangers,
+                        home_enemies,
+                        combat_count,
+                        crisis_target,
+                    )
                 )
                 chosen = reinforcement_order[0]
-                reason = "HOME_ALERT_REINFORCEMENT"
-            elif (home_combat or home_alert) and combat_count >= home_target:
+                reason = "CRISIS_REINFORCEMENT"
+            elif rebuild_active:
+                reinforcement_order = self._rebuild_candidates(
+                    vanguards,
+                    rangers,
+                    baseline,
+                )
+                chosen = reinforcement_order[0]
+                reason = "POST_CRISIS_REBUILD"
+            elif baseline.phase == "ACTIVE" or home_combat or home_alert:
                 reason = "HOME_COMBAT_FREEZE"
             elif urgent_defense and combat_count < home_target:
                 reinforcement_order = self._reinforcement_candidates(
@@ -103,11 +146,19 @@ class ProductionPlanner:
                 chosen = reinforcement_order[0]
                 reason = "EMERGENCY_HOME_FORCE"
             elif world.population >= self.config.population_stockpile_threshold:
-                # At this population every extra Unit is in the fourth dynamic
-                # price band.  Keep the Core liquid for healing, evacuation and
-                # an actual home-defense emergency instead of growing the
-                # already worker-heavy economy without a ceiling.
-                reason = "POPULATION_STOCKPILE"
+                if world.resources != world.resource_capacity:
+                    reason = "WAIT_FOR_FULL_STORAGE"
+                elif projection.occupied_cells.get(world.core.position, 0) >= 2:
+                    reason = "WAIT_FOR_CORE_SLOT"
+                else:
+                    chosen, reinforcement_order = self._full_storage_choice(
+                        world,
+                        workers,
+                        vanguards,
+                        rangers,
+                        next_worker_target,
+                    )
+                    reason = "FULL_STORAGE_BALANCE"
             elif world.population < self.config.worker_only_population_threshold:
                 if workers < next_worker_target:
                     chosen = UnitType.WORKER
@@ -172,6 +223,13 @@ class ProductionPlanner:
                 "fallback_reason": fallback_reason if unit_type is selected else None,
                 "affordable": unit_cost(unit_type, world.population) <= available,
                 "reserved_for_recovery": reserved_resources,
+                "production_mode": reason,
+                "full_storage_gate": world.resources == world.resource_capacity,
+                "crisis_phase": baseline.phase,
+                "pre_crisis_vanguards": baseline.vanguards,
+                "pre_crisis_rangers": baseline.rangers,
+                "vanguard_rebuild_gap": max(0, baseline.vanguards - vanguards),
+                "ranger_rebuild_gap": max(0, baseline.rangers - rangers),
                 "reason": (
                     reason
                     if unit_type in selection_order or strategic_primary is None
@@ -194,6 +252,103 @@ class ProductionPlanner:
                 reason=reason,
             )
         ], candidates
+
+    def _sync_crisis_baseline(
+        self,
+        world: WorldModel,
+        vanguards: int,
+        rangers: int,
+        *,
+        threat_active: bool,
+        loss_crisis: bool,
+    ) -> CrisisForceBaseline:
+        baseline = self.memory.crisis_force_baseline
+        if baseline is None:
+            baseline = CrisisForceBaseline(
+                vanguards=vanguards,
+                rangers=rangers,
+                started_tick=None,
+            )
+        if baseline.phase == "SAFE":
+            if threat_active or loss_crisis:
+                baseline = CrisisForceBaseline(
+                    vanguards=baseline.vanguards,
+                    rangers=baseline.rangers,
+                    started_tick=world.tick,
+                    phase="ACTIVE",
+                )
+            else:
+                baseline = CrisisForceBaseline(
+                    vanguards=vanguards,
+                    rangers=rangers,
+                    started_tick=None,
+                    phase="SAFE",
+                )
+        elif baseline.phase == "ACTIVE":
+            safe_ticks = 0 if threat_active else baseline.safe_ticks + 1
+            baseline = CrisisForceBaseline(
+                vanguards=baseline.vanguards,
+                rangers=baseline.rangers,
+                started_tick=baseline.started_tick,
+                phase="REBUILD" if safe_ticks >= 4 else "ACTIVE",
+                safe_ticks=safe_ticks,
+            )
+        elif baseline.phase == "REBUILD":
+            if threat_active:
+                baseline = CrisisForceBaseline(
+                    vanguards=baseline.vanguards,
+                    rangers=baseline.rangers,
+                    started_tick=baseline.started_tick,
+                    phase="ACTIVE",
+                )
+            elif vanguards >= baseline.vanguards and rangers >= baseline.rangers:
+                baseline = CrisisForceBaseline(
+                    vanguards=vanguards,
+                    rangers=rangers,
+                    started_tick=None,
+                    phase="SAFE",
+                )
+        self.memory.crisis_force_baseline = baseline
+        return baseline
+
+    def _rebuild_candidates(
+        self,
+        vanguards: int,
+        rangers: int,
+        baseline: CrisisForceBaseline,
+    ) -> tuple[UnitType, ...]:
+        gaps = {
+            UnitType.VANGUARD: max(0, baseline.vanguards - vanguards),
+            UnitType.RANGER: max(0, baseline.rangers - rangers),
+        }
+        return tuple(
+            sorted(
+                (unit_type for unit_type, gap in gaps.items() if gap > 0),
+                key=lambda unit_type: (
+                    -gaps[unit_type],
+                    (
+                        vanguards / max(1, baseline.vanguards)
+                        if unit_type is UnitType.VANGUARD
+                        else rangers / max(1, baseline.rangers)
+                    ),
+                    0 if unit_type is UnitType.VANGUARD else 1,
+                ),
+            )
+        )
+
+    @staticmethod
+    def _full_storage_choice(
+        world: WorldModel,
+        workers: int,
+        vanguards: int,
+        rangers: int,
+        next_worker_target: int,
+    ) -> tuple[UnitType, tuple[UnitType, ...]]:
+        if workers < next_worker_target:
+            return UnitType.WORKER, (UnitType.WORKER,)
+        if vanguards <= rangers:
+            return UnitType.VANGUARD, (UnitType.VANGUARD, UnitType.RANGER)
+        return UnitType.RANGER, (UnitType.RANGER, UnitType.VANGUARD)
 
     def _reinforcement_candidates(
         self,

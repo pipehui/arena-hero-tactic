@@ -97,6 +97,16 @@ class TacticConfig:
     home_defense_hold_ticks: int = 4
     home_engage_radius: int = 13
     home_pursuit_radius: int = 18
+    outer_screen_min_radius: int = 13
+    outer_screen_max_radius: int = 30
+    outer_screen_continue_radius: int = 32
+    outer_screen_acquire_distance: int = 5
+    outer_screen_vanguards: int = 2
+    outer_screen_rangers: int = 2
+    outer_screen_home_vanguard_reserve: int = 4
+    outer_screen_home_ranger_reserve: int = 4
+    outer_screen_hold_ticks: int = 4
+    outer_screen_fog_ttl: int = 2
     vanguard_engage_distance: int = 4
     combat_exclusive_radius: int = 13
     peaceful_squad_radii: tuple[int, ...] = (5, 10, 15)
@@ -190,6 +200,16 @@ class TacticConfig:
             self.home_defense_hold_ticks,
             self.home_engage_radius,
             self.home_pursuit_radius,
+            self.outer_screen_min_radius,
+            self.outer_screen_max_radius,
+            self.outer_screen_continue_radius,
+            self.outer_screen_acquire_distance,
+            self.outer_screen_vanguards,
+            self.outer_screen_rangers,
+            self.outer_screen_home_vanguard_reserve,
+            self.outer_screen_home_ranger_reserve,
+            self.outer_screen_hold_ticks,
+            self.outer_screen_fog_ttl,
             self.vanguard_engage_distance,
             self.combat_exclusive_radius,
             self.squad_max_separation,
@@ -226,6 +246,12 @@ class TacticConfig:
             raise ValueError("worker ratio must be within 1..100")
         if self.population_stockpile_threshold <= self.worker_only_population_threshold:
             raise ValueError("stockpile population must exceed worker-only threshold")
+        if self.outer_screen_min_radius < self.home_engage_radius:
+            raise ValueError("outer screen must start at or beyond home engagement")
+        if self.outer_screen_max_radius < self.outer_screen_min_radius:
+            raise ValueError("outer screen radius must be ordered")
+        if self.outer_screen_continue_radius < self.outer_screen_max_radius:
+            raise ValueError("outer screen continuation must cover acquisition radius")
         if (
             not self.exploration_sector_radii
             or tuple(sorted(set(self.exploration_sector_radii)))

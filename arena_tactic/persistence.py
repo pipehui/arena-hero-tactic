@@ -15,6 +15,7 @@ from .rules import CORE_VISION_RADIUS, UNIT_VISION_RADIUS
 from .schema import EXPLORATION_MEMORY_SCHEMA_VERSION
 from .state import TacticMemory
 from .models import (
+    CrisisForceBaseline,
     EnemyCoreIntel,
     EnemyTrack,
     ThreatHeatCell,
@@ -211,6 +212,17 @@ class ExplorationMemoryStore:
             "last_congestion_decay_tick": memory.last_congestion_decay_tick,
             "opening_complete": memory.opening_complete,
             "home_force_high_water": memory.home_force_high_water,
+            "crisis_force_baseline": (
+                None
+                if memory.crisis_force_baseline is None
+                else {
+                    "vanguards": memory.crisis_force_baseline.vanguards,
+                    "rangers": memory.crisis_force_baseline.rangers,
+                    "started_tick": memory.crisis_force_baseline.started_tick,
+                    "phase": memory.crisis_force_baseline.phase,
+                    "safe_ticks": memory.crisis_force_baseline.safe_ticks,
+                }
+            ),
             "strategic_relocation_pending": memory.strategic_relocation_pending,
             "strategic_relocation_safe_ticks": memory.strategic_relocation_safe_ticks,
             "strategic_relocation_goal": (
@@ -462,6 +474,34 @@ class ExplorationMemoryStore:
                 )
         if isinstance(high_water, int) and high_water > 0:
             memory.home_force_high_water = max(self.config.home_force_floor, high_water)
+        if schema >= 12:
+            raw_baseline = payload.get("crisis_force_baseline")
+            if isinstance(raw_baseline, dict):
+                vanguards = raw_baseline.get("vanguards")
+                rangers = raw_baseline.get("rangers")
+                started_tick = raw_baseline.get("started_tick")
+                phase = raw_baseline.get("phase")
+                safe_ticks = raw_baseline.get("safe_ticks", 0)
+                if (
+                    isinstance(vanguards, int)
+                    and not isinstance(vanguards, bool)
+                    and vanguards >= 0
+                    and isinstance(rangers, int)
+                    and not isinstance(rangers, bool)
+                    and rangers >= 0
+                    and (started_tick is None or isinstance(started_tick, int))
+                    and phase in {"SAFE", "ACTIVE", "REBUILD"}
+                    and isinstance(safe_ticks, int)
+                    and not isinstance(safe_ticks, bool)
+                    and safe_ticks >= 0
+                ):
+                    memory.crisis_force_baseline = CrisisForceBaseline(
+                        vanguards=vanguards,
+                        rangers=rangers,
+                        started_tick=started_tick,
+                        phase=phase,
+                        safe_ticks=safe_ticks,
+                    )
         memory.opening_complete = bool(payload.get("opening_complete", False))
         memory.strategic_relocation_pending = bool(
             payload.get("strategic_relocation_pending", False)

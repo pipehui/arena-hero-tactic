@@ -10,6 +10,7 @@ from .combat import CombatPlanner
 from .config import TacticConfig
 from .geometry import (
     DIRECTION_ORDER,
+    cardinal_neighbors,
     manhattan,
     manhattan_ring,
     ranger_firing_positions,
@@ -92,9 +93,175 @@ class DefensePlanner:
                 <= self.config.home_warning_radius
             )
         self._sync_squads(living_combatants)
+        screening_intents = self._screening_intents(
+            world,
+            projection,
+            healthy,
+            protected,
+        )
         if threats:
-            return self._sector_defense(world, projection, healthy, threats, protected)
+            screening_ids = {
+                member_id
+                for group in self.memory.screening_groups.values()
+                for member_id in (*group.vanguard_ids, *group.ranger_ids)
+            }
+            home_pool = tuple(
+                unit for unit in healthy if unit.id not in screening_ids
+            )
+            return [
+                *screening_intents,
+                *self._sector_defense(
+                    world,
+                    projection,
+                    home_pool,
+                    threats,
+                    protected,
+                ),
+            ]
+        if screening_intents:
+            screening_ids = {
+                member_id
+                for group in self.memory.screening_groups.values()
+                for member_id in (*group.vanguard_ids, *group.ranger_ids)
+            }
+            home_pool = tuple(
+                unit for unit in healthy if unit.id not in screening_ids
+            )
+            return [
+                *screening_intents,
+                *self._peaceful_patrol(world, projection, home_pool, protected),
+            ]
         return self._peaceful_patrol(world, projection, healthy, protected)
+
+    def _screening_intents(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        healthy: tuple[EntitySnapshot, ...],
+        protected: frozenset[Position],
+    ) -> list[ActionIntent]:
+        """Give each active outer screen two blockers and two firing roles."""
+
+        if world.core is None or not self.memory.screening_groups:
+            return []
+        members = {unit.id: unit for unit in healthy}
+        intents: list[ActionIntent] = []
+        reserved: set[Position] = set(protected)
+        for group in sorted(
+            self.memory.screening_groups.values(),
+            key=lambda item: (item.started_tick, item.target_id.bytes),
+        ):
+            target = world.enemy(group.target_id)
+            if target is None:
+                track = world.track(group.target_id)
+                target_position = None if track is None else track.position
+                candidates = () if target_position is None else (target_position,)
+            else:
+                target_position = target.position
+                candidates, _ = self.combat.enemy_candidate_cells(
+                    world, projection, target
+                )
+            if target_position is None or not candidates:
+                continue
+            vanguards = [members.get(unit_id) for unit_id in group.vanguard_ids]
+            rangers = [members.get(unit_id) for unit_id in group.ranger_ids]
+            if any(unit is None for unit in (*vanguards, *rangers)):
+                continue
+
+            blocker_candidates = tuple(
+                sorted(
+                    {
+                        cell
+                        for candidate in candidates[:3]
+                        for _, cell in cardinal_neighbors(candidate)
+                        if cell in world.known_passable
+                        and cell not in world.known_obstacles
+                        and cell not in projection.hostile_occupied
+                        and cell not in reserved
+                        and manhattan(cell, world.core.position)
+                        <= self.config.outer_screen_continue_radius
+                    },
+                    key=lambda cell: (
+                        projection.immediate_attackers(cell),
+                        projection.future_attackers(cell),
+                        manhattan(cell, world.core.position),
+                        min(manhattan(cell, candidate) for candidate in candidates),
+                        cell,
+                    ),
+                )
+            )
+            for index, vanguard in enumerate(vanguards):
+                assert vanguard is not None
+                target_cell = next(
+                    (cell for cell in blocker_candidates if cell not in reserved),
+                    target_position,
+                )
+                reserved.add(target_cell)
+                intents.extend(
+                    self._move_or_wait(
+                        world,
+                        projection,
+                        vanguard,
+                        target_cell,
+                        frozenset(reserved - {target_cell}),
+                        "OUTER_SCREEN_BLOCKER" if index == 0 else "OUTER_SCREEN_FLANKER",
+                        mission=UnitMission.HOME_DEFENSE,
+                        move_priority=47,
+                        wait_priority=49,
+                    )
+                )
+
+            firing_cells = tuple(
+                sorted(
+                    {
+                        stance
+                        for candidate in candidates[:3]
+                        for stance in ranger_firing_positions(candidate)
+                        if stance in world.known_passable
+                        and stance not in world.known_obstacles
+                        and stance not in projection.hostile_occupied
+                        and stance not in reserved
+                        and manhattan(stance, world.core.position)
+                        <= self.config.outer_screen_continue_radius
+                        and ranger_line_is_clear(
+                            stance, candidate, world.known_obstacles
+                        )
+                    },
+                    key=lambda cell: (
+                        -sum(
+                            ranger_line_is_clear(
+                                cell, candidate, world.known_obstacles
+                            )
+                            for candidate in candidates
+                        ),
+                        projection.immediate_attackers(cell),
+                        projection.future_attackers(cell),
+                        manhattan(cell, target_position),
+                        cell,
+                    ),
+                )
+            )
+            for ranger in rangers:
+                assert ranger is not None
+                target_cell = next(
+                    (cell for cell in firing_cells if cell not in reserved),
+                    ranger.position,
+                )
+                reserved.add(target_cell)
+                intents.extend(
+                    self._move_or_wait(
+                        world,
+                        projection,
+                        ranger,
+                        target_cell,
+                        frozenset(reserved - {target_cell}),
+                        "OUTER_SCREEN_FIRE_SUPPORT",
+                        mission=UnitMission.HOME_DEFENSE,
+                        move_priority=51,
+                        wait_priority=54,
+                    )
+                )
+        return intents
 
     def _sector_defense(
         self,

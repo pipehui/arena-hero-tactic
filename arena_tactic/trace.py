@@ -261,6 +261,15 @@ class DecisionTraceBuilder:
             if intent.actor_id is not None
         }
         heat = dict(world.threat_heat)
+        production_mode = next(
+            (
+                str(item.get("production_mode"))
+                for item in production_candidates
+                if item.get("production_mode") is not None
+            ),
+            "NONE",
+        )
+        crisis = self.memory.crisis_force_baseline
         return {
             "workers": workers,
             "worker_target": ceil(
@@ -270,6 +279,35 @@ class DecisionTraceBuilder:
                 world.population >= self.config.population_stockpile_threshold
             ),
             "stockpile_population_threshold": self.config.population_stockpile_threshold,
+            "production_mode": production_mode,
+            "full_storage_gate": world.resources == world.resource_capacity,
+            "crisis_force_baseline": (
+                None
+                if crisis is None
+                else {
+                    "vanguards": crisis.vanguards,
+                    "rangers": crisis.rangers,
+                    "started_tick": crisis.started_tick,
+                    "phase": crisis.phase,
+                    "safe_ticks": crisis.safe_ticks,
+                    "vanguard_gap": max(
+                        0,
+                        crisis.vanguards
+                        - sum(
+                            unit.unit_type is UnitType.VANGUARD
+                            for unit in world.friendlies
+                        ),
+                    ),
+                    "ranger_gap": max(
+                        0,
+                        crisis.rangers
+                        - sum(
+                            unit.unit_type is UnitType.RANGER
+                            for unit in world.friendlies
+                        ),
+                    ),
+                }
+            ),
             "storage_saturated": self.memory.storage_saturated,
             "storage_headroom": max(0, world.resource_capacity - world.resources),
             "worker_home_guard_radii": list(
@@ -479,6 +517,10 @@ class DecisionTraceBuilder:
                         )
                     ),
                     "ranked_cells": [list(cell) for cell in mission.candidate_cells],
+                    "prediction_mode": mission.prediction_mode,
+                    "candidate_roles": list(mission.candidate_roles),
+                    "evidence": list(mission.evidence),
+                    "split_fire": mission.split_fire,
                 }
                 for mission in fire_missions
                 if mission.target_type is not None
@@ -534,6 +576,37 @@ class DecisionTraceBuilder:
                         item.sector_index,
                         item.vanguard_id.bytes,
                     ),
+                )
+            ],
+            "screening_groups": [
+                {
+                    "target_id": str(group.target_id),
+                    "vanguards": [str(item) for item in group.vanguard_ids],
+                    "rangers": [str(item) for item in group.ranger_ids],
+                    "started_tick": group.started_tick,
+                    "last_seen_tick": group.last_seen_tick,
+                    "last_distance": group.last_distance,
+                    "outward_ticks": group.outward_ticks,
+                    "phase": group.phase,
+                    "actions": [
+                        {
+                            "actor_id": str(intent.actor_id),
+                            "action": intent.action.value,
+                            "reason": intent.reason,
+                            "target": (
+                                None
+                                if intent.target_position is None
+                                else list(intent.target_position)
+                            ),
+                        }
+                        for intent in resolution.selected
+                        if intent.actor_id
+                        in {*group.vanguard_ids, *group.ranger_ids}
+                    ],
+                }
+                for group in sorted(
+                    self.memory.screening_groups.values(),
+                    key=lambda item: (item.started_tick, item.target_id.bytes),
                 )
             ],
             "defense_sector_anchors": {
@@ -663,6 +736,10 @@ class DecisionTraceBuilder:
             "confidence": mission.confidence,
             "candidate_cells": [list(cell) for cell in mission.candidate_cells],
             "required_hits": mission.required_hits,
+            "prediction_mode": mission.prediction_mode,
+            "candidate_roles": list(mission.candidate_roles),
+            "evidence": list(mission.evidence),
+            "split_fire": mission.split_fire,
             "shooters": [str(shooter) for shooter in mission.assigned_shooters],
             "assignments": [
                 {"shooter_id": str(shooter), "cell": list(cell)}

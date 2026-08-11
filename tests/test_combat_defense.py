@@ -187,7 +187,7 @@ class CombatDefenseTests(unittest.TestCase):
         self.assertTrue(all(isinstance(action, ShootAction) for action in shots))
         self.assertEqual({action.expected_cell for action in shots}, {(0, 0)})
 
-    def test_spare_ranger_cross_covers_after_primary_lethal_package(self) -> None:
+    def test_moving_ranger_uses_current_and_firing_position_split(self) -> None:
         rangers = (
             unit(1, UnitType.RANGER, (2, -2)),
             unit(2, UnitType.RANGER, (2, 2)),
@@ -215,10 +215,12 @@ class CombatDefenseTests(unittest.TestCase):
 
         shots = [turn.plan.unit_actions[ranger.id] for ranger in rangers]
         self.assertTrue(all(isinstance(action, ShootAction) for action in shots))
-        self.assertEqual(
-            Counter(action.expected_cell for action in shots),
-            Counter({(2, 0): 2, (1, 0): 1}),
-        )
+        cells = [action.expected_cell for action in shots]
+        self.assertEqual(len(set(cells)), 3)
+        mission = tactic.last_decision_trace["combat"]["fire_missions"][0]
+        self.assertTrue(mission["split_fire"])
+        self.assertIn("CURRENT", mission["candidate_roles"])
+        self.assertIn("NEXT_FIRE_POSITION", mission["candidate_roles"])
 
     def test_uncertain_target_candidates_include_wait_and_legal_steps(self) -> None:
         tactic = BalancedTactic()
@@ -235,6 +237,107 @@ class CombatDefenseTests(unittest.TestCase):
         self.assertNotIn([1, 1], mission["candidate_cells"])
         self.assertGreater(len(mission["candidate_cells"]), 1)
         self.assertLessEqual(len(mission["candidate_cells"]), 5)
+
+    def test_uncertain_vanguard_splits_two_rangers_across_angles(self) -> None:
+        rangers = (
+            unit(1, UnitType.RANGER, (8, -2)),
+            unit(2, UnitType.RANGER, (8, 2)),
+        )
+        tactic = BalancedTactic()
+        tactic.choose_actions(
+            make_turn(
+                tick=1,
+                units=rangers,
+                enemies=(unit(100, UnitType.VANGUARD, (10, 0), controlled=False),),
+                resources=0,
+            )
+        )
+        turn = make_turn(
+            tick=2,
+            units=rangers,
+            enemies=(unit(100, UnitType.VANGUARD, (11, 0), controlled=False),),
+            resources=0,
+        )
+
+        tactic.choose_actions(turn)
+
+        shots = [turn.plan.unit_actions[ranger.id] for ranger in rangers]
+        self.assertTrue(all(isinstance(action, ShootAction) for action in shots))
+        self.assertEqual(len({action.expected_cell for action in shots}), 2)
+        mission = tactic.last_decision_trace["combat"]["fire_missions"][0]
+        self.assertEqual(mission["prediction_mode"], "UNCERTAIN")
+        self.assertTrue(mission["split_fire"])
+
+    def test_retreating_vanguard_prefers_continuing_outward(self) -> None:
+        rangers = (
+            unit(1, UnitType.RANGER, (10, -3)),
+            unit(2, UnitType.RANGER, (10, 3)),
+        )
+        tactic = BalancedTactic()
+        for tick, position in ((1, (10, 0)), (2, (11, 0)), (3, (12, 0))):
+            tactic.choose_actions(
+                make_turn(
+                    tick=tick,
+                    units=rangers,
+                    enemies=(unit(100, UnitType.VANGUARD, position, controlled=False),),
+                    resources=0,
+                )
+            )
+
+        mission = tactic.last_decision_trace["combat"]["fire_missions"][0]
+        self.assertEqual(mission["prediction_mode"], "RETREATING")
+        self.assertEqual(mission["candidate_cells"][0], [13, 0])
+
+    def test_outer_contact_forms_two_by_two_screen_and_keeps_four_by_four_home(self) -> None:
+        units = list(
+            [unit(10 + index, UnitType.VANGUARD, (index - 4, 5)) for index in range(6)]
+            + [unit(30 + index, UnitType.RANGER, (index - 4, -5)) for index in range(6)]
+        )
+        units[0] = unit(10, UnitType.VANGUARD, (12, 0))
+        units[1] = unit(11, UnitType.VANGUARD, (11, 1))
+        units[6] = unit(30, UnitType.RANGER, (12, 2))
+        units[7] = unit(31, UnitType.RANGER, (11, -1))
+        memory = TacticMemory(opening_complete=True)
+        memory.known_passable.update(
+            (x, y)
+            for x in range(-35, 36)
+            for y in range(-35, 36)
+            if abs(x) + abs(y) <= 35
+        )
+        tactic = BalancedTactic(memory=memory)
+        target = unit(200, UnitType.VANGUARD, (17, 0), controlled=False)
+
+        tactic.choose_actions(
+            make_turn(tick=1, units=tuple(units), enemies=(target,), resources=0)
+        )
+
+        group = tactic.memory.screening_groups[target.id]
+        self.assertEqual(len(group.vanguard_ids), 2)
+        self.assertEqual(len(group.ranger_ids), 2)
+        all_vanguards = {item.id for item in units if item.unit_type is UnitType.VANGUARD}
+        all_rangers = {item.id for item in units if item.unit_type is UnitType.RANGER}
+        self.assertEqual(len(all_vanguards - set(group.vanguard_ids)), 4)
+        self.assertEqual(len(all_rangers - set(group.ranger_ids)), 4)
+        group_ids = {str(item) for item in (*group.vanguard_ids, *group.ranger_ids)}
+        group_tasks = [
+            task
+            for task in tactic.last_decision_trace["tasks"]
+            if task["actor_id"] in group_ids
+        ]
+        self.assertTrue(group_tasks)
+        self.assertTrue(
+            all(
+                task["reason"].startswith("OUTER_SCREEN_")
+                or task["reason"]
+                in {
+                    "INTENT_SPLIT_COVERAGE",
+                    "LETHAL_FIRE_PACKAGE",
+                    "URGENT_REMAINDER",
+                    "URGENT_CROSS_COVERAGE",
+                }
+                for task in group_tasks
+            )
+        )
 
     def test_two_rangers_cross_cover_a_moving_worker(self) -> None:
         rangers = (
