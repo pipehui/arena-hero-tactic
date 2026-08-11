@@ -863,6 +863,28 @@ class DecisionTraceBuilder:
                 {"worker_id": str(worker_id), "tick": tick}
                 for worker_id, tick in service.scheduled_deposits
             ],
+            "return_reservations": [
+                {
+                    "worker_id": str(row.worker_id),
+                    "route_target": (
+                        None if row.route_target is None else list(row.route_target)
+                    ),
+                    "route_distance": row.route_distance,
+                    "first_direction": (
+                        None if row.first_direction is None else row.first_direction.value
+                    ),
+                    "first_position": (
+                        None if row.first_position is None else list(row.first_position)
+                    ),
+                    "earliest_deposit_tick": row.earliest_deposit_tick,
+                    "scheduled_deposit_tick": row.scheduled_deposit_tick,
+                    "departure_tick": row.departure_tick,
+                    "slack_ticks": row.slack_ticks,
+                    "status": row.status,
+                    "delay_reason": row.delay_reason,
+                }
+                for row in service.return_reservations
+            ],
             "worker_progress": [
                 {
                     "worker_id": str(worker_id),

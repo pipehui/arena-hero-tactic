@@ -374,6 +374,29 @@ class IntentResolution:
 
 
 @dataclass(frozen=True, slots=True)
+class CargoReturnReservation:
+    """A cargo Worker's executable route and future Core appointment.
+
+    ``route_distance`` counts movement Ticks until the Worker is on the Core;
+    the following Tick is the scheduled DEPOSIT action.  Keeping the first
+    route step beside the appointment prevents the service calendar and the
+    Worker executor from planning against different threat maps.
+    """
+
+    worker_id: UUID
+    route_target: Position | None
+    route_distance: int | None
+    first_direction: Direction | None
+    first_position: Position | None
+    earliest_deposit_tick: int | None
+    scheduled_deposit_tick: int | None
+    departure_tick: int | None
+    slack_ticks: int | None
+    status: str
+    delay_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class CoreServiceQueue:
     service: str
     admission_id: UUID | None
@@ -386,6 +409,7 @@ class CoreServiceQueue:
     queue_slots: tuple[tuple[UUID, Position], ...] = ()
     overflow_slots: tuple[tuple[UUID, Position], ...] = ()
     scheduled_deposits: tuple[tuple[UUID, int], ...] = ()
+    return_reservations: tuple[CargoReturnReservation, ...] = ()
     worker_progress: tuple[tuple[UUID, Position, int], ...] = ()
     wounded: tuple[UUID, ...] = ()
     entrance: Position | None = None

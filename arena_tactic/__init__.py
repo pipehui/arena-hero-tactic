@@ -7,6 +7,7 @@ from .context import DecisionContext
 from .models import (
     ActionIntent,
     BeaconSnapshot,
+    CargoReturnReservation,
     CoreServiceQueue,
     CoreOperationRequest,
     CoreOperationTimeline,
@@ -64,6 +65,7 @@ __all__ = (
     "BalancedTactic",
     "BeaconPlanner",
     "BeaconSnapshot",
+    "CargoReturnReservation",
     "CoreServiceQueue",
     "CoreOperationRequest",
     "CoreOperationTimeline",

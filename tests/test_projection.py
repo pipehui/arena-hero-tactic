@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from arena_hero import Direction, UnitType
+from arena_hero import Direction, MoveAction, UnitType
 
 from arena_tactic import BalancedTactic, TacticMemory, build_projected_turn
 from arena_tactic.world import build_world_model
@@ -145,23 +145,36 @@ class TacticalMapTests(unittest.TestCase):
         )
         self.assertEqual(selected["mission"], "ESCAPE")
 
-    def test_worker_does_not_take_an_ordinary_step_toward_a_remote_enemy(self) -> None:
-        worker = unit(1, UnitType.WORKER, (8, 0))
-        observer = unit(2, UnitType.RANGER, (0, 1))
-        enemy = unit(100, UnitType.VANGUARD, (0, 0), controlled=False)
+    def test_remote_enemy_does_not_reverse_an_unrelated_cargo_return(self) -> None:
+        worker = unit(1, UnitType.WORKER, (10, 0), cargo=1)
+        observer = unit(2, UnitType.RANGER, (-17, 0))
+        enemy = unit(100, UnitType.VANGUARD, (-20, 0), controlled=False)
         turn = make_turn(
-            core=friendly_core(position=(20, 0)),
+            core=friendly_core(position=(0, 0)),
             units=(worker, observer),
             enemies=(enemy,),
             resources=0,
-            resource_cells=((7, 0),),
         )
-        tactic = BalancedTactic()
+        memory = TacticMemory(opening_complete=True)
+        memory.known_passable.update(
+            (x, y)
+            for x in range(-24, 13)
+            for y in range(-4, 5)
+        )
+        tactic = BalancedTactic(memory=memory)
 
         tactic.choose_actions(turn)
 
         action = turn.plan.unit_actions[worker.id]
-        self.assertNotEqual(getattr(action, "direction", None), Direction.LEFT)
+        self.assertIsInstance(action, MoveAction)
+        self.assertEqual(action.direction, Direction.LEFT)
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        reservation = next(
+            row
+            for row in queue["return_reservations"]
+            if row["worker_id"] == str(worker.id)
+        )
+        self.assertEqual(tuple(reservation["first_position"]), (9, 0))
 
     def test_worker_discovery_triggers_combat_response(self) -> None:
         worker = unit(1, UnitType.WORKER, (10, 0))

@@ -10,6 +10,7 @@ from arena_hero import Core, Turn, Unit, UnitType, WaitAction
 from arena_tactic import (
     ActionIntent,
     BalancedTactic,
+    CargoReturnReservation,
     CoreServiceQueue,
     CoreOperationRequest,
     CoreOperationTimeline,
@@ -37,6 +38,7 @@ class PublicContractTests(unittest.TestCase):
         for value_type in (
             WorldModel,
             ActionIntent,
+            CargoReturnReservation,
             IntentResolution,
             CoreServiceQueue,
             CoreOperationRequest,
@@ -101,14 +103,14 @@ class PublicContractTests(unittest.TestCase):
 
         self.assertIsInstance(turn.plan.unit_actions[worker.id], WaitAction)
 
-    def test_decision_trace_is_detached_schema_28_data(self) -> None:
+    def test_decision_trace_is_detached_schema_29_data(self) -> None:
         turn = make_turn(units=(unit(1, UnitType.WORKER, (1, 0)),))
         tactic = BalancedTactic()
         tactic.choose_actions(turn)
 
         trace = tactic.last_decision_trace
 
-        self.assertEqual(trace["schema_version"], 28)
+        self.assertEqual(trace["schema_version"], 29)
         self.assertIn("resolution", trace)
         self.assertIn("world", trace)
         global_map = trace["world"]["global_map"]

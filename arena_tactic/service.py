@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable
 from uuid import UUID
 
-from arena_hero import CoreState, Position, UnitType
+from arena_hero import CoreState, Direction, Position, UnitType
 
 from .config import TacticConfig
 from .geometry import DIRECTION_ORDER, add_direction, cardinal_neighbors, manhattan, manhattan_ring
 from .models import (
     ActionIntent,
+    CargoReturnReservation,
     CoreOperationRequest,
     CoreOperationTimeline,
     CoreServiceQueue,
@@ -20,7 +21,7 @@ from .models import (
     WorldModel,
 )
 from .projection import TacticalMap
-from .planning import route_to
+from .planning import route_to, weighted_route_to
 from .rules import UNIT_MAX_HP
 from .state import TacticMemory
 
@@ -33,6 +34,127 @@ _SERVICE_MISSIONS = frozenset(
         UnitMission.RECOVER,
     }
 )
+
+
+def _cardinal_direction(start: Position, destination: Position) -> Direction | None:
+    return next(
+        (
+            direction
+            for direction, neighbor in cardinal_neighbors(start)
+            if neighbor == destination
+        ),
+        None,
+    )
+
+
+def cargo_return_route(
+    world: WorldModel,
+    projection: TacticalMap,
+    carrier: EntitySnapshot,
+    core_position: Position,
+    queue_cells: tuple[Position, ...],
+    *,
+    node_limit: int,
+    exit_cell: Position | None = None,
+    direct_core: bool = False,
+) -> CargoReturnReservation:
+    """Build the one authoritative spatial route used by calendar and actor.
+
+    Visible hostile occupancy and actual current firing cells are hard
+    blockers.  Fogged tracks and durable threat heat remain weighted costs;
+    they may cause a local detour but never an infinite directional ban.
+    """
+
+    if carrier.position == core_position:
+        return CargoReturnReservation(
+            worker_id=carrier.id,
+            route_target=core_position,
+            route_distance=0,
+            first_direction=None,
+            first_position=None,
+            earliest_deposit_tick=world.tick,
+            scheduled_deposit_tick=None,
+            departure_tick=None,
+            slack_ticks=None,
+            status="ON_CORE",
+        )
+    if direct_core and manhattan(carrier.position, core_position) == 1:
+        direction = _cardinal_direction(carrier.position, core_position)
+        return CargoReturnReservation(
+            worker_id=carrier.id,
+            route_target=core_position,
+            route_distance=1,
+            first_direction=direction,
+            first_position=core_position,
+            earliest_deposit_tick=world.tick + 1,
+            scheduled_deposit_tick=None,
+            departure_tick=None,
+            slack_ticks=None,
+            status="RETURNING",
+        )
+    lane_index = {cell: index for index, cell in enumerate(queue_cells)}
+    if carrier.position in lane_index:
+        index = lane_index[carrier.position]
+        destination = core_position if index == 0 else queue_cells[index - 1]
+        direction = _cardinal_direction(carrier.position, destination)
+        distance = index + 1
+        return CargoReturnReservation(
+            worker_id=carrier.id,
+            route_target=destination,
+            route_distance=distance,
+            first_direction=direction,
+            first_position=destination if direction is not None else None,
+            earliest_deposit_tick=world.tick + distance,
+            scheduled_deposit_tick=None,
+            departure_tick=None,
+            slack_ticks=None,
+            status="RETURNING" if direction is not None else "UNROUTABLE",
+            delay_reason=None if direction is not None else "INVALID_SERVICE_LANE",
+        )
+
+    target = queue_cells[-1] if queue_cells else core_position
+    blocked = set(projection.hostile_occupied)
+    blocked.update(projection.immediate_damage)
+    blocked.update({core_position, *queue_cells[:-1]})
+    if exit_cell is not None:
+        blocked.add(exit_cell)
+    blocked.discard(carrier.position)
+    blocked.discard(target)
+    route = weighted_route_to(
+        world,
+        carrier.position,
+        target,
+        node_limit=node_limit,
+        blocked=frozenset(blocked),
+        cell_costs=projection.route_costs_for(UnitType.WORKER),
+    )
+    if route is None:
+        return CargoReturnReservation(
+            worker_id=carrier.id,
+            route_target=target,
+            route_distance=None,
+            first_direction=None,
+            first_position=None,
+            earliest_deposit_tick=None,
+            scheduled_deposit_tick=None,
+            departure_tick=None,
+            slack_ticks=None,
+            status="UNROUTABLE",
+            delay_reason="NO_RETURN_ROUTE",
+        )
+    distance = route.distance + len(queue_cells)
+    return CargoReturnReservation(
+        worker_id=carrier.id,
+        route_target=target,
+        route_distance=distance,
+        first_direction=route.first_direction,
+        first_position=route.first_position,
+        earliest_deposit_tick=world.tick + distance,
+        scheduled_deposit_tick=None,
+        departure_tick=None,
+        slack_ticks=None,
+        status="RETURNING",
+    )
 
 
 def service_protected_positions(
@@ -143,6 +265,9 @@ class CoreServicePlanner:
         for worker_id in tuple(self.memory.service_worker_progress):
             if worker_id not in living_carrier_ids:
                 self.memory.service_worker_progress.pop(worker_id, None)
+        for worker_id in tuple(self.memory.service_return_progress):
+            if worker_id not in living_carrier_ids:
+                self.memory.service_return_progress.pop(worker_id, None)
         for worker_id in tuple(self.memory.service_cargo_first_seen_ticks):
             if worker_id not in living_carrier_ids:
                 self.memory.service_cargo_first_seen_ticks.pop(worker_id, None)
@@ -184,12 +309,14 @@ class CoreServicePlanner:
             carriers,
             core_position=service_core_position,
             force_replan=bool(
-                previous_admission is not None
-                and self.memory.service_worker_progress.get(
-                    previous_admission,
-                    ((0, 0), 0),
-                )[1]
-                >= 2
+                any(
+                    stalled >= 2
+                    for _, stalled in self.memory.service_return_progress.values()
+                )
+                or any(
+                    carrier.id in self.memory.failed_unit_moves
+                    for carrier in carriers
+                )
             ),
         )
         if previous_lane != (entrance, queue_cells):
@@ -202,40 +329,62 @@ class CoreServicePlanner:
             exit_cell,
             service_core_position,
         )
-        deposit_schedule = self._sync_deposit_schedule(
-            world,
-            projection,
-            carriers,
-            service_core_position,
-            queue_cells,
-        )
-
         emergency_ready_id = self._emergency_funding_carrier(
             world,
             carriers,
             urgent,
         )
-        ready, approaching, lane_index, head = self._sync_ready_line(
+        return_reservations = self._sync_deposit_schedule(
+            world,
+            projection,
+            carriers,
+            service_core_position,
+            queue_cells,
+            exit_cell,
+            emergency_ready_id=emergency_ready_id,
+        )
+        deposit_schedule = tuple(
+            (row.worker_id, row.scheduled_deposit_tick)
+            for row in return_reservations
+            if row.scheduled_deposit_tick is not None
+        )
+        reservation_by_id = {row.worker_id: row for row in return_reservations}
+        for row in return_reservations:
+            previous = self.memory.service_return_progress.get(row.worker_id)
+            stalled = 0
+            if row.status == "RETURNING" and row.route_distance is not None:
+                stalled = (
+                    previous[1] + 1
+                    if previous is not None
+                    and previous[0] is not None
+                    and row.route_distance >= previous[0]
+                    else 0
+                )
+            self.memory.service_return_progress[row.worker_id] = (
+                row.route_distance,
+                stalled,
+            )
+
+        ready, outside_line, lane_index, head = self._sync_ready_line(
             world,
             carriers,
             queue_cells,
             emergency_ready_id=emergency_ready_id,
         )
-        # Ordinary cells hold two entities.  Keep a two-wide feeder active so
-        # the queue can advance as a real pipeline instead of waiting for one
-        # remote carrier to complete its entire trip before releasing another.
-        active_approaching = approaching[:2]
-        holding = approaching[2:]
-        overflow_slots = self._overflow_slots(
-            world,
-            projection,
-            holding,
-            service_core_position,
-            queue_cells,
-            entrance,
-            exit_cell,
-            deposit_schedule,
+        active_approaching = tuple(
+            unit
+            for unit in outside_line
+            if reservation_by_id.get(unit.id) is not None
+            and reservation_by_id[unit.id].status == "RETURNING"
         )
+        holding = tuple(
+            unit for unit in outside_line if unit not in active_approaching
+        )
+        approaching = outside_line
+        # Future reservations are deliberately held at each Worker's current
+        # safe cell.  Herding them to synthetic radius-4 staging positions was
+        # the source of the old Core pile-up.
+        overflow_slots: tuple[tuple[UUID, Position], ...] = ()
         ready_ids = {unit.id for unit in ready}
 
         # START_MOVE is validated before harvest/deposit and turns the Core
@@ -254,11 +403,12 @@ class CoreServicePlanner:
                 overflow_slots=overflow_slots,
                 queue_slots=tuple((unit.id, target) for unit in active_approaching),
                 scheduled_deposits=deposit_schedule,
+                return_reservations=return_reservations,
                 worker_progress=tuple(
                     (
                         unit.id,
                         unit.position,
-                        self.memory.service_worker_progress.get(unit.id, (unit.position, 0))[1],
+                        self.memory.service_return_progress.get(unit.id, (None, 0))[1],
                     )
                     for unit in (*ready, *approaching)
                 ),
@@ -359,6 +509,27 @@ class CoreServicePlanner:
             ),
             patient_gateway,
         )
+        return_reservations = self._shift_reservations_for_patient(
+            world,
+            return_reservations,
+            patient_progress,
+            service,
+        )
+        deposit_schedule = tuple(
+            (row.worker_id, row.scheduled_deposit_tick)
+            for row in return_reservations
+            if row.scheduled_deposit_tick is not None
+        )
+        reservation_by_id = {row.worker_id: row for row in return_reservations}
+        active_approaching = tuple(
+            unit
+            for unit in approaching
+            if reservation_by_id.get(unit.id) is not None
+            and reservation_by_id[unit.id].status == "RETURNING"
+        )
+        holding = tuple(
+            unit for unit in approaching if unit not in active_approaching
+        )
         timeline = self._operation_timeline(
             world,
             projection,
@@ -371,7 +542,7 @@ class CoreServicePlanner:
             exit_cell,
             patient_gateway,
             carriers,
-            deposit_schedule,
+            return_reservations,
         )
         core_slot_reserved = timeline.current_slot_reserved
 
@@ -414,6 +585,7 @@ class CoreServicePlanner:
                     key=lambda item: (item[1], item[0].bytes),
                 )
             ),
+            return_reservations=return_reservations,
             ready_ticks=tuple(
                 (unit.id, self.memory.cargo_arrival_ticks[unit.id]) for unit in ready
             ),
@@ -431,7 +603,7 @@ class CoreServicePlanner:
                 (
                     unit.id,
                     unit.position,
-                    self.memory.service_worker_progress.get(unit.id, (unit.position, 0))[1],
+                    self.memory.service_return_progress.get(unit.id, (None, 0))[1],
                 )
                 for unit in (*ready, *approaching)
             ),
@@ -521,109 +693,209 @@ class CoreServicePlanner:
         carriers: tuple[EntitySnapshot, ...],
         core_position: Position,
         queue_cells: tuple[Position, ...],
-    ) -> tuple[tuple[UUID, int], ...]:
-        """Assign stable future DEPOSIT Ticks to every cargo Worker.
+        exit_cell: Position | None,
+        *,
+        emergency_ready_id: UUID | None = None,
+    ) -> tuple[CargoReturnReservation, ...]:
+        """Build executable routes and a stable, feasibility-correct calendar."""
 
-        Physical arrival and Core service are the same scheduling problem: a
-        Worker with a later appointment may stage farther out, while an
-        imminent appointment must keep moving.  Persisting the appointment in
-        session memory prevents the old failure where recomputing nearest-first
-        every Tick let new nearby cargo starve older Workers indefinitely.
-        """
-
-        lane_index = {cell: index for index, cell in enumerate(queue_cells)}
-        outer = queue_cells[-1] if queue_cells else core_position
-        rows: list[tuple[EntitySnapshot, int]] = []
-        for carrier in carriers:
-            if carrier.position == core_position:
-                eta = 0
-            elif carrier.position in lane_index:
-                eta = lane_index[carrier.position] + 1
-            else:
-                route = route_to(
-                    world,
-                    carrier.position,
-                    outer,
-                    node_limit=self.config.distance_field_node_limit,
-                    blocked=frozenset(
-                        (
-                            projection.hostile_occupied
-                            | {core_position, *queue_cells[:-1]}
-                        )
-                        - {carrier.position, outer}
-                    ),
-                )
-                # The appointment is the Tick on which DEPOSIT can execute,
-                # not merely a Manhattan arrival beside the Core.  Reaching
-                # the queue tail is followed by one move for every remaining
-                # lane cell before the Worker can act on the Core.
-                eta = (
-                    route.distance + len(queue_cells)
-                    if route is not None
-                    else manhattan(carrier.position, outer) + len(queue_cells)
-                )
-            rows.append((carrier, eta))
-
-        # First retain every appointment, including an overdue one.  Overdue
-        # means "move now", not "go to the back of the queue".  New cargo may
-        # fill an earlier unused future Tick, but it may not push an older
-        # Worker back merely because it appeared closer to home.
+        drafts = tuple(
+            cargo_return_route(
+                world,
+                projection,
+                carrier,
+                core_position,
+                queue_cells,
+                node_limit=self.config.path_node_limit,
+                exit_cell=exit_cell,
+                direct_core=carrier.id == emergency_ready_id,
+            )
+            for carrier in carriers
+        )
+        reachable = tuple(
+            row
+            for row in drafts
+            if row.earliest_deposit_tick is not None
+            and row.route_distance is not None
+        )
         used_ticks: set[int] = set()
+
+        def reservation_status(
+            row: CargoReturnReservation,
+            departure: int,
+        ) -> str:
+            if row.route_distance == 0:
+                return "ON_CORE"
+            if world.tick >= departure:
+                return "RETURNING"
+            return "WAIT_FOR_DEPARTURE"
 
         def next_available(requested: int) -> int:
             assigned = requested
-            # A Worker enters the Core on the Tick before DEPOSIT, performs
-            # DEPOSIT on its appointment, and can leave on the following Tick.
-            # Consequently consecutive deposit appointments need a one-Tick
-            # gap even though egress and the next ingress may share a Tick.
             while any(abs(assigned - other) < 2 for other in used_ticks):
                 assigned += 1
             return assigned
 
-        schedule: dict[UUID, int] = {}
+        assigned_rows: dict[UUID, CargoReturnReservation] = {}
         stable = sorted(
             (
-                (carrier, self.memory.service_deposit_ticks[carrier.id])
-                for carrier, _ in rows
-                if carrier.id in self.memory.service_deposit_ticks
+                row
+                for row in reachable
+                if row.worker_id in self.memory.service_deposit_ticks
+                and self.memory.service_deposit_ticks[row.worker_id]
+                >= row.earliest_deposit_tick
             ),
             key=lambda row: (
-                row[1],
-                self.memory.service_cargo_first_seen_ticks.get(
-                    row[0].id,
-                    world.tick,
-                ),
-                row[0].id.bytes,
+                self.memory.service_deposit_ticks[row.worker_id],
+                self.memory.service_cargo_first_seen_ticks.get(row.worker_id, world.tick),
+                row.worker_id.bytes,
             ),
         )
-        for carrier, requested in stable:
+        for row in stable:
+            requested = self.memory.service_deposit_ticks[row.worker_id]
             assigned = next_available(requested)
-            schedule[carrier.id] = assigned
             used_ticks.add(assigned)
-
-        unscheduled = sorted(
-            (
-                (carrier, world.tick + eta)
-                for carrier, eta in rows
-                if carrier.id not in schedule
-            ),
-            key=lambda row: (
-                row[1],
-                self.memory.service_cargo_first_seen_ticks.get(
-                    row[0].id,
-                    world.tick,
+            departure = assigned - row.route_distance
+            assigned_rows[row.worker_id] = replace(
+                row,
+                scheduled_deposit_tick=assigned,
+                departure_tick=departure,
+                slack_ticks=max(0, departure - world.tick),
+                status=reservation_status(row, departure),
+                delay_reason=(
+                    None if assigned == requested else "SERVICE_CONFLICT"
                 ),
-                row[0].id.bytes,
+            )
+
+        pending = sorted(
+            (row for row in reachable if row.worker_id not in assigned_rows),
+            key=lambda row: (
+                row.earliest_deposit_tick,
+                self.memory.service_cargo_first_seen_ticks.get(row.worker_id, world.tick),
+                row.worker_id.bytes,
             ),
         )
-        for carrier, earliest in unscheduled:
-            assigned = next_available(earliest)
-            schedule[carrier.id] = assigned
+        for row in pending:
+            assert row.earliest_deposit_tick is not None
+            requested = self.memory.service_deposit_ticks.get(row.worker_id)
+            assigned = next_available(row.earliest_deposit_tick)
             used_ticks.add(assigned)
+            departure = assigned - row.route_distance
+            assigned_rows[row.worker_id] = replace(
+                row,
+                scheduled_deposit_tick=assigned,
+                departure_tick=departure,
+                slack_ticks=max(0, departure - world.tick),
+                status=reservation_status(row, departure),
+                delay_reason=(
+                    "MISSED_APPOINTMENT"
+                    if requested is not None and requested < row.earliest_deposit_tick
+                    else "SERVICE_CONFLICT"
+                    if assigned > row.earliest_deposit_tick
+                    else None
+                ),
+            )
 
-        self.memory.service_deposit_ticks.update(schedule)
+        result = tuple(
+            sorted(
+                (
+                    assigned_rows.get(row.worker_id, row)
+                    for row in drafts
+                ),
+                key=lambda row: (
+                    row.scheduled_deposit_tick
+                    if row.scheduled_deposit_tick is not None
+                    else 1 << 60,
+                    row.worker_id.bytes,
+                ),
+            )
+        )
+        self.memory.service_deposit_ticks = {
+            row.worker_id: row.scheduled_deposit_tick
+            for row in result
+            if row.scheduled_deposit_tick is not None
+        }
+        return result
+
+    def _shift_reservations_for_patient(
+        self,
+        world: WorldModel,
+        reservations: tuple[CargoReturnReservation, ...],
+        patient_progress: PatientAdmissionProgress | None,
+        service: str,
+    ) -> tuple[CargoReturnReservation, ...]:
+        if (
+            patient_progress is None
+            or patient_progress.entry_distance is None
+        ):
+            return reservations
+        patient_tick = world.tick + patient_progress.entry_distance
+        if (
+            patient_progress.entry_distance == 0
+            and service in {
+                "DEPOSIT",
+                "DEPOSIT_BEFORE_PATIENT",
+                "WOUNDED_CARGO_DEPOSIT",
+            }
+        ):
+            patient_tick += 1
+        used: set[int] = set()
+        rows: list[CargoReturnReservation] = []
+        for row in sorted(
+            reservations,
+            key=lambda item: (
+                item.scheduled_deposit_tick
+                if item.scheduled_deposit_tick is not None
+                else 1 << 60,
+                item.worker_id.bytes,
+            ),
+        ):
+            if row.scheduled_deposit_tick is None or row.route_distance is None:
+                rows.append(row)
+                continue
+            assigned = row.scheduled_deposit_tick
+            original = assigned
+            while (
+                assigned in {patient_tick, patient_tick + 1}
+                or any(abs(assigned - other) < 2 for other in used)
+            ):
+                assigned += 1
+            used.add(assigned)
+            departure = assigned - row.route_distance
+            status = (
+                "ON_CORE"
+                if row.route_distance == 0
+                else "RETURNING"
+                if world.tick >= departure
+                else "WAIT_FOR_DEPARTURE"
+            )
+            rows.append(
+                replace(
+                    row,
+                    scheduled_deposit_tick=assigned,
+                    departure_tick=departure,
+                    slack_ticks=max(0, departure - world.tick),
+                    status=status,
+                    delay_reason=(
+                        "PATIENT_WINDOW" if assigned != original else row.delay_reason
+                    ),
+                )
+            )
+        self.memory.service_deposit_ticks = {
+            row.worker_id: row.scheduled_deposit_tick
+            for row in rows
+            if row.scheduled_deposit_tick is not None
+        }
         return tuple(
-            sorted(schedule.items(), key=lambda item: (item[1], item[0].bytes))
+            sorted(
+                rows,
+                key=lambda row: (
+                    row.scheduled_deposit_tick
+                    if row.scheduled_deposit_tick is not None
+                    else 1 << 60,
+                    row.worker_id.bytes,
+                ),
+            )
         )
 
     def _choose_patient_gateway(
@@ -1058,7 +1330,7 @@ class CoreServicePlanner:
         exit_cell: Position | None,
         patient_gateway: Position | None,
         carriers: tuple[EntitySnapshot, ...],
-        deposit_schedule: tuple[tuple[UUID, int], ...],
+        return_reservations: tuple[CargoReturnReservation, ...],
     ) -> CoreOperationTimeline:
         assert world.core is not None
         core = world.core
@@ -1072,6 +1344,15 @@ class CoreServicePlanner:
         if patient is not None and patient_progress.entry_distance is not None:
             missing = UNIT_MAX_HP[patient.unit_type] - patient.hp
             eta = patient_progress.entry_distance
+            if (
+                eta == 0
+                and service in {
+                    "DEPOSIT",
+                    "DEPOSIT_BEFORE_PATIENT",
+                    "WOUNDED_CARGO_DEPOSIT",
+                }
+            ):
+                eta = 1
             requests.append(
                 CoreOperationRequest(
                     actor_id=patient.id,
@@ -1094,29 +1375,22 @@ class CoreServicePlanner:
             for request in requests
             if request.operation == "HEAL"
         }
-        scheduled = dict(deposit_schedule)
-        next_deposit_tick = world.tick - 2
-        carrier_rows = sorted(
-            carriers,
-            key=lambda unit: (
-                scheduled.get(unit.id, world.tick),
-                self.memory.service_cargo_first_seen_ticks.get(unit.id, world.tick),
-                unit.id.bytes,
-            ),
-        )
-        for carrier in carrier_rows:
-            assigned = max(
-                world.tick,
-                scheduled.get(carrier.id, world.tick),
-                next_deposit_tick + 2,
-            )
+        carriers_by_id = {carrier.id: carrier for carrier in carriers}
+        for reservation in return_reservations:
+            carrier = carriers_by_id.get(reservation.worker_id)
+            assigned = reservation.scheduled_deposit_tick
+            if carrier is None or assigned is None:
+                continue
+            # Treatment owns a colliding physical window.  Delay the calendar
+            # entry rather than normalising an unreachable appointment to the
+            # current Tick.  The next service plan will persist this shift.
             while assigned in patient_ticks or assigned - 1 in patient_ticks:
                 assigned += 1
             self.memory.service_deposit_ticks[carrier.id] = assigned
             occupy_tick = (
                 world.tick
                 if carrier.position == core.position
-                else max(world.tick, assigned - 1)
+                else assigned - 1
             )
             requests.append(
                 CoreOperationRequest(
@@ -1130,7 +1404,6 @@ class CoreServicePlanner:
                     gateway=self.memory.service_entrance,
                 )
             )
-            next_deposit_tick = assigned
         requests.sort(
             key=lambda item: (
                 item.eta,
@@ -1148,13 +1421,22 @@ class CoreServicePlanner:
             else None
         )
         admission = units.get(admission_id) if admission_id is not None else None
+        incoming_cargo = any(
+            row.status == "RETURNING"
+            and row.first_position == core.position
+            and row.departure_tick is not None
+            and row.departure_tick <= world.tick
+            for row in return_reservations
+        )
+        incoming_patient = bool(
+            patient_progress is not None
+            and patient_progress.entry_distance is not None
+            and patient_progress.entry_distance <= 1
+        )
         current_slot_reserved = bool(
             current_occupant is not None
-            or admission is not None
-            and (
-                admission.position == core.position
-                or manhattan(admission.position, core.position) == 1
-            )
+            or incoming_cargo
+            or incoming_patient
         )
         next_request = requests[0] if requests else None
         protected_next = {
@@ -1324,7 +1606,26 @@ class CoreServicePlanner:
         enemy_positions = projection.hostile_occupied
         occupied = dict(world.occupied_cells)
         existing = self.memory.service_queue_cells
-        if not force_replan and self._lane_valid(core, existing, world, projection):
+        existing_reachable = tuple(
+            cargo_return_route(
+                world,
+                projection,
+                carrier,
+                core,
+                existing,
+                node_limit=self.config.path_node_limit,
+                exit_cell=self.memory.service_exit_cell,
+            )
+            for carrier in carriers
+        )
+        if (
+            not force_replan
+            and self._lane_valid(core, existing, world, projection)
+            and (
+                not carriers
+                or any(row.route_distance is not None for row in existing_reachable)
+            )
+        ):
             entrance = existing[0]
             exit_cell = self.memory.service_exit_cell
             if exit_cell is not None and (
@@ -1369,6 +1670,24 @@ class CoreServicePlanner:
             return None, (), None
 
         def path_score(path: tuple[Position, ...]) -> tuple[int, ...]:
+            candidate_exit = self._choose_exit(core, path[0], world, projection)
+            carrier_routes = tuple(
+                cargo_return_route(
+                    world,
+                    projection,
+                    carrier,
+                    core,
+                    path,
+                    node_limit=self.config.path_node_limit,
+                    exit_cell=candidate_exit,
+                )
+                for carrier in carriers
+            )
+            reachable = tuple(
+                row.route_distance
+                for row in carrier_routes
+                if row.route_distance is not None
+            )
             bends = sum(
                 (path[index][0] - path[index - 1][0], path[index][1] - path[index - 1][1])
                 != (path[index - 1][0] - (core if index == 1 else path[index - 2])[0],
@@ -1376,14 +1695,12 @@ class CoreServicePlanner:
                 for index in range(1, len(path))
             )
             return (
+                -len(reachable),
                 sum(projection.immediate_attackers(cell) for cell in path),
                 sum(projection.future_attackers(cell) for cell in path),
                 sum(projection.remembered_danger.get(cell, 0) for cell in path),
                 sum(max(0, occupied.get(cell, 0) - 1) for cell in path),
-                min(
-                    (manhattan(carrier.position, path[-1]) for carrier in carriers),
-                    default=0,
-                ),
+                sum(reachable),
                 bends,
                 path,
             )

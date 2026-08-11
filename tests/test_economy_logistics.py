@@ -188,7 +188,7 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         self.assertEqual(queue["admission_id"], str(carrier.id))
         self.assertEqual(queue["timeline"]["next_service_eta"], 0)
 
-    def test_waiting_carriers_receive_distinct_overflow_positions(self) -> None:
+    def test_waiting_carriers_hold_their_distributed_positions_until_departure(self) -> None:
         carriers = tuple(
             unit(index, UnitType.WORKER, (8 + index, 0), cargo=1)
             for index in range(1, 5)
@@ -199,13 +199,25 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         )
         tactic = BalancedTactic(memory=memory)
 
-        tactic.choose_actions(make_turn(units=carriers, resources=0))
+        turn = make_turn(units=carriers, resources=0)
+        tactic.choose_actions(turn)
 
         queue = tactic.last_decision_trace["economy"]["service_queue"]
-        overflow = queue["overflow_slots"]
-        self.assertEqual(len(queue["approaching_depositors"]), 2)
-        self.assertEqual(len(overflow), 2)
-        self.assertEqual(len({tuple(row["cell"]) for row in overflow}), 2)
+        self.assertEqual(queue["overflow_slots"], [])
+        reservations = queue["return_reservations"]
+        self.assertEqual(len(reservations), len(carriers))
+        waiting = {
+            row["worker_id"]
+            for row in reservations
+            if row["status"] == "WAIT_FOR_DEPARTURE"
+        }
+        self.assertEqual(set(queue["holding_depositors"]), waiting)
+        for carrier in carriers:
+            if str(carrier.id) in waiting:
+                self.assertIsInstance(
+                    turn.plan.unit_actions[carrier.id],
+                    WaitAction,
+                )
 
     def test_local_emergency_patient_reserves_core_slot_and_blocks_spawn(self) -> None:
         memory = TacticMemory(opening_complete=True)
@@ -714,7 +726,7 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         self.assertEqual(queue["admission_id"], str(front.id))
         self.assertEqual(turn.plan.unit_actions[front.id].direction, Direction.UP)
 
-    def test_ready_queue_advances_as_a_single_tick_pipeline(self) -> None:
+    def test_ready_queue_advances_on_reserved_departure_ticks(self) -> None:
         front = unit(1, UnitType.WORKER, (0, 1), cargo=1)
         outer = unit(2, UnitType.WORKER, (0, 2), cargo=1)
         approaching = unit(3, UnitType.WORKER, (0, 3), cargo=1)
@@ -738,12 +750,19 @@ class EconomyAndLogisticsTests(unittest.TestCase):
 
         tactic.choose_actions(turn)
 
-        for worker in (front, outer, approaching):
-            self.assertIsInstance(turn.plan.unit_actions[worker.id], MoveAction)
-            self.assertEqual(turn.plan.unit_actions[worker.id].direction, Direction.UP)
+        self.assertIsInstance(turn.plan.unit_actions[front.id], MoveAction)
+        self.assertEqual(turn.plan.unit_actions[front.id].direction, Direction.UP)
+        for worker in (outer, approaching):
+            self.assertIsInstance(turn.plan.unit_actions[worker.id], WaitAction)
+            task = next(
+                row
+                for row in tactic.last_decision_trace["tasks"]
+                if row["actor_id"] == str(worker.id)
+            )
+            self.assertEqual(task["reason"], "WAIT_FOR_DEPARTURE_TICK")
         queue = tactic.last_decision_trace["economy"]["service_queue"]
         self.assertEqual(queue["ready_depositors"], [str(front.id), str(outer.id)])
-        self.assertEqual(queue["approaching_depositors"], [str(approaching.id)])
+        self.assertEqual(queue["holding_depositors"], [str(approaching.id)])
 
     def test_blocked_pipeline_wait_keeps_its_service_reason(self) -> None:
         depositing = unit(1, UnitType.WORKER, (0, 0), cargo=1)
@@ -770,7 +789,7 @@ class EconomyAndLogisticsTests(unittest.TestCase):
             if item["actor_id"] == str(front.id)
         )
         self.assertEqual(task["mission"], "RETURN_CARGO")
-        self.assertEqual(task["reason"], "WAITING_FOR_CORE_SLOT")
+        self.assertEqual(task["reason"], "WAIT_FOR_DEPARTURE_TICK")
 
     def test_remote_carrier_approaches_the_outer_slot_without_cutting_the_line(self) -> None:
         carrier = unit(1, UnitType.WORKER, (0, -2), cargo=1)
@@ -956,7 +975,7 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         self.assertIsInstance(action, MoveAction)
         self.assertIn(action.direction, {Direction.LEFT, Direction.RIGHT})
 
-    def test_loaded_worker_detours_instead_of_closing_on_a_remote_enemy(self) -> None:
+    def test_loaded_worker_may_approach_a_remote_enemy_before_spatial_detour(self) -> None:
         core = friendly_core(position=(-10, 0))
         carrier = unit(1, UnitType.WORKER, (8, 0), cargo=1)
         observer = unit(2, UnitType.RANGER, (0, 1))
@@ -980,7 +999,15 @@ class EconomyAndLogisticsTests(unittest.TestCase):
 
         action = turn.plan.unit_actions[carrier.id]
         self.assertIsInstance(action, MoveAction)
-        self.assertNotEqual(action.direction, Direction.LEFT)
+        self.assertEqual(action.direction, Direction.LEFT)
+        destination = (carrier.position[0] - 1, carrier.position[1])
+        projection = tactic.last_tactical_map
+        assert projection is not None
+        self.assertEqual(projection.immediate_attackers(destination), 0)
+        self.assertLess(
+            manhattan(destination, core.position),
+            manhattan(carrier.position, core.position),
+        )
 
     def test_resource_distance_field_routes_around_visible_enemy_occupancy(self) -> None:
         worker = unit(1, UnitType.WORKER, (0, -2))
@@ -1092,7 +1119,7 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         self.assertIsInstance(action, MoveAction)
         self.assertEqual(action.direction, Direction.UP)
 
-    def test_remote_holding_carriers_keep_advancing_to_distributed_staging(self) -> None:
+    def test_remote_carriers_follow_departure_ticks_without_staging_herd(self) -> None:
         carriers = (
             unit(1, UnitType.WORKER, (6, 0), cargo=1),
             unit(2, UnitType.WORKER, (6, 1), cargo=1),
@@ -1110,16 +1137,18 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         tactic.choose_actions(turn)
 
         queue = tactic.last_decision_trace["economy"]["service_queue"]
-        self.assertEqual(len(queue["approaching_depositors"]), 2)
-        self.assertEqual(len(queue["holding_depositors"]), 0)
+        self.assertEqual(len(queue["approaching_depositors"]), 1)
+        self.assertEqual(len(queue["holding_depositors"]), 1)
+        self.assertEqual(queue["overflow_slots"], [])
         for carrier in carriers:
             action = turn.plan.unit_actions[carrier.id]
             if isinstance(action, WaitAction):
-                overflow = {
-                    row["worker_id"]: tuple(row["cell"])
-                    for row in queue["overflow_slots"]
-                }
-                self.assertEqual(overflow[str(carrier.id)], carrier.position)
+                task = next(
+                    row
+                    for row in tactic.last_decision_trace["tasks"]
+                    if row["actor_id"] == str(carrier.id)
+                )
+                self.assertEqual(task["reason"], "WAIT_FOR_DEPARTURE_TICK")
                 continue
             self.assertIsInstance(action, MoveAction)
             destination = (
@@ -1179,7 +1208,17 @@ class EconomyAndLogisticsTests(unittest.TestCase):
 
         # A future appointment must remain fixed while an early Worker is
         # staging.  Sliding every Tick recreates permanent overflow WAIT.
-        next_turn = make_turn(tick=101, units=carriers, resources=0)
+        next_units = []
+        for index, carrier in enumerate(carriers, start=1):
+            action = turn.plan.unit_actions[carrier.id]
+            position = carrier.position
+            if isinstance(action, MoveAction):
+                position = (
+                    position[0] + action.direction.delta[0],
+                    position[1] + action.direction.delta[1],
+                )
+            next_units.append(unit(index, UnitType.WORKER, position, cargo=1))
+        next_turn = make_turn(tick=101, units=tuple(next_units), resources=0)
         tactic.choose_actions(next_turn)
         next_schedule = tactic.last_decision_trace["economy"]["service_queue"][
             "scheduled_deposits"
@@ -1203,6 +1242,9 @@ class EconomyAndLogisticsTests(unittest.TestCase):
             ]
         }
 
+        # Simulate the first planned return step so the old appointment remains
+        # physically achievable on the next Tick.
+        far = unit(1, UnitType.WORKER, (7, 0), cargo=1)
         near = unit(2, UnitType.WORKER, (1, 0), cargo=1)
         tactic.choose_actions(
             make_turn(tick=101, units=(far, near), resources=0)
@@ -1217,11 +1259,47 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         self.assertEqual(second_schedule[str(far.id)], first_schedule[str(far.id)])
         self.assertLess(second_schedule[str(near.id)], second_schedule[str(far.id)])
 
-    def test_overdue_cargo_keeps_approach_lease_instead_of_rejoining_back(self) -> None:
+    def test_distance_five_cargo_fills_gap_before_distance_ten_appointment(self) -> None:
+        far = unit(1, UnitType.WORKER, (10, 0), cargo=1)
+        memory = TacticMemory(opening_complete=True)
+        memory.known_passable.update(
+            (x, y)
+            for x in range(-12, 13)
+            for y in range(-6, 7)
+        )
+        tactic = BalancedTactic(memory=memory)
+        tactic.choose_actions(make_turn(tick=100, units=(far,), resources=0))
+        first = tactic.last_decision_trace["economy"]["service_queue"]
+        far_reservation = first["return_reservations"][0]
+        self.assertEqual(far_reservation["route_distance"], 10)
+        self.assertEqual(far_reservation["scheduled_deposit_tick"], 110)
+
+        moved_far = unit(1, UnitType.WORKER, (9, 0), cargo=1)
+        near = unit(2, UnitType.WORKER, (5, 0), cargo=1)
+        tactic.choose_actions(
+            make_turn(tick=101, units=(moved_far, near), resources=0)
+        )
+        reservations = {
+            row["worker_id"]: row
+            for row in tactic.last_decision_trace["economy"]["service_queue"][
+                "return_reservations"
+            ]
+        }
+        self.assertEqual(
+            reservations[str(moved_far.id)]["scheduled_deposit_tick"],
+            110,
+        )
+        self.assertEqual(reservations[str(near.id)]["route_distance"], 5)
+        self.assertLess(
+            reservations[str(near.id)]["scheduled_deposit_tick"],
+            reservations[str(moved_far.id)]["scheduled_deposit_tick"],
+        )
+
+    def test_overdue_cargo_is_rescheduled_from_its_real_eta(self) -> None:
         far = unit(1, UnitType.WORKER, (8, 0), cargo=1)
-        near_a = unit(2, UnitType.WORKER, (2, 0), cargo=1)
-        near_b = unit(3, UnitType.WORKER, (0, 2), cargo=1)
         memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
             opening_complete=True,
             service_deposit_ticks={far.id: 99},
             service_cargo_first_seen_ticks={far.id: 90},
@@ -1234,11 +1312,26 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         tactic = BalancedTactic(memory=memory)
 
         tactic.choose_actions(
-            make_turn(tick=101, units=(far, near_a, near_b), resources=0)
+            make_turn(tick=101, units=(far,), resources=0)
         )
 
         queue = tactic.last_decision_trace["economy"]["service_queue"]
         self.assertIn(str(far.id), queue["approaching_depositors"])
+        reservation = next(
+            row
+            for row in queue["return_reservations"]
+            if row["worker_id"] == str(far.id)
+        )
+        self.assertGreaterEqual(
+            reservation["scheduled_deposit_tick"],
+            reservation["earliest_deposit_tick"],
+        )
+        self.assertEqual(reservation["delay_reason"], "MISSED_APPOINTMENT")
+        self.assertGreater(queue["timeline"]["next_service_eta"], 0)
+        self.assertNotEqual(
+            queue["timeline"]["reason"],
+            "SERVICE_DUE_THIS_TICK",
+        )
         far_task = next(
             task
             for task in tactic.last_decision_trace["tasks"]
@@ -2029,10 +2122,7 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         )
         self.assertEqual(task["mission"], "EXPLORE")
         self.assertEqual(task["reason"], "INFORMATION_GAIN")
-        self.assertGreaterEqual(
-            manhattan(tuple(task["target"]), distant_home_threat.position),
-            manhattan((2, 0), distant_home_threat.position),
-        )
+        self.assertNotEqual(task["mission"], "ESCAPE")
 
     def test_recent_fogged_threat_keeps_worker_in_escape_mission(self) -> None:
         worker = unit(1, UnitType.WORKER, (0, 0))

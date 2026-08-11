@@ -340,10 +340,6 @@ class WorkerPlanner:
             if cell is not None and cell != worker.position
         }
         options = []
-        directional_avoid = self._remote_threat_approach_cells(
-            projection,
-            worker.position,
-        )
         occupied = dict(world.occupied_cells)
         current_distance = manhattan(worker.position, world.core.position)
         outer = manhattan(world.core.position, target)
@@ -354,7 +350,6 @@ class WorkerPlanner:
                 or destination == world.core.position
                 or not self._manual_allowed(worker.id, direction, world.tick)
                 or projection.immediate_attackers(destination) >= worker.hp
-                or destination in directional_avoid
             ):
                 continue
             immediate, future, remembered = projection.worker_exposure(destination)
@@ -1173,13 +1168,14 @@ class WorkerPlanner:
                     reason=f"SERVICE_PAUSED_{service.paused_reason}",
                 )
             ]
-        if worker.id in service.holding_depositors:
-            return self._hold_cargo_outside_service_lane(
-                world,
-                projection,
-                worker,
-                service,
-            )
+        reservation = next(
+            (
+                row
+                for row in service.return_reservations
+                if row.worker_id == worker.id
+            ),
+            None,
+        )
         if (
             worker.position == world.core.position
             and world.resources >= world.resource_capacity
@@ -1206,104 +1202,63 @@ class WorkerPlanner:
                         metadata=(("allow_protected", True),),
                     )
                 ]
-        slots = dict(service.queue_slots)
-        target = slots.get(worker.id, world.core.destination or world.core.position)
-        ready = worker.id in service.ready_depositors
-        approaching = worker.id in service.approaching_depositors
-        extra = set()
-        if (
-            service.paused_reason == "CORE_STARTING_MOVE"
-            and service.service_core_position is not None
-            and worker.position != service.service_core_position
-        ):
-            extra.add(service.service_core_position)
-        if approaching and service.queue_cells:
-            extra.update(
-                {
-                    world.core.position,
-                    *service.queue_cells[:-1],
-                    *((service.exit_cell,) if service.exit_cell is not None else ()),
-                }
-                - {worker.position, target}
-            )
-        route = self._route(
-            world,
-            projection,
-            worker,
-            target,
-            service,
-            logistics=True,
-            allow_directional_fallback=True,
-            extra_blocked=frozenset(extra),
-        )
-        fallback = False
-        if route is None and approaching:
-            # Service admission is a near-Core concern.  A stale or
-            # temporarily inaccessible queue tail must never cancel the
-            # Worker's sticky return-home mission while it is still far away.
-            # Follow a terrain-safe route toward the Core and let the local
-            # queue take over as soon as the Worker reaches its service area.
-            route = self._route(
-                world,
-                projection,
-                worker,
-                world.core.position,
-                service,
-                logistics=True,
-                allow_directional_fallback=True,
-            )
-            fallback = route is not None
-        if (
-            route is not None
-            and route.first_direction is not None
-        ):
-            priority = 49 if service.admission_id == worker.id else (50 if ready else 51)
-            reason = (
-                "SERVICE_ADMISSION"
-                if service.admission_id == worker.id
-                else (
-                    "SERVICE_PIPELINE_ADVANCE"
-                    if ready
-                    else (
-                        "RETURN_HOME_FALLBACK"
-                        if fallback
-                        else "SERVICE_QUEUE_APPROACH"
-                    )
+        if reservation is None or reservation.status == "UNROUTABLE":
+            return [
+                ActionIntent.simple(
+                    worker.id,
+                    IntentAction.WAIT,
+                    UnitMission.RETURN_CARGO,
+                    51,
+                    reason="NO_RETURN_ROUTE",
                 )
+            ]
+        if reservation.status == "WAIT_FOR_DEPARTURE":
+            return [
+                ActionIntent.simple(
+                    worker.id,
+                    IntentAction.WAIT,
+                    UnitMission.RETURN_CARGO,
+                    51,
+                    target_position=worker.position,
+                    reason="WAIT_FOR_DEPARTURE_TICK",
+                    metadata=(
+                        ("scheduled_deposit_tick", reservation.scheduled_deposit_tick),
+                        ("departure_tick", reservation.departure_tick),
+                        ("slack_ticks", reservation.slack_ticks),
+                    ),
+                )
+            ]
+        if reservation.first_direction is not None and reservation.first_position is not None:
+            ready = worker.id in service.ready_depositors
+            priority = 49 if service.admission_id == worker.id else (50 if ready else 51)
+            reason = "SERVICE_ADMISSION" if reservation.first_position == world.core.position else (
+                "SERVICE_PIPELINE_ADVANCE" if ready else "SERVICE_QUEUE_APPROACH"
             )
             return [
                 ActionIntent.move(
                     worker.id,
                     UnitMission.RETURN_CARGO,
                     priority,
-                    route.first_direction,
-                    route.first_position,
-                    risk=self._risk(projection, route.first_position),
-                    # Queue cells have the official two-entity capacity and
-                    # are deliberately used as a feeder pipeline.  Only the
-                    # Core service slot itself is exclusive.
-                    exclusive_destination=route.first_position == world.core.position,
-                    tie_break=(route.distance,),
+                    reservation.first_direction,
+                    reservation.first_position,
+                    risk=self._risk(projection, reservation.first_position),
+                    exclusive_destination=reservation.first_position == world.core.position,
+                    tie_break=(reservation.route_distance,),
                     reason=reason,
                     metadata=(
                         ("allow_protected", True),
                         (
                             "allow_head_on_swap",
-                            service.admission_id == worker.id
+                            reservation.first_position == world.core.position
                             or worker.position == world.core.position,
                         ),
-                        (
-                            "service_slot",
-                            world.core.position if fallback else target,
-                        ),
+                        ("service_slot", reservation.route_target),
                         (
                             "allow_service_overlap",
-                            route.first_position in service.queue_cells,
+                            reservation.first_position in service.queue_cells,
                         ),
-                        (
-                            "scheduled_deposit_tick",
-                            dict(service.scheduled_deposits).get(worker.id),
-                        ),
+                        ("scheduled_deposit_tick", reservation.scheduled_deposit_tick),
+                        ("departure_tick", reservation.departure_tick),
                     ),
                 ),
                 ActionIntent.simple(
@@ -1318,21 +1273,13 @@ class WorkerPlanner:
                     ),
                 ),
             ]
-        core_blocked = ready and any(
-            other.id != worker.id and other.position == world.core.position
-            for other in world.friendlies
-        )
         return [
             ActionIntent.simple(
                 worker.id,
                 IntentAction.WAIT,
                 UnitMission.RETURN_CARGO,
-                49 if service.admission_id == worker.id else (50 if ready else 51),
-                reason=(
-                    "NO_RETURN_ROUTE"
-                    if approaching and route is None
-                    else ("WAITING_FOR_CORE_SLOT" if core_blocked else "WAITING_IN_SERVICE_QUEUE")
-                ),
+                49 if service.admission_id == worker.id else 51,
+                reason="WAITING_FOR_DEPOSIT_ACTION",
             )
         ]
 
@@ -1348,10 +1295,6 @@ class WorkerPlanner:
         if preferred is not None and manhattan(preferred, world.core.position) != 1:
             preferred = None
         candidates = []
-        directional_avoid = self._remote_threat_approach_cells(
-            projection,
-            unit.position,
-        )
         scout_step = None if exploration is None else exploration[1].first_position
         scout_target = None if exploration is None else exploration[0]
         for index, (direction, destination) in enumerate(cardinal_neighbors(unit.position)):
@@ -1362,7 +1305,6 @@ class WorkerPlanner:
             score = (
                 projection.immediate_attackers(destination),
                 projection.future_attackers(destination),
-                int(destination in directional_avoid),
                 int(destination != scout_step),
                 int(destination != preferred),
                 occupied.get(destination, 0),
@@ -1422,10 +1364,6 @@ class WorkerPlanner:
             *service.queue_cells,
         }
         rows = []
-        directional_avoid = self._remote_threat_approach_cells(
-            projection,
-            unit.position,
-        )
         for index, (direction, destination) in enumerate(
             cardinal_neighbors(unit.position)
         ):
@@ -1438,7 +1376,6 @@ class WorkerPlanner:
             score = (
                 projection.immediate_attackers(destination),
                 projection.future_attackers(destination),
-                int(destination in directional_avoid),
                 projection.worker_exposure(destination)[2],
                 int(destination in world.visible_resources),
                 occupied.get(destination, 0),
@@ -1453,7 +1390,7 @@ class WorkerPlanner:
                 45,
                 direction,
                 destination,
-                risk=score[0] * 100 + score[1] * 10 + score[3],
+                risk=score[0] * 100 + score[1] * 10 + score[2],
                 tie_break=score,
                 reason=(
                     "CLEAR_SERVICE_EXIT"
@@ -1567,10 +1504,6 @@ class WorkerPlanner:
             ]
         occupied = dict(world.occupied_cells)
         rows = []
-        directional_avoid = self._remote_threat_approach_cells(
-            projection,
-            worker.position,
-        )
         route = self._route(
             world,
             projection,
@@ -1596,7 +1529,6 @@ class WorkerPlanner:
                 continue
             destination_distance = manhattan(destination, world.core.position)
             score = (
-                int(destination in directional_avoid),
                 projection.future_attackers(destination),
                 projection.worker_exposure(destination)[2],
                 int(
@@ -1625,7 +1557,7 @@ class WorkerPlanner:
                 48,
                 direction,
                 destination,
-                risk=score[1] * 10 + score[2],
+                risk=score[0] * 10 + score[1],
                 tie_break=score,
                 reason=(
                     "RETURN_TO_SERVICE_STAGING"
@@ -2272,9 +2204,6 @@ class WorkerPlanner:
         blocked = set(projection.hostile_occupied)
         blocked.update(protected)
         blocked.update(projection.immediate_damage)
-        blocked.update(
-            self._remote_threat_approach_cells(projection, actor.position)
-        )
         blocked.discard(actor.position)
         if (
             world.core is not None
@@ -2318,26 +2247,7 @@ class WorkerPlanner:
         blocked.update(projection.immediate_damage)
         blocked.discard(actor.position)
         costs = self.safety.route_costs(projection)
-        directional_avoid = self._remote_threat_approach_cells(
-            projection,
-            actor.position,
-        )
         route = weighted_route_to(
-            world,
-            actor.position,
-            target,
-            node_limit=self.config.path_node_limit,
-            blocked=frozenset(blocked | directional_avoid),
-            cell_costs=costs,
-            allow_unknown_endpoint=allow_unknown,
-        )
-        if route is not None or not allow_directional_fallback:
-            return route
-        # A carrier must eventually reach the Core even when terrain makes
-        # every lateral detour impossible.  This fallback is deliberately
-        # opt-in: patrol, exploration and home guard must never volunteer to
-        # close on a remote enemy merely because they use service corridors.
-        return weighted_route_to(
             world,
             actor.position,
             target,
@@ -2346,30 +2256,7 @@ class WorkerPlanner:
             cell_costs=costs,
             allow_unknown_endpoint=allow_unknown,
         )
-
-    def _remote_threat_approach_cells(self, projection, origin):
-        """Immediate steps that explicitly close on globally known enemies."""
-
-        threats = tuple(
-            enemy
-            for enemy in projection.enemies
-            if enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
-            and enemy.age <= self.config.enemy_track_ttl
-            and max(
-                0,
-                manhattan(origin, enemy.observed_position) - enemy.age,
-            )
-            > self.config.global_worker_threat_awareness_radius
-        )
-        return frozenset(
-            destination
-            for _, destination in cardinal_neighbors(origin)
-            if any(
-                manhattan(destination, enemy.observed_position)
-                < manhattan(origin, enemy.observed_position)
-                for enemy in threats
-            )
-        )
+        return route
 
     def _looping(self, unit_id):
         history = self.memory.position_history.get(unit_id, ())

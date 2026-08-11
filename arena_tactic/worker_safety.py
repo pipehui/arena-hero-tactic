@@ -18,7 +18,6 @@ class WorkerStepSafety:
     survival_terminals: int
     immediate_attackers: int
     future_attackers: int
-    remote_enemy_approaches: int
     heat: int
     route: Route
     route_reachable: bool
@@ -31,7 +30,6 @@ class WorkerStepSafety:
             0 if self.forward_exits >= 2 else (1 if self.forward_exits == 1 else 2),
             self.immediate_attackers,
             self.future_attackers,
-            self.remote_enemy_approaches,
             self.heat,
             int(not self.route_reachable),
             self.route.distance,
@@ -112,8 +110,6 @@ class WorkerSafetyEvaluator:
         blocked: frozenset[Position],
         node_limit: int,
         lookahead_node_limit: int,
-        enemy_track_ttl: int,
-        near_escape_radius: int,
     ) -> tuple[WorkerStepSafety, ...]:
         costs = self.route_costs(projection)
         rows: list[WorkerStepSafety] = []
@@ -179,22 +175,6 @@ class WorkerSafetyEvaluator:
                     ),
                     immediate_attackers=projection.immediate_attackers(destination),
                     future_attackers=projection.future_attackers(destination),
-                    remote_enemy_approaches=sum(
-                        enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
-                        and enemy.age <= enemy_track_ttl
-                        and max(
-                            0,
-                            manhattan(
-                                worker.position,
-                                enemy.observed_position,
-                            )
-                            - enemy.age,
-                        )
-                        > near_escape_radius
-                        and manhattan(destination, enemy.observed_position)
-                        < manhattan(worker.position, enemy.observed_position)
-                        for enemy in projection.enemies
-                    ),
                     heat=projection.worker_exposure(destination)[2],
                     route=route,
                     route_reachable=(
