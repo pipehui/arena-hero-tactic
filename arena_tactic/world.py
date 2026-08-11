@@ -162,7 +162,7 @@ def _sync_events(
         if event.event_type == "SWEEP_RESOLVED" and event.actor_id is not None:
             plan = memory.last_vanguard_sweeps.get(event.actor_id)
             if plan is not None:
-                key = plan.target_id, plan.expected_cell
+                key = plan.shooter_id, plan.expected_cell
                 values = event.values or {}
                 hits = values.get("targets_hit", 0)
                 if isinstance(hits, int) and hits > 0:

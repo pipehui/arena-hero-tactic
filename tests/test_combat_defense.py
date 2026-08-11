@@ -6,6 +6,7 @@ from collections import Counter
 from arena_hero import (
     BeaconStatus,
     ChampionBeacon,
+    Direction,
     MoveAction,
     ShootAction,
     SpawnAction,
@@ -20,6 +21,50 @@ from tests.helpers import enemy_core, friendly_core, make_turn, unit
 
 
 class CombatDefenseTests(unittest.TestCase):
+    def test_global_vanguard_assignment_uses_nearest_defender_before_uuid_order(self) -> None:
+        vanguards = (
+            unit(1, UnitType.VANGUARD, (1, -5)),
+            unit(2, UnitType.VANGUARD, (6, 0)),
+            unit(3, UnitType.VANGUARD, (-6, 0)),
+            unit(4, UnitType.VANGUARD, (0, -9)),
+        )
+        enemy = unit(900, UnitType.VANGUARD, (0, -13), controlled=False)
+        memory = TacticMemory(opening_complete=True)
+        memory.known_passable.update(
+            (x, y)
+            for x in range(-16, 17)
+            for y in range(-16, 17)
+            if abs(x) + abs(y) <= 16
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(
+            make_turn(units=vanguards, enemies=(enemy,), resources=0)
+        )
+
+        nearest_task = next(
+            task
+            for task in tactic.last_decision_trace["tasks"]
+            if task["actor_id"] == str(vanguards[-1].id)
+        )
+        self.assertEqual(nearest_task["mission"], "ATTACK")
+        self.assertNotIn("SECTOR_RESERVE", nearest_task["reason"])
+
+    def test_vanguard_sweeps_a_multi_enemy_candidate_convergence_cell(self) -> None:
+        vanguard = unit(1, UnitType.VANGUARD, (0, 0))
+        enemies = (
+            unit(100, UnitType.VANGUARD, (-1, -1), controlled=False),
+            unit(101, UnitType.VANGUARD, (-1, 1), controlled=False),
+        )
+
+        turn = make_turn(units=(vanguard,), enemies=enemies, resources=0)
+        tactic = BalancedTactic()
+        tactic.choose_actions(turn)
+
+        action = turn.plan.unit_actions[vanguard.id]
+        self.assertIsInstance(action, SweepAction)
+        self.assertEqual(action.direction, Direction.LEFT)
+
     def test_distant_healthy_rangers_advance_to_real_enemy_firing_lines(self) -> None:
         rangers = (
             unit(1, UnitType.RANGER, (-4, -3)),
@@ -338,6 +383,57 @@ class CombatDefenseTests(unittest.TestCase):
                 for task in group_tasks
             )
         )
+
+    def test_outer_screen_members_survive_home_handoff_at_radius_thirteen(self) -> None:
+        unit_rows = list(
+            [unit(10 + index, UnitType.VANGUARD, (index - 3, 5)) for index in range(6)]
+            + [unit(30 + index, UnitType.RANGER, (index - 3, -5)) for index in range(6)]
+        )
+        unit_rows[0] = unit(10, UnitType.VANGUARD, (12, 0))
+        unit_rows[1] = unit(11, UnitType.VANGUARD, (11, 1))
+        unit_rows[6] = unit(30, UnitType.RANGER, (12, 2))
+        unit_rows[7] = unit(31, UnitType.RANGER, (11, -1))
+        units = tuple(unit_rows)
+        memory = TacticMemory(opening_complete=True)
+        memory.known_passable.update(
+            (x, y)
+            for x in range(-35, 36)
+            for y in range(-35, 36)
+            if abs(x) + abs(y) <= 35
+        )
+        tactic = BalancedTactic(memory=memory)
+        target_id = 200
+        tactic.choose_actions(
+            make_turn(
+                tick=1,
+                units=units,
+                enemies=(unit(target_id, UnitType.VANGUARD, (17, 0), controlled=False),),
+                resources=0,
+            )
+        )
+        original = tactic.memory.screening_groups[
+            unit(target_id, UnitType.VANGUARD, (17, 0), controlled=False).id
+        ]
+
+        tactic.choose_actions(
+            make_turn(
+                tick=2,
+                units=units,
+                enemies=(unit(target_id, UnitType.VANGUARD, (13, 0), controlled=False),),
+                resources=0,
+            )
+        )
+
+        retained = tactic.memory.screening_groups[original.target_id]
+        self.assertEqual(retained.phase, "HOME_HANDOFF")
+        self.assertEqual(retained.vanguard_ids, original.vanguard_ids)
+        assignments = tactic.last_decision_trace["combat"]["home_vanguard_assignment"]["tasks"]
+        handoff_ids = {
+            row["vanguard_id"]
+            for row in assignments
+            if row["phase"] == "HOME_HANDOFF"
+        }
+        self.assertEqual(handoff_ids, {str(item) for item in original.vanguard_ids})
 
     def test_two_rangers_cross_cover_a_moving_worker(self) -> None:
         rangers = (

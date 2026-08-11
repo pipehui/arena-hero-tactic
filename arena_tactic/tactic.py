@@ -3,7 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import replace
 
-from arena_hero import CommandSource, Direction, Received, Turn
+from arena_hero import CommandSource, Direction, Received, Turn, UnitType
 
 from .config import DEFAULT_CONFIG, TacticConfig
 from .kernel import DecisionKernel
@@ -95,6 +95,20 @@ class BalancedTactic:
             try:
                 direction = Direction(direction)
             except (TypeError, ValueError):
+                continue
+            snapshot = (
+                None
+                if self._last_world is None
+                else self._last_world.friendly(unit_id)
+            )
+            if snapshot is not None and snapshot.unit_type in {
+                UnitType.VANGUARD,
+                UnitType.RANGER,
+            }:
+                # Manual combat commands never become online policy.  Clear
+                # stale attribution above, but let the next Turn's global
+                # assignment respond to the current battlefield immediately.
+                self.memory.manual_move_leases.pop(unit_id, None)
                 continue
             self.memory.unit_missions.pop(unit_id, None)
             scout = self.memory.worker_scout_states.get(unit_id)

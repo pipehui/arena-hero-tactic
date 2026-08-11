@@ -86,7 +86,14 @@ class RecoveryPlanner:
                 )
                 continue
 
-            target = world.core.position if admitted and service.paused_reason is None else None
+            target = None
+            if admitted and service.paused_reason is None:
+                target = (
+                    service.patient_gateway
+                    if service.patient_gateway is not None
+                    and unit.position != service.patient_gateway
+                    else world.core.position
+                )
             if target is None:
                 target = self._staging_cell(
                     world,
@@ -101,6 +108,12 @@ class RecoveryPlanner:
             route_blocked = False
             if target is not None and unit.position != target:
                 blocked = set(projection.hostile_occupied)
+                blocked.update(
+                    cell
+                    for cell, count in projection.occupied_cells.items()
+                    if count >= 2
+                    and cell not in {unit.position, target, world.core.position}
+                )
                 allowed_service_cells = {unit.position, target, world.core.position}
                 if admitted:
                     # An admitted patient must be able to use the same narrow
@@ -109,6 +122,10 @@ class RecoveryPlanner:
                     allowed_service_cells.update(service.queue_cells)
                     if service.entrance is not None:
                         allowed_service_cells.add(service.entrance)
+                    if service.exit_cell is not None:
+                        allowed_service_cells.add(service.exit_cell)
+                    if service.patient_gateway is not None:
+                        allowed_service_cells.add(service.patient_gateway)
                 blocked.update(
                     cell
                     for cell in protected

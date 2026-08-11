@@ -39,9 +39,18 @@ class ProductionPlanner:
         projection: TacticalMap,
         *,
         reserved_resources: int = 0,
+        core_slot_reserved: bool = False,
     ) -> tuple[list[ActionIntent], tuple[dict[str, object], ...]]:
         if world.core is None or world.core.state is CoreState.MOVING:
             return [], ()
+        if core_slot_reserved:
+            return [], (
+                {
+                    "unit_type": None,
+                    "reason": "URGENT_PATIENT_CORE_SLOT_RESERVED",
+                    "reserved_resources": reserved_resources,
+                },
+            )
         counts = Counter(unit.unit_type for unit in world.friendlies)
         workers = counts[UnitType.WORKER]
         vanguards = counts[UnitType.VANGUARD]

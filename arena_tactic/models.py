@@ -383,15 +383,61 @@ class CoreServiceQueue:
     holding_depositors: tuple[UUID, ...] = ()
     ready_ticks: tuple[tuple[UUID, int], ...] = ()
     queue_slots: tuple[tuple[UUID, Position], ...] = ()
+    worker_progress: tuple[tuple[UUID, Position, int], ...] = ()
     wounded: tuple[UUID, ...] = ()
     entrance: Position | None = None
     queue_cells: tuple[Position, ...] = ()
     exit_cell: Position | None = None
+    patient_gateway: Position | None = None
+    core_slot_reserved: bool = False
+    patient_progress: "PatientAdmissionProgress | None" = None
     reserved_resources: int = 0
     paused_reason: str | None = None
     previous_admission_id: UUID | None = None
     admission_reason: str | None = None
     release_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PatientAdmissionProgress:
+    patient_id: UUID
+    gateway: Position | None
+    started_tick: int
+    last_position: Position
+    stalled_ticks: int = 0
+    entry_distance: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class VanguardInterceptTask:
+    vanguard_id: UUID
+    target_id: UUID
+    sector: Direction
+    phase: str
+    intercept_cell: Position
+    candidate_cells: tuple[Position, ...]
+    cost: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class VanguardAssignmentCandidate:
+    vanguard_id: UUID
+    target_id: UUID
+    cost: tuple[int, ...] | None
+    selected: bool
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class HomeCombatAssignment:
+    tasks: tuple[VanguardInterceptTask, ...] = ()
+    candidates: tuple[VanguardAssignmentCandidate, ...] = ()
+    unassigned_vanguards: tuple[UUID, ...] = ()
+    uncovered_targets: tuple[UUID, ...] = ()
+
+    @property
+    def assigned_vanguard_ids(self) -> frozenset[UUID]:
+        return frozenset(task.vanguard_id for task in self.tasks)
 
 
 @dataclass(frozen=True, slots=True)

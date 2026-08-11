@@ -16,6 +16,7 @@ from .models import (
     ActionIntent,
     CoreServiceQueue,
     FireMission,
+    HomeCombatAssignment,
     IntentAction,
     IntentResolution,
     MoveAttempt,
@@ -42,6 +43,7 @@ class _PlanningProducts:
     fire_missions: tuple[FireMission, ...]
     legal_opportunities: tuple[tuple[UUID, UUID, Position], ...]
     production_candidates: tuple[dict[str, object], ...]
+    home_combat_assignment: HomeCombatAssignment
 
 
 class DecisionKernel:
@@ -97,6 +99,7 @@ class DecisionKernel:
             products.legal_opportunities,
             evacuation,
             products.production_candidates,
+            products.home_combat_assignment,
         )
         return world, resolution, trace
 
@@ -189,6 +192,10 @@ class DecisionKernel:
         worker_intents = self.workers.intents(world, projection, service)
         egress_intents = self.service.combat_egress_intents(world, projection, service)
         recovery_intents = self.recovery.intents(world, projection, service)
+        home_combat_assignment = self.combat.home_combat_assignment(
+            world,
+            projection,
+        )
 
         intents: list[ActionIntent] = []
         intents.extend(core_intents)
@@ -204,12 +211,19 @@ class DecisionKernel:
                 context.protected_positions,
             )
         )
-        intents.extend(self.combat.vanguard_intents(world, projection))
+        intents.extend(
+            self.combat.vanguard_intents(
+                world,
+                projection,
+                home_combat_assignment,
+            )
+        )
         intents.extend(
             self.defense.intents(
                 world,
                 projection,
                 context.protected_positions,
+                home_combat_assignment.assigned_vanguard_ids,
             )
         )
         intents.extend(
@@ -223,6 +237,7 @@ class DecisionKernel:
             world,
             projection,
             reserved_resources=service.reserved_resources,
+            core_slot_reserved=service.core_slot_reserved,
         )
         intents.extend(production_intents)
         intents.extend(self._fallback_waits(world))
@@ -236,6 +251,7 @@ class DecisionKernel:
             fire_missions=fire_missions,
             legal_opportunities=legal_opportunities,
             production_candidates=production_candidates,
+            home_combat_assignment=home_combat_assignment,
         )
 
     @staticmethod

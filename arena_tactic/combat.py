@@ -21,12 +21,15 @@ from .models import (
     EnemyRangerFireEstimate,
     EntitySnapshot,
     FireMission,
+    HomeCombatAssignment,
     IntentAction,
     ShotPlan,
     ScreeningGroupState,
     UnitMission,
     VanguardIntent,
     VanguardIntentEstimate,
+    VanguardAssignmentCandidate,
+    VanguardInterceptTask,
     WorldModel,
 )
 from .projection import TacticalMap
@@ -105,7 +108,7 @@ class CombatPlanner:
                 or member.hp * 2 <= UNIT_MAX_HP[member.unit_type]
                 for member in members
             )
-            if inner_threat or invalid_member:
+            if invalid_member:
                 self.memory.screening_groups.pop(target_id, None)
                 continue
             if target is None:
@@ -113,6 +116,15 @@ class CombatPlanner:
                     self.memory.screening_groups.pop(target_id, None)
                 continue
             distance = manhattan(target.position, world.core.position)
+            if distance <= self.config.home_engage_radius:
+                self.memory.screening_groups[target_id] = replace(
+                    group,
+                    last_seen_tick=world.tick,
+                    last_distance=distance,
+                    outward_ticks=0,
+                    phase="HOME_HANDOFF",
+                )
+                continue
             outward = group.outward_ticks + 1 if distance > group.last_distance else 0
             near_friendly = any(
                 manhattan(target.position, friendly.position) <= 6
@@ -233,7 +245,6 @@ class CombatPlanner:
             and unit.hp * 2 > UNIT_MAX_HP[unit.unit_type]
             and unit.id not in raid_ids
             and unit.id != self.memory.beacon_mission_actor_id
-            and unit.id not in self.memory.manual_move_leases
             and not (
                 unit.id in self.memory.unit_missions
                 and self.memory.unit_missions[unit.id].mission is UnitMission.RECOVER
@@ -1365,10 +1376,251 @@ class CombatPlanner:
             return ranger_line_is_clear(enemy.position, cell, world.known_obstacles)
         return False
 
+    def home_combat_assignment(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+    ) -> HomeCombatAssignment:
+        """Assign home Vanguards globally before formation planners run.
+
+        The old per-unit loop let low UUID defenders consume every responder
+        slot even when they were much farther from the contact.  This pass
+        first covers distinct threat sectors, then adds one extra responder
+        per target, using an actual bounded path field as the primary cost.
+        """
+
+        if world.core is None:
+            return HomeCombatAssignment()
+        urgent = tuple(
+            sorted(
+                (
+                    enemy
+                    for enemy in world.enemies
+                    if self.target_is_urgent(world, projection, enemy)
+                ),
+                key=lambda enemy: self.target_priority(world, projection, enemy),
+            )
+        )
+        vanguards = tuple(
+            unit
+            for unit in world.friendlies
+            if unit.unit_type is UnitType.VANGUARD
+            and unit.hp * 2 > UNIT_MAX_HP[UnitType.VANGUARD]
+            and unit.id not in self.memory.raid_member_ids
+            and unit.id != self.memory.beacon_mission_actor_id
+        )
+        if not urgent or not vanguards:
+            return HomeCombatAssignment(
+                unassigned_vanguards=tuple(unit.id for unit in vanguards),
+                uncovered_targets=tuple(enemy.id for enemy in urgent),
+            )
+
+        fields: dict[UUID, dict[Position, int]] = {}
+        blocked = projection.hostile_occupied | projection.service_positions
+        for vanguard in vanguards:
+            fields[vanguard.id] = weighted_distance_field(
+                world,
+                vanguard.position,
+                node_limit=self.config.path_node_limit,
+                blocked=frozenset(blocked - {vanguard.position}),
+            )[0]
+
+        predictions = {
+            enemy.id: self.enemy_candidate_cells(world, projection, enemy)[0]
+            for enemy in urgent
+        }
+        profiles: dict[
+            tuple[UUID, UUID],
+            tuple[Position, tuple[int, ...]],
+        ] = {}
+        for enemy in urgent:
+            screening = self.memory.screening_groups.get(enemy.id)
+            for vanguard in vanguards:
+                eligible = (
+                    manhattan(enemy.position, world.core.position)
+                    <= self.config.home_engage_radius
+                    or manhattan(vanguard.position, enemy.position)
+                    <= self.config.vanguard_engage_distance
+                    or (
+                        screening is not None
+                        and vanguard.id in screening.vanguard_ids
+                    )
+                )
+                if eligible:
+                    profiles[(vanguard.id, enemy.id)] = self._vanguard_assignment_cost(
+                        world,
+                        projection,
+                        vanguard,
+                        enemy,
+                        predictions[enemy.id],
+                        fields[vanguard.id],
+                    )
+        sectors: dict[Direction, list[EntitySnapshot]] = defaultdict(list)
+        for enemy in urgent:
+            sectors[self._home_sector(world.core.position, enemy.position)].append(enemy)
+        for enemies in sectors.values():
+            enemies.sort(key=lambda enemy: self.target_priority(world, projection, enemy))
+
+        assigned: set[UUID] = set()
+        response_counts: defaultdict[UUID, int] = defaultdict(int)
+        tasks: list[VanguardInterceptTask] = []
+
+        def assign(target: EntitySnapshot, *, phase: str | None = None) -> bool:
+            screening = self.memory.screening_groups.get(target.id)
+            available = [
+                unit
+                for unit in vanguards
+                if unit.id not in assigned
+                and (unit.id, target.id) in profiles
+            ]
+            if not available:
+                return False
+            if screening is not None and screening.phase == "HOME_HANDOFF":
+                preserved = [
+                    unit for unit in available if unit.id in screening.vanguard_ids
+                ]
+                if preserved:
+                    available = preserved
+                    phase = "HOME_HANDOFF"
+            candidates = predictions[target.id]
+            rows = []
+            for vanguard in available:
+                intercept, cost = profiles[(vanguard.id, target.id)]
+                rows.append((cost, vanguard.id.bytes, vanguard, intercept))
+            cost, _, vanguard, intercept = min(rows, key=lambda row: row[:2])
+            assigned.add(vanguard.id)
+            response_counts[target.id] += 1
+            tasks.append(
+                VanguardInterceptTask(
+                    vanguard_id=vanguard.id,
+                    target_id=target.id,
+                    sector=self._home_sector(world.core.position, target.position),
+                    phase=phase or "HOME_INTERCEPT",
+                    intercept_cell=intercept,
+                    candidate_cells=candidates,
+                    cost=cost,
+                )
+            )
+            return True
+
+        # One defender per active direction before any direction receives a
+        # second responder.
+        sector_heads = sorted(
+            (enemies[0] for enemies in sectors.values()),
+            key=lambda enemy: self.target_priority(world, projection, enemy),
+        )
+        for enemy in sector_heads:
+            assign(enemy)
+        # Keep an outer group's two closest blockers through the 14 -> 13
+        # handoff, then give every ordinary target at most one extra blocker.
+        for enemy in urgent:
+            limit = 2
+            while response_counts[enemy.id] < limit and assign(enemy):
+                pass
+
+        covered = {task.target_id for task in tasks}
+        selected_pairs = {(task.vanguard_id, task.target_id) for task in tasks}
+        candidate_rows = tuple(
+            VanguardAssignmentCandidate(
+                vanguard_id=vanguard.id,
+                target_id=enemy.id,
+                cost=(
+                    None
+                    if (vanguard.id, enemy.id) not in profiles
+                    else profiles[(vanguard.id, enemy.id)][1]
+                ),
+                selected=(vanguard.id, enemy.id) in selected_pairs,
+                reason=(
+                    "SELECTED"
+                    if (vanguard.id, enemy.id) in selected_pairs
+                    else "OUT_OF_RESPONSE_RANGE"
+                    if (vanguard.id, enemy.id) not in profiles
+                    else "ASSIGNED_TO_HIGHER_PRIORITY_THREAT"
+                    if vanguard.id in assigned
+                    else "TARGET_RESPONSE_LIMIT_FILLED"
+                    if response_counts[enemy.id] >= 2
+                    else "HIGHER_COST"
+                ),
+            )
+            for enemy in urgent
+            for vanguard in vanguards
+        )
+        return HomeCombatAssignment(
+            tasks=tuple(tasks),
+            candidates=candidate_rows,
+            unassigned_vanguards=tuple(
+                unit.id for unit in vanguards if unit.id not in assigned
+            ),
+            uncovered_targets=tuple(
+                enemy.id for enemy in urgent if enemy.id not in covered
+            ),
+        )
+
+    def _vanguard_assignment_cost(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        vanguard: EntitySnapshot,
+        target: EntitySnapshot,
+        candidates: tuple[Position, ...],
+        distances: dict[Position, int],
+    ) -> tuple[Position, tuple[int, ...]]:
+        assert world.core is not None
+        intercepts = {
+            neighbor
+            for candidate in candidates
+            for _, neighbor in cardinal_neighbors(candidate)
+            if neighbor in world.known_passable
+            and neighbor not in world.known_obstacles
+            and neighbor not in projection.hostile_occupied
+            and neighbor not in projection.service_positions
+            and manhattan(neighbor, world.core.position)
+            <= self.config.home_pursuit_radius
+        }
+        if any(manhattan(vanguard.position, cell) == 1 for cell in candidates):
+            intercepts.add(vanguard.position)
+        if not intercepts:
+            intercepts.add(vanguard.position)
+        screening = self.memory.screening_groups.get(target.id)
+        rows = []
+        for cell in intercepts:
+            coverage = sum(
+                len(candidates) - rank
+                for rank, candidate in enumerate(candidates)
+                if manhattan(cell, candidate) == 1
+            )
+            path_cost = distances.get(cell, 1 << 20)
+            rows.append(
+                (
+                    (
+                        int(cell != vanguard.position or not coverage),
+                        path_cost,
+                        -coverage,
+                        int(screening is None or vanguard.id not in screening.vanguard_ids),
+                        projection.immediate_attackers(cell),
+                        projection.future_attackers(cell),
+                        manhattan(cell, world.core.position),
+                        cell[0],
+                        cell[1],
+                    ),
+                    cell,
+                )
+            )
+        cost, intercept = min(rows, key=lambda row: row[0])
+        return intercept, cost
+
+    @staticmethod
+    def _home_sector(core: Position, threat: Position) -> Direction:
+        dx, dy = threat[0] - core[0], threat[1] - core[1]
+        if abs(dx) > abs(dy):
+            return Direction.RIGHT if dx > 0 else Direction.LEFT
+        return Direction.DOWN if dy > 0 else Direction.UP
+
     def vanguard_intents(
         self,
         world: WorldModel,
         projection: TacticalMap,
+        assignment: HomeCombatAssignment | None = None,
     ) -> list[ActionIntent]:
         if world.core is None:
             return []
@@ -1384,12 +1636,13 @@ class CombatPlanner:
         )
         intents: list[ActionIntent] = []
         predicted_sweeps: dict[UUID, ShotPlan] = {}
-        responder_counts: dict[UUID, int] = defaultdict(int)
         protected_units = tuple(
             unit
             for unit in world.friendlies
             if unit.unit_type in {UnitType.WORKER, UnitType.RANGER}
         )
+        assignment = assignment or self.home_combat_assignment(world, projection)
+        tasks_by_vanguard = {task.vanguard_id: task for task in assignment.tasks}
         for vanguard in (
             unit for unit in world.friendlies if unit.unit_type is UnitType.VANGUARD
         ):
@@ -1397,19 +1650,25 @@ class CombatPlanner:
             if adjacent is not None:
                 intents.append(adjacent)
                 continue
-            if not urgent:
+            task = tasks_by_vanguard.get(vanguard.id)
+            if not urgent or task is None:
                 continue
-            target = self._vanguard_target(
+            target = world.enemy(task.target_id)
+            if target is None:
+                continue
+            candidate_cells = task.candidate_cells
+            confidence = self.enemy_candidate_cells(world, projection, target)[1]
+            joint = self._joint_vanguard_sweep(
                 world,
                 projection,
                 vanguard,
                 urgent,
-                responder_counts,
             )
-            if target is None:
+            if joint is not None:
+                sweep_intent, sweep_plan = joint
+                intents.append(sweep_intent)
+                predicted_sweeps[vanguard.id] = sweep_plan
                 continue
-            responder_counts[target.id] += 1
-            candidate_cells, confidence = self.enemy_candidate_cells(world, projection, target)
             predicted = self._predicted_vanguard_sweep(
                 world,
                 vanguard,
@@ -1429,10 +1688,66 @@ class CombatPlanner:
                     target,
                     candidate_cells,
                     protected_units,
+                    task.intercept_cell,
                 )
             )
         self.memory.last_vanguard_sweeps = predicted_sweeps
         return intents
+
+    def _joint_vanguard_sweep(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        vanguard: EntitySnapshot,
+        urgent: tuple[EntitySnapshot, ...],
+    ) -> tuple[ActionIntent, ShotPlan] | None:
+        rows: list[tuple[tuple[int, ...], Position, tuple[UUID, ...]]] = []
+        for direction_index, (_, cell) in enumerate(cardinal_neighbors(vanguard.position)):
+            converging: list[UUID] = []
+            rank_sum = 0
+            for enemy in urgent:
+                candidates, _ = self.enemy_candidate_cells(world, projection, enemy)
+                if cell not in candidates:
+                    continue
+                rank = candidates.index(cell)
+                if rank <= 1:
+                    converging.append(enemy.id)
+                    rank_sum += rank
+            if len(converging) < 2:
+                continue
+            rows.append(
+                (
+                    (-len(converging), rank_sum, direction_index, cell[0], cell[1]),
+                    cell,
+                    tuple(sorted(converging, key=lambda item: item.bytes)),
+                )
+            )
+        if not rows:
+            return None
+        score, cell, targets = min(rows, key=lambda row: row[0])
+        # Fresh multi-enemy convergence is stronger evidence than an old miss
+        # on the same cell, so it deliberately overrides short suppression.
+        direction = direction_between(vanguard.position, cell)
+        if direction is None:
+            return None
+        representative = targets[0]
+        return (
+            ActionIntent(
+                actor_id=vanguard.id,
+                action=IntentAction.SWEEP,
+                mission=UnitMission.ATTACK,
+                priority=29,
+                direction=direction,
+                target_id=representative,
+                target_position=cell,
+                reason="MULTI_ENEMY_CONVERGENCE_SWEEP",
+                metadata=(
+                    ("converging_targets", tuple(str(item) for item in targets)),
+                    ("joint_score", score),
+                ),
+            ),
+            ShotPlan(vanguard.id, representative, cell),
+        )
 
     @staticmethod
     def _adjacent_sweep(vanguard, urgent):
@@ -1460,46 +1775,6 @@ class CombatPlanner:
             reason="ADJACENT_ENEMY_SWEEP",
         )
 
-    def _vanguard_target(
-        self,
-        world,
-        projection,
-        vanguard,
-        urgent,
-        responder_counts,
-    ):
-        assert world.core is not None
-        eligible = tuple(
-            enemy
-            for enemy in urgent
-            if responder_counts[enemy.id]
-            < (2 if enemy.unit_type in {UnitType.WORKER, UnitType.RANGER} else 3)
-            and (
-                manhattan(enemy.position, world.core.position)
-                <= self.config.home_engage_radius
-                or manhattan(vanguard.position, enemy.position)
-                <= self.config.vanguard_engage_distance
-                or (
-                    enemy.id in self.memory.screening_groups
-                    and vanguard.id
-                    in self.memory.screening_groups[enemy.id].vanguard_ids
-                )
-            )
-            and (
-                enemy.id not in self.memory.screening_groups
-                or vanguard.id
-                in self.memory.screening_groups[enemy.id].vanguard_ids
-            )
-        )
-        return min(
-            eligible,
-            key=lambda enemy: (
-                self.target_priority(world, projection, enemy),
-                manhattan(vanguard.position, enemy.position),
-            ),
-            default=None,
-        )
-
     def _predicted_vanguard_sweep(
         self,
         world,
@@ -1520,7 +1795,7 @@ class CombatPlanner:
         )
         if predicted is None or self._sweep_suppressed(
             world.tick,
-            target.id,
+            vanguard.id,
             predicted,
         ):
             return None
@@ -1549,6 +1824,7 @@ class CombatPlanner:
         target,
         candidate_cells,
         protected_units,
+        assigned_intercept,
     ):
         assert world.core is not None
         protected = min(
@@ -1556,15 +1832,27 @@ class CombatPlanner:
             key=lambda cell: manhattan(target.position, cell),
         )
         options: list[tuple[tuple[int, ...], Direction, Position]] = []
-        reposition: list[tuple[tuple[int, ...], Direction, Position]] = []
         occupied = projection.occupied_cells
-        current_distance = min(
-            manhattan(vanguard.position, cell) for cell in candidate_cells
-        )
         current_route_block = min(
             manhattan(cell, vanguard.position)
             + manhattan(vanguard.position, protected)
             for cell in candidate_cells
+        )
+        path_blocks = frozenset(
+            (projection.hostile_occupied | projection.service_positions)
+            - {vanguard.position, assigned_intercept}
+        )
+        current_path = route_to(
+            world,
+            vanguard.position,
+            assigned_intercept,
+            node_limit=self.config.path_node_limit,
+            blocked=path_blocks,
+        )
+        current_path_cost = (
+            0
+            if vanguard.position == assigned_intercept
+            else (1 << 20 if current_path is None else current_path.distance)
         )
         for index, (direction, destination) in enumerate(
             cardinal_neighbors(vanguard.position)
@@ -1591,14 +1879,39 @@ class CombatPlanner:
             candidate_distance = min(
                 manhattan(destination, cell) for cell in candidate_cells
             )
+            next_path = route_to(
+                world,
+                destination,
+                assigned_intercept,
+                node_limit=self.config.path_node_limit,
+                blocked=frozenset(path_blocks - {destination}),
+            )
+            next_path_cost = (
+                0
+                if destination == assigned_intercept
+                else (1 << 20 if next_path is None else next_path.distance)
+            )
+            current_coverage = sum(
+                len(candidate_cells) - rank
+                for rank, cell in enumerate(candidate_cells)
+                if manhattan(vanguard.position, cell) == 1
+            )
+            candidate_coverage = sum(
+                len(candidate_cells) - rank
+                for rank, cell in enumerate(candidate_cells)
+                if manhattan(destination, cell) == 1
+            )
             improves_intercept = (
-                candidate_distance < current_distance
+                next_path_cost < current_path_cost
                 or route_block < current_route_block
+                or candidate_coverage > current_coverage
             )
             if improves_intercept:
                 score = (
-                    candidate_distance,
+                    next_path_cost,
+                    -candidate_coverage,
                     route_block,
+                    candidate_distance,
                     immediate,
                     future,
                     occupied.get(destination, 0),
@@ -1606,27 +1919,6 @@ class CombatPlanner:
                     index,
                 )
                 options.append((score, direction, destination))
-            elif (
-                candidate_distance <= current_distance + 1
-                and route_block <= current_route_block + 2
-                and manhattan(destination, world.core.position)
-                <= self.config.home_pursuit_radius
-            ):
-                # When the best intercept cell is part of a friendly movement
-                # chain, retaining only strict-improvement steps makes every
-                # rear Vanguard fall through to WAIT.  A bounded lateral step
-                # opens the chain while keeping the unit on the interception
-                # corridor and inside the home pursuit envelope.
-                score = (
-                    immediate,
-                    future,
-                    occupied.get(destination, 0),
-                    candidate_distance,
-                    route_block,
-                    self.memory.congestion_counts.get(destination, 0),
-                    index,
-                )
-                reposition.append((score, direction, destination))
         intents = [
             ActionIntent.move(
                 vanguard.id,
@@ -1634,41 +1926,26 @@ class CombatPlanner:
                 50,
                 direction,
                 destination,
-                risk=score[2] * 100 + score[3] * 10,
+                risk=score[4] * 100 + score[5] * 10,
                 exclusive_destination=True,
                 tie_break=score,
                 reason="ROUTE_INTERCEPT_ADVANCE",
                 metadata=(
                     ("target_id", str(target.id)),
-                    ("candidate_distance", score[0]),
-                    ("route_block", score[1]),
-                    ("immediate_attackers", score[2]),
-                    ("future_attackers", score[3]),
+                    ("candidate_distance", score[3]),
+                    ("route_block", score[2]),
+                    ("immediate_attackers", score[4]),
+                    ("future_attackers", score[5]),
                     ("intercept_improved", True),
+                    ("intercept_path_before", current_path_cost),
+                    ("intercept_path_after", score[0]),
+                    ("candidate_coverage_before", current_coverage),
+                    ("candidate_coverage_after", -score[1]),
                 ),
             )
             for score, direction, destination in sorted(options)[:4]
         ]
-        intents.extend(
-            ActionIntent.move(
-                vanguard.id,
-                UnitMission.ATTACK,
-                53,
-                direction,
-                destination,
-                risk=score[0] * 100 + score[1] * 10,
-                exclusive_destination=True,
-                tie_break=score,
-                reason="INTERCEPT_REPOSITION",
-                metadata=(
-                    ("target_id", str(target.id)),
-                    ("candidate_distance", score[3]),
-                    ("route_block", score[4]),
-                ),
-            )
-            for score, direction, destination in sorted(reposition)[:4]
-        )
-        if options or reposition:
+        if options:
             intents.append(
                 ActionIntent.simple(
                     vanguard.id,

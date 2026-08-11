@@ -11,6 +11,7 @@ from .models import (
     CoreEvacuationCampaign,
     CoreServiceQueue,
     FireMission,
+    HomeCombatAssignment,
     IntentAction,
     IntentResolution,
     UnitMission,
@@ -38,6 +39,7 @@ class DecisionTraceBuilder:
         legal_opportunities,
         evacuation: CoreEvacuationCampaign | None,
         production_candidates: tuple[dict[str, object], ...],
+        home_combat_assignment: HomeCombatAssignment = HomeCombatAssignment(),
     ) -> dict[str, object]:
         return {
             "schema_version": STRATEGY_LOG_SCHEMA_VERSION,
@@ -59,6 +61,7 @@ class DecisionTraceBuilder:
                 resolution,
                 fire_missions,
                 legal_opportunities,
+                home_combat_assignment,
             ),
             "core_safety": self._core_safety_dict(evacuation),
         }
@@ -469,6 +472,7 @@ class DecisionTraceBuilder:
         resolution: IntentResolution,
         fire_missions: tuple[FireMission, ...],
         legal_opportunities,
+        home_combat_assignment: HomeCombatAssignment,
     ) -> dict[str, object]:
         selected_attackers = {
             intent.actor_id
@@ -482,10 +486,10 @@ class DecisionTraceBuilder:
             for intent in resolution.selected
             if intent.reason == "ADVANCE_TO_DYNAMIC_FIRE_LINE"
         ]
-        vanguard_repositions = [
+        vanguard_intercepts = [
             intent
             for intent in resolution.selected
-            if intent.reason == "INTERCEPT_REPOSITION"
+            if intent.reason == "ROUTE_INTERCEPT_ADVANCE"
         ]
         return {
             "fire_missions": [self.fire_mission_dict(item) for item in fire_missions],
@@ -546,13 +550,71 @@ class DecisionTraceBuilder:
                 }
                 for intent in dynamic_fire_lines
             ],
-            "vanguard_repositions": [
+            "vanguard_intercepts": [
                 {
                     "vanguard_id": str(intent.actor_id),
                     "next_cell": list(intent.target_position),
                     "target_id": dict(intent.metadata).get("target_id"),
+                    "path_before": dict(intent.metadata).get(
+                        "intercept_path_before"
+                    ),
+                    "path_after": dict(intent.metadata).get(
+                        "intercept_path_after"
+                    ),
+                    "coverage_before": dict(intent.metadata).get(
+                        "candidate_coverage_before"
+                    ),
+                    "coverage_after": dict(intent.metadata).get(
+                        "candidate_coverage_after"
+                    ),
                 }
-                for intent in vanguard_repositions
+                for intent in vanguard_intercepts
+            ],
+            "home_vanguard_assignment": {
+                "tasks": [
+                    {
+                        "vanguard_id": str(task.vanguard_id),
+                        "target_id": str(task.target_id),
+                        "sector": task.sector.value,
+                        "phase": task.phase,
+                        "intercept_cell": list(task.intercept_cell),
+                        "candidate_cells": [list(cell) for cell in task.candidate_cells],
+                        "cost": list(task.cost),
+                    }
+                    for task in home_combat_assignment.tasks
+                ],
+                "candidates": [
+                    {
+                        "vanguard_id": str(candidate.vanguard_id),
+                        "target_id": str(candidate.target_id),
+                        "cost": (
+                            None
+                            if candidate.cost is None
+                            else list(candidate.cost)
+                        ),
+                        "selected": candidate.selected,
+                        "reason": candidate.reason,
+                    }
+                    for candidate in home_combat_assignment.candidates
+                ],
+                "unassigned_vanguards": [
+                    str(item) for item in home_combat_assignment.unassigned_vanguards
+                ],
+                "uncovered_targets": [
+                    str(item) for item in home_combat_assignment.uncovered_targets
+                ],
+            },
+            "joint_sweeps": [
+                {
+                    "vanguard_id": str(intent.actor_id),
+                    "cell": list(intent.target_position),
+                    "metadata": {
+                        key: list(value) if isinstance(value, tuple) else value
+                        for key, value in intent.metadata
+                    },
+                }
+                for intent in resolution.selected
+                if intent.reason == "MULTI_ENEMY_CONVERGENCE_SWEEP"
             ],
             "home_force_target": max(
                 self.config.home_force_floor,
@@ -727,10 +789,40 @@ class DecisionTraceBuilder:
                 {"worker_id": str(worker_id), "cell": list(cell)}
                 for worker_id, cell in service.queue_slots
             ],
+            "worker_progress": [
+                {
+                    "worker_id": str(worker_id),
+                    "position": list(position),
+                    "stalled_ticks": stalled_ticks,
+                }
+                for worker_id, position, stalled_ticks in service.worker_progress
+            ],
             "wounded": [str(item) for item in service.wounded],
             "entrance": None if service.entrance is None else list(service.entrance),
             "queue_cells": [list(cell) for cell in service.queue_cells],
             "exit": None if service.exit_cell is None else list(service.exit_cell),
+            "patient_gateway": (
+                None
+                if service.patient_gateway is None
+                else list(service.patient_gateway)
+            ),
+            "core_slot_reserved": service.core_slot_reserved,
+            "patient_progress": (
+                None
+                if service.patient_progress is None
+                else {
+                    "patient_id": str(service.patient_progress.patient_id),
+                    "gateway": (
+                        None
+                        if service.patient_progress.gateway is None
+                        else list(service.patient_progress.gateway)
+                    ),
+                    "started_tick": service.patient_progress.started_tick,
+                    "last_position": list(service.patient_progress.last_position),
+                    "stalled_ticks": service.patient_progress.stalled_ticks,
+                    "entry_distance": service.patient_progress.entry_distance,
+                }
+            ),
             "reserved_resources": service.reserved_resources,
             "paused_reason": service.paused_reason,
         }

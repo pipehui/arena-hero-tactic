@@ -58,7 +58,7 @@ class _EventGame:
 
 class RuntimeAndPersistenceTests(unittest.TestCase):
     def test_schema_versions_are_upgraded(self) -> None:
-        self.assertEqual(LOG_SCHEMA_VERSION, 25)
+        self.assertEqual(LOG_SCHEMA_VERSION, 26)
         self.assertEqual(EXPLORATION_MEMORY_SCHEMA_VERSION, 12)
 
     def test_main_translates_sigterm_into_a_graceful_service_stop(self) -> None:
@@ -384,7 +384,7 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
         queue = tactic.last_decision_trace["economy"]["service_queue"]
         self.assertEqual(queue["admission_id"], str(ready.id))
 
-    def test_replay_logger_writes_schema_25_and_redacts_secret(self) -> None:
+    def test_replay_logger_writes_schema_26_and_redacts_secret(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             logger = ReplayLogger(directory)
             logger.record_error(
@@ -397,10 +397,10 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
             text = logger.path.read_text(encoding="utf-8")
             first = json.loads(text.splitlines()[0])
 
-        self.assertEqual(first["schema_version"], 25)
+        self.assertEqual(first["schema_version"], 26)
         self.assertNotIn("hidden-token", text)
 
-    def test_turn_log_contains_detached_schema_25_strategy(self) -> None:
+    def test_turn_log_contains_detached_schema_26_strategy(self) -> None:
         turn = make_turn(tick=9, units=(unit(1, UnitType.WORKER, (1, 0)),))
         tactic = BalancedTactic()
         tactic.choose_actions(turn)
@@ -422,9 +422,9 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
             logger.close(status="completed", last_tick=9)
             records = [json.loads(line) for line in logger.path.read_text(encoding="utf-8").splitlines()]
 
-        self.assertEqual(records[0]["schema_version"], 25)
+        self.assertEqual(records[0]["schema_version"], 26)
         record = next(item for item in records if item["record_type"] == "turn")
-        self.assertEqual(record["strategy"]["schema_version"], 25)
+        self.assertEqual(record["strategy"]["schema_version"], 26)
         self.assertIn("resolution", record["strategy"])
 
     def test_single_instance_lock_rejects_overlap_and_releases(self) -> None:
@@ -521,6 +521,24 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
 
         action = second.plan.unit_actions[worker.id]
         self.assertFalse(isinstance(action, MoveAction) and action.direction is Direction.LEFT)
+
+    def test_manual_combat_move_does_not_create_a_direction_lease(self) -> None:
+        vanguard = unit(1, UnitType.VANGUARD, (0, 0))
+        tactic = BalancedTactic()
+        tactic.choose_actions(make_turn(tick=1, units=(vanguard,), resources=0))
+        receipt = Received(
+            tick=1,
+            source=CommandSource.MANUAL,
+            received_at=datetime.now(timezone.utc),
+            plan=CommandPlan(
+                tick=1,
+                unit_actions={vanguard.id: MoveAction(direction=Direction.RIGHT)},
+            ),
+        )
+
+        tactic.observe_receipt(receipt)
+
+        self.assertNotIn(vanguard.id, tactic.memory.manual_move_leases)
 
 
 if __name__ == "__main__":

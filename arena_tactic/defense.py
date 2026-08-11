@@ -41,6 +41,7 @@ class DefensePlanner:
         world: WorldModel,
         projection: TacticalMap,
         protected: frozenset[Position],
+        assigned_vanguard_ids: frozenset[UUID] = frozenset(),
     ) -> list[ActionIntent]:
         if world.core is None:
             return []
@@ -103,10 +104,14 @@ class DefensePlanner:
             screening_ids = {
                 member_id
                 for group in self.memory.screening_groups.values()
+                if group.phase != "HOME_HANDOFF"
                 for member_id in (*group.vanguard_ids, *group.ranger_ids)
             }
             home_pool = tuple(
-                unit for unit in healthy if unit.id not in screening_ids
+                unit
+                for unit in healthy
+                if unit.id not in screening_ids
+                and unit.id not in assigned_vanguard_ids
             )
             return [
                 *screening_intents,
@@ -122,16 +127,25 @@ class DefensePlanner:
             screening_ids = {
                 member_id
                 for group in self.memory.screening_groups.values()
+                if group.phase != "HOME_HANDOFF"
                 for member_id in (*group.vanguard_ids, *group.ranger_ids)
             }
             home_pool = tuple(
-                unit for unit in healthy if unit.id not in screening_ids
+                unit
+                for unit in healthy
+                if unit.id not in screening_ids
+                and unit.id not in assigned_vanguard_ids
             )
             return [
                 *screening_intents,
                 *self._peaceful_patrol(world, projection, home_pool, protected),
             ]
-        return self._peaceful_patrol(world, projection, healthy, protected)
+        return self._peaceful_patrol(
+            world,
+            projection,
+            tuple(unit for unit in healthy if unit.id not in assigned_vanguard_ids),
+            protected,
+        )
 
     def _screening_intents(
         self,
@@ -151,6 +165,8 @@ class DefensePlanner:
             self.memory.screening_groups.values(),
             key=lambda item: (item.started_tick, item.target_id.bytes),
         ):
+            if group.phase == "HOME_HANDOFF":
+                continue
             target = world.enemy(group.target_id)
             if target is None:
                 track = world.track(group.target_id)
@@ -911,11 +927,6 @@ class DefensePlanner:
                 or destination not in world.known_passable
                 or destination in projection.hostile_occupied
                 or destination in protected
-                or not self._manual_direction_allowed(
-                    unit.id,
-                    direction,
-                    world.tick,
-                )
             ):
                 continue
             is_preferred = (
@@ -1043,18 +1054,6 @@ class DefensePlanner:
                 radius=self.config.peaceful_squad_radii[layer],
                 sector_index=index,
             )
-
-    def _manual_direction_allowed(self, unit_id, direction, tick):
-        lease = self.memory.manual_move_leases.get(unit_id)
-        if lease is None or tick > lease.expires_tick:
-            return True
-        opposite = {
-            Direction.UP: Direction.DOWN,
-            Direction.DOWN: Direction.UP,
-            Direction.LEFT: Direction.RIGHT,
-            Direction.RIGHT: Direction.LEFT,
-        }[lease.direction]
-        return direction is not opposite
 
     @staticmethod
     def _sector_direction(core: Position, threat: Position) -> Direction:

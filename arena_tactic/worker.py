@@ -457,6 +457,21 @@ class WorkerPlanner:
                     )
                 )
                 continue
+            if worker.cargo > 0 and worker.id in service.ready_depositors:
+                # A Worker already in the explicit service pipeline follows
+                # that one-slot choreography unless its current cell or next
+                # slot is actually fatal.  Fog heat and broad home alerts are
+                # route costs, not permission to abandon a safe queue slot.
+                next_slot = dict(service.queue_slots).get(worker.id)
+                current_fatal = (
+                    projection.immediate_attackers(worker.position) >= worker.hp
+                )
+                next_fatal = bool(
+                    next_slot is not None
+                    and projection.immediate_attackers(next_slot) >= worker.hp
+                )
+                if not current_fatal and not next_fatal:
+                    continue
             escape = self._update_escape(world, projection, worker)
             if escape is not None:
                 escaping.add(worker.id)

@@ -512,12 +512,6 @@ class RaidPlanner:
         )
         if route is None or route.first_direction is None:
             return [self._wait(unit, f"{reason}_BLOCKED")]
-        if not self._manual_direction_allowed(
-            unit.id,
-            route.first_direction,
-            world.tick,
-        ):
-            return [self._wait(unit, f"{reason}_MANUAL_LEASE_HOLD")]
         immediate, future, remembered = projection.exposure(route.first_position)
         return [
             ActionIntent.move(
@@ -543,23 +537,6 @@ class RaidPlanner:
             61,
             reason=reason,
         )
-
-    def _manual_direction_allowed(
-        self,
-        unit_id,
-        direction: Direction,
-        tick: int,
-    ) -> bool:
-        lease = self.memory.manual_move_leases.get(unit_id)
-        if lease is None or tick > lease.expires_tick:
-            return True
-        opposite = {
-            Direction.UP: Direction.DOWN,
-            Direction.DOWN: Direction.UP,
-            Direction.LEFT: Direction.RIGHT,
-            Direction.RIGHT: Direction.LEFT,
-        }[lease.direction]
-        return direction is not opposite
 
     @staticmethod
     def _visible_guards(world: WorldModel, position: Position) -> int:

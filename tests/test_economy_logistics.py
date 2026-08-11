@@ -32,6 +32,79 @@ from tests.helpers import enemy_core, friendly_core, make_turn, uid, unit
 
 
 class EconomyAndLogisticsTests(unittest.TestCase):
+    def test_emergency_patient_can_enter_core_through_safe_service_exit(self) -> None:
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            service_entrance=(1, 0),
+            service_queue_cells=((1, 0), (2, 0)),
+            service_exit_cell=(0, -1),
+        )
+        patient = unit(2, UnitType.RANGER, (-1, -2), hp=1)
+        turn = make_turn(
+            units=(patient,),
+            resources=2,
+            obstacle_cells=((-1, -1), (-2, -2), (-1, -3), (0, -3), (1, -2)),
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(turn)
+
+        action = turn.plan.unit_actions[patient.id]
+        self.assertIsInstance(action, MoveAction)
+        self.assertEqual(action.direction, Direction.RIGHT)
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        self.assertEqual(queue["patient_gateway"], [0, -1])
+        self.assertTrue(queue["core_slot_reserved"])
+
+    def test_local_emergency_patient_reserves_core_slot_and_blocks_spawn(self) -> None:
+        memory = TacticMemory(opening_complete=True)
+        patient = unit(1, UnitType.VANGUARD, (1, 0), hp=2)
+        tactic = BalancedTactic(memory=memory)
+        turn = make_turn(units=(patient,), resources=25)
+
+        tactic.choose_actions(turn)
+
+        self.assertNotIsInstance(turn.plan.core_action, SpawnAction)
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        self.assertTrue(queue["core_slot_reserved"])
+        self.assertEqual(
+            tactic.last_decision_trace["economy"]["production_candidates"][0]["reason"],
+            "URGENT_PATIENT_CORE_SLOT_RESERVED",
+        )
+
+    def test_all_half_health_combat_patients_reserve_missing_hp(self) -> None:
+        patients = (
+            unit(1, UnitType.VANGUARD, (2, 0), hp=2),
+            unit(2, UnitType.RANGER, (-2, 0), hp=1),
+        )
+        tactic = BalancedTactic(memory=TacticMemory(opening_complete=True))
+
+        tactic.choose_actions(make_turn(units=patients, resources=10))
+
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        self.assertEqual(queue["reserved_resources"], 3)
+
+    def test_admitted_outer_carrier_advances_one_service_slot_per_tick(self) -> None:
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            service_entrance=(1, 0),
+            service_queue_cells=((1, 0), (2, 0)),
+            service_exit_cell=(-1, 0),
+            service_admission_id=uid(1),
+            cargo_arrival_ticks={uid(1): 1},
+        )
+        carrier = unit(1, UnitType.WORKER, (2, 0), cargo=1)
+        tactic = BalancedTactic(memory=memory)
+        turn = make_turn(tick=2, units=(carrier,), resources=0)
+
+        tactic.choose_actions(turn)
+
+        action = turn.plan.unit_actions[carrier.id]
+        self.assertIsInstance(action, MoveAction)
+        self.assertEqual(action.direction, Direction.LEFT)
+
     def test_full_storage_workers_leave_service_queue_for_distributed_home_guard(self) -> None:
         workers = (
             unit(1, UnitType.WORKER, (0, 0), cargo=1),
