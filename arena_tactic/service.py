@@ -434,6 +434,10 @@ class CoreServicePlanner:
                     for _, stalled in self.memory.service_return_progress.values()
                 )
                 or any(
+                    feedback.stalled_ticks >= 2
+                    for feedback in self.memory.service_move_feedback.values()
+                )
+                or any(
                     carrier.id in self.memory.failed_unit_moves
                     for carrier in carriers
                 )
@@ -510,14 +514,32 @@ class CoreServicePlanner:
             if reservation_by_id.get(unit.id) is not None
             and reservation_by_id[unit.id].status == "RETURNING"
         )
+        future_remote = tuple(
+            unit
+            for unit in outside_line
+            if reservation_by_id.get(unit.id) is not None
+            and reservation_by_id[unit.id].status == "WAIT_FOR_DEPARTURE"
+        )
+        overflow_slots = self._overflow_slots(
+            world,
+            projection,
+            future_remote,
+            service_core_position,
+            entrance,
+            queue_cells,
+            exit_cell,
+            deposit_schedule,
+        )
+        overflow_by_id = dict(overflow_slots)
         holding = tuple(
-            unit for unit in outside_line if unit not in active_approaching
+            unit
+            for unit in future_remote
+            if overflow_by_id.get(unit.id) == unit.position
+        )
+        active_approaching = tuple(
+            unit for unit in outside_line if unit not in holding
         )
         approaching = outside_line
-        # Future reservations are deliberately held at each Worker's current
-        # safe cell.  Herding them to synthetic radius-4 staging positions was
-        # the source of the old Core pile-up.
-        overflow_slots: tuple[tuple[UUID, Position], ...] = ()
         ready_ids = {unit.id for unit in ready}
 
         # START_MOVE is validated before harvest/deposit and turns the Core
@@ -657,8 +679,11 @@ class CoreServicePlanner:
         active_approaching = tuple(
             unit
             for unit in approaching
-            if reservation_by_id.get(unit.id) is not None
-            and reservation_by_id[unit.id].status == "RETURNING"
+            if not (
+                reservation_by_id.get(unit.id) is not None
+                and reservation_by_id[unit.id].status == "WAIT_FOR_DEPARTURE"
+                and overflow_by_id.get(unit.id) == unit.position
+            )
         )
         holding = tuple(
             unit for unit in approaching if unit not in active_approaching
@@ -783,6 +808,7 @@ class CoreServicePlanner:
             *queue_cells,
             *(cell for cell in (entrance, exit_cell) if cell is not None),
         }
+        occupied = dict(world.occupied_cells)
         candidates = tuple(
             cell
             for radius in range(
@@ -794,6 +820,7 @@ class CoreServicePlanner:
             and cell not in world.known_obstacles
             and cell not in projection.hostile_occupied
             and cell not in protected
+            and occupied.get(cell, 0) < 2
             and projection.immediate_attackers(cell) == 0
         )
         available = set(candidates)

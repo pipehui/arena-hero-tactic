@@ -21,6 +21,7 @@ from .models import (
     IntentAction,
     IntentResolution,
     MoveAttempt,
+    ServiceMoveFeedback,
     UnitMission,
     WorldModel,
 )
@@ -89,6 +90,7 @@ class DecisionKernel:
         products = self._plan(context, core_intents)
         resolution = self._resolve(context, products)
         self.defense.observe_resolution(world, resolution)
+        self._remember_service_feedback(world, resolution)
         self._remember_move_attempts(world, resolution)
         assigned_map = self._map_with_resource_assignments(context.tactical_map)
         resolved_map = self._resolved_tactical_map(assigned_map, resolution)
@@ -104,6 +106,7 @@ class DecisionKernel:
             products.production_candidates,
             products.home_combat_assignment,
             products.counter_siege,
+            context.combat_active,
         )
         return world, resolution, trace
 
@@ -162,11 +165,15 @@ class DecisionKernel:
             projected_core_destination=core_move_target,
         )
         protected = service_protected_positions(world, service)
-        combat_active = any(
+        visible_home_threat = any(
             enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
             and manhattan(enemy.position, world.core.position)
-            <= self.config.combat_exclusive_radius
+            <= self.config.home_warning_radius
             for enemy in world.enemies
+        )
+        combat_active = (
+            visible_home_threat
+            or self.memory.home_defense_alert_until >= world.tick
         )
         tactical_map = projection.with_operations(
             service_positions=protected,
@@ -302,6 +309,7 @@ class DecisionKernel:
             combat_exclusive=context.combat_active,
             combat_exclusive_center=context.world.core.position,
             combat_exclusive_radius=self.config.combat_exclusive_radius,
+            wartime_worker_exclusive=context.combat_active,
             protected_positions=context.protected_positions,
             actor_priority_ceilings=choreography.priority_ceiling_map(),
             actor_move_blocks={
@@ -379,3 +387,66 @@ class DecisionKernel:
             and intent.direction is not None
             and world.actor_position(intent.actor_id) is not None
         }
+
+    def _remember_service_feedback(
+        self,
+        world: WorldModel,
+        resolution: IntentResolution,
+    ) -> None:
+        cargo_ids = {
+            unit.id
+            for unit in world.friendlies
+            if unit.unit_type is UnitType.WORKER and unit.cargo > 0
+        }
+        selected = {intent.actor_id: intent for intent in resolution.selected}
+        rejected_moves: dict[UUID, list] = {}
+        for row in resolution.rejected:
+            intent = row.intent
+            if (
+                intent.actor_id in cargo_ids
+                and intent.mission is UnitMission.RETURN_CARGO
+                and intent.action is IntentAction.MOVE
+            ):
+                rejected_moves.setdefault(intent.actor_id, []).append(row)
+        next_feedback: dict[UUID, ServiceMoveFeedback] = {}
+        for worker_id in cargo_ids:
+            chosen = selected.get(worker_id)
+            rejected = sorted(
+                rejected_moves.get(worker_id, ()),
+                key=lambda row: row.intent.sort_key(),
+            )
+            if (
+                chosen is not None
+                and chosen.mission is UnitMission.RETURN_CARGO
+                and chosen.action is IntentAction.MOVE
+            ):
+                next_feedback[worker_id] = ServiceMoveFeedback(
+                    worker_id=worker_id,
+                    tick=world.tick,
+                    destination=chosen.target_position,
+                    selected=True,
+                    rejection_reason=None,
+                    stalled_ticks=0,
+                )
+                continue
+            if not rejected:
+                continue
+            primary = rejected[0]
+            previous = self.memory.service_move_feedback.get(worker_id)
+            stalled = (
+                previous.stalled_ticks + 1
+                if previous is not None
+                and not previous.selected
+                and previous.destination == primary.intent.target_position
+                and previous.rejection_reason == primary.reason
+                else 1
+            )
+            next_feedback[worker_id] = ServiceMoveFeedback(
+                worker_id=worker_id,
+                tick=world.tick,
+                destination=primary.intent.target_position,
+                selected=False,
+                rejection_reason=primary.reason,
+                stalled_ticks=stalled,
+            )
+        self.memory.service_move_feedback = next_feedback

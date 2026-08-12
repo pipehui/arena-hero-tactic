@@ -30,6 +30,7 @@ from .models import (
     ShotFeedback,
     ShotPlan,
     ScreeningGroupState,
+    ServiceMoveFeedback,
     ThreatHeatCell,
 )
 
@@ -103,6 +104,7 @@ class TacticMemory:
     # Remaining executable cargo-route distance and consecutive non-progress
     # Ticks.  This is session-only and rebuilt after process restart.
     service_return_progress: dict[UUID, tuple[int | None, int]] = field(default_factory=dict)
+    service_move_feedback: dict[UUID, ServiceMoveFeedback] = field(default_factory=dict)
     service_cargo_first_seen_ticks: dict[UUID, int] = field(default_factory=dict)
     service_deposit_ticks: dict[UUID, int] = field(default_factory=dict)
     # Session-only fairness age for actors that can physically enter the Core.
@@ -214,6 +216,7 @@ class TacticMemory:
         self.service_egress_worker_ids.clear()
         self.service_worker_progress.clear()
         self.service_return_progress.clear()
+        self.service_move_feedback.clear()
         self.service_cargo_first_seen_ticks.clear()
         self.service_deposit_ticks.clear()
         self.service_ready_since_ticks.clear()

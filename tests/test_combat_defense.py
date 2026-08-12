@@ -55,7 +55,7 @@ class CombatDefenseTests(unittest.TestCase):
             if squad.support_target is not None
         ]
         self.assertEqual(len(supports), len(set(supports)))
-        self.assertEqual(tactic.last_decision_trace["schema_version"], 34)
+        self.assertEqual(tactic.last_decision_trace["schema_version"], 35)
         formation = tactic.last_decision_trace["combat"]["formation"]
         assigned_supports = [
             tuple(bundle["support"])
@@ -365,7 +365,7 @@ class CombatDefenseTests(unittest.TestCase):
         self.assertNotEqual(selected.direction, Direction.DOWN)
         self.assertIn(
             tactic.memory.formation_move_feedback[ranger.id].rejection_reason,
-            {"CELL_CAPACITY", "RESERVATION_CONFLICT"},
+            {"PHYSICAL_CELL_CAPACITY", "COMBAT_UNIT_EXCLUSIVE"},
         )
 
     def test_repeated_formation_conflict_uses_safe_non_reversing_yield(self) -> None:

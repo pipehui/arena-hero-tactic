@@ -4,7 +4,13 @@ import unittest
 
 from arena_hero import Direction, UnitType
 
-from arena_tactic import ActionIntent, IntentAction, IntentResolver, UnitMission
+from arena_tactic import (
+    ActionIntent,
+    DestinationExclusivity,
+    IntentAction,
+    IntentResolver,
+    UnitMission,
+)
 from arena_tactic.world import build_world_model
 from tests.helpers import friendly_core, make_turn, unit
 
@@ -35,7 +41,10 @@ class IntentKernelTests(unittest.TestCase):
             ActionIntent.simple(second.id, IntentAction.WAIT, UnitMission.WAIT, 99),
         )
 
-        result = IntentResolver(combat_exclusive=True).resolve(world, intents)
+        result = IntentResolver(
+            combat_exclusive=True,
+            wartime_worker_exclusive=True,
+        ).resolve(world, intents)
 
         movers = [intent for intent in result.selected if intent.action is IntentAction.MOVE]
         self.assertEqual([intent.actor_id for intent in movers], [first.id])
@@ -74,6 +83,134 @@ class IntentKernelTests(unittest.TestCase):
             {intent.actor_id for intent in result.selected},
             {first.id, second.id},
         )
+
+    def test_exclusive_combat_candidate_does_not_poison_worker_capacity(self) -> None:
+        stationary = unit(1, UnitType.VANGUARD, (0, 0))
+        worker = unit(2, UnitType.WORKER, (1, 0))
+        ranger = unit(3, UnitType.RANGER, (0, 1))
+        world = build_world_model(
+            make_turn(
+                core=friendly_core(position=(10, 10)),
+                units=(stationary, worker, ranger),
+            )
+        )
+        worker_move = ActionIntent.move(
+            worker.id,
+            UnitMission.RETURN_CARGO,
+            40,
+            Direction.LEFT,
+            stationary.position,
+            reason="SERVICE_QUEUE_APPROACH",
+        )
+        ranger_move = ActionIntent.move(
+            ranger.id,
+            UnitMission.HOME_DEFENSE,
+            50,
+            Direction.UP,
+            stationary.position,
+            exclusive_destination=True,
+            reason="RANGER_SUPPORT",
+        )
+        intents = (
+            worker_move,
+            ranger_move,
+            ActionIntent.simple(worker.id, IntentAction.WAIT, UnitMission.WAIT, 99),
+            ActionIntent.simple(ranger.id, IntentAction.WAIT, UnitMission.WAIT, 99),
+        )
+
+        result = IntentResolver().resolve(world, intents)
+
+        self.assertEqual(result.for_actor(worker.id), worker_move)
+        self.assertEqual(result.for_actor(ranger.id).action, IntentAction.WAIT)
+        rejection = next(item for item in result.rejected if item.intent == ranger_move)
+        self.assertEqual(rejection.reason, "COMBAT_UNIT_EXCLUSIVE")
+
+    def test_wartime_allows_worker_and_combatant_but_not_two_workers(self) -> None:
+        first = unit(1, UnitType.WORKER, (-1, 0))
+        second = unit(2, UnitType.WORKER, (1, 0))
+        vanguard = unit(3, UnitType.VANGUARD, (5, 0))
+        world = build_world_model(
+            make_turn(
+                core=friendly_core(position=(10, 10)),
+                units=(first, second, vanguard),
+            )
+        )
+        intents = (
+            ActionIntent.move(first.id, UnitMission.RETURN_CARGO, 40, Direction.RIGHT, (0, 0)),
+            ActionIntent.move(second.id, UnitMission.RETURN_CARGO, 40, Direction.LEFT, (0, 0)),
+            ActionIntent.move(vanguard.id, UnitMission.HOME_DEFENSE, 50, Direction.LEFT, (4, 0)),
+            ActionIntent.simple(first.id, IntentAction.WAIT, UnitMission.WAIT, 99),
+            ActionIntent.simple(second.id, IntentAction.WAIT, UnitMission.WAIT, 99),
+        )
+
+        result = IntentResolver(wartime_worker_exclusive=True).resolve(world, intents)
+
+        worker_moves = [
+            intent
+            for intent in result.selected
+            if intent.actor_id in {first.id, second.id}
+            and intent.action is IntentAction.MOVE
+        ]
+        self.assertEqual(len(worker_moves), 1)
+
+        worker_beside_combat = unit(4, UnitType.WORKER, (6, 0))
+        mixed_world = build_world_model(
+            make_turn(
+                core=friendly_core(position=(10, 10)),
+                units=(vanguard, worker_beside_combat),
+            )
+        )
+        mixed_move = ActionIntent.move(
+            worker_beside_combat.id,
+            UnitMission.RETURN_CARGO,
+            40,
+            Direction.LEFT,
+            vanguard.position,
+        )
+        mixed = IntentResolver(wartime_worker_exclusive=True).resolve(
+            mixed_world,
+            (mixed_move,),
+        )
+        self.assertEqual(mixed.for_actor(worker_beside_combat.id), mixed_move)
+
+    def test_lower_priority_physical_lease_does_not_poison_shared_cell(self) -> None:
+        first = unit(1, UnitType.WORKER, (-1, 0))
+        second = unit(2, UnitType.WORKER, (1, 0))
+        world = build_world_model(
+            make_turn(
+                core=friendly_core(position=(10, 10)),
+                units=(first, second),
+            )
+        )
+        shared = ActionIntent.move(
+            first.id,
+            UnitMission.EXPLORE,
+            40,
+            Direction.RIGHT,
+            (0, 0),
+        )
+        physical = ActionIntent.move(
+            second.id,
+            UnitMission.CLEAR_SERVICE_CELL,
+            50,
+            Direction.LEFT,
+            (0, 0),
+            destination_exclusivity=DestinationExclusivity.PHYSICAL,
+        )
+
+        result = IntentResolver().resolve(
+            world,
+            (
+                shared,
+                physical,
+                ActionIntent.simple(second.id, IntentAction.WAIT, UnitMission.WAIT, 99),
+            ),
+        )
+
+        self.assertEqual(result.for_actor(first.id), shared)
+        self.assertEqual(result.for_actor(second.id).action, IntentAction.WAIT)
+        rejected = next(row for row in result.rejected if row.intent == physical)
+        self.assertEqual(rejected.reason, "PHYSICAL_EXCLUSIVE")
 
     def test_recent_failed_destination_falls_through_to_an_alternative(self) -> None:
         worker = unit(1, UnitType.WORKER, (0, 0))

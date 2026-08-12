@@ -10,6 +10,7 @@ from .geometry import cardinal_neighbors, manhattan, manhattan_ring
 from .models import (
     ActionIntent,
     CoreServiceQueue,
+    DestinationExclusivity,
     EntitySnapshot,
     IntentAction,
     MissionState,
@@ -65,13 +66,57 @@ class WorkerPlanner:
         )
         self._ensure_scout_states(workers, world.tick)
         intents, escaping = self._survival_intents(world, projection, service, workers)
+        deconflicting: set[UUID] = set()
+        home_defense_active = (
+            self.memory.home_defense_alert_until >= world.tick
+            or any(
+                enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+                and manhattan(enemy.position, world.core.position)
+                <= self.config.home_warning_radius
+                for enemy in world.enemies
+            )
+        )
+        if home_defense_active:
+            by_position: dict[Position, list[EntitySnapshot]] = {}
+            for worker in workers:
+                by_position.setdefault(worker.position, []).append(worker)
+            service_ids = set(service.depositors) | set(service.wounded)
+            for group in by_position.values():
+                if len(group) < 2:
+                    continue
+                stayer = min(
+                    group,
+                    key=lambda worker: (
+                        worker.id != service.admission_id,
+                        worker.id not in service_ids,
+                        worker.id.bytes,
+                    ),
+                )
+                for worker in sorted(group, key=lambda item: item.id.bytes):
+                    if (
+                        worker.id == stayer.id
+                        or worker.id in escaping
+                        or worker.id in service_ids
+                        or worker.cargo > 0
+                        or worker.hp < UNIT_MAX_HP[UnitType.WORKER]
+                    ):
+                        continue
+                    intents.extend(
+                        self._wartime_deconflict_intents(
+                            world,
+                            projection,
+                            service,
+                            worker,
+                        )
+                    )
+                    deconflicting.add(worker.id)
         guarding: dict[UUID, Position] = {}
         if self.memory.storage_saturated:
             service_ids = set(service.depositors)
             guard_workers = tuple(
                 worker
                 for worker in workers
-                if worker.id not in escaping
+                if worker.id not in escaping and worker.id not in deconflicting
                 and worker.hp >= UNIT_MAX_HP[UnitType.WORKER]
                 and worker.id != world.beacon.carrier_id
                 and worker.id not in service_ids
@@ -89,7 +134,7 @@ class WorkerPlanner:
             available = tuple(
                 worker
                 for worker in workers
-                if worker.id not in escaping
+                if worker.id not in escaping and worker.id not in deconflicting
                 and worker.hp >= UNIT_MAX_HP[UnitType.WORKER]
                 and worker.cargo == 0
                 and worker.id != world.beacon.carrier_id
@@ -99,7 +144,7 @@ class WorkerPlanner:
             )
 
         for worker in workers:
-            if worker.id in escaping:
+            if worker.id in escaping or worker.id in deconflicting:
                 continue
             if worker.id in guarding:
                 intents.extend(
@@ -127,6 +172,81 @@ class WorkerPlanner:
                     exploration_assignments.get(worker.id),
                 )
             )
+        return intents
+
+    def _wartime_deconflict_intents(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        service: CoreServiceQueue,
+        worker: EntitySnapshot,
+    ) -> list[ActionIntent]:
+        """Separate an existing Worker stack without blocking combat traffic."""
+
+        assert world.core is not None
+        occupied = dict(world.occupied_cells)
+        service_cells = {
+            cell
+            for cell in (
+                world.core.position,
+                service.entrance,
+                service.exit_cell,
+                *service.queue_cells,
+            )
+            if cell is not None
+        }
+        rows = []
+        for index, (direction, destination) in enumerate(
+            cardinal_neighbors(worker.position)
+        ):
+            if (
+                destination in world.known_obstacles
+                or destination in projection.hostile_occupied
+                or destination in service_cells
+                or projection.immediate_attackers(destination) >= worker.hp
+                or occupied.get(destination, 0) >= 2
+            ):
+                continue
+            viability = move_viability(
+                world,
+                worker.position,
+                destination,
+                node_limit=min(self.config.path_node_limit, 256),
+                require_open_area=True,
+            )
+            if not viability.viable:
+                continue
+            score = (
+                occupied.get(destination, 0),
+                projection.future_attackers(destination),
+                projection.threat_heat.get(destination, 0),
+                -viability.forward_exits,
+                index,
+            )
+            rows.append((score, direction, destination, viability))
+        intents = [
+            ActionIntent.move(
+                worker.id,
+                UnitMission.DECONFLICT_CELL,
+                47,
+                direction,
+                destination,
+                risk=score[1] * 100 + score[2],
+                tie_break=score,
+                reason="WARTIME_WORKER_DECONFLICT",
+                metadata=viability.metadata,
+            )
+            for score, direction, destination, viability in sorted(rows)
+        ]
+        intents.append(
+            ActionIntent.simple(
+                worker.id,
+                IntentAction.WAIT,
+                UnitMission.DECONFLICT_CELL,
+                48,
+                reason="WARTIME_WORKER_DECONFLICT_BLOCKED",
+            )
+        )
         return intents
 
     def _home_guard_assignments(
@@ -1372,96 +1492,72 @@ class WorkerPlanner:
                     worker,
                     service,
                 )
-            return [
-                ActionIntent.simple(
-                    worker.id,
-                    IntentAction.WAIT,
-                    UnitMission.RETURN_CARGO,
-                    51,
-                    target_position=worker.position,
-                    reason="WAIT_FOR_DEPARTURE_TICK",
-                    metadata=(
-                        ("scheduled_deposit_tick", reservation.scheduled_deposit_tick),
-                        ("departure_tick", reservation.departure_tick),
-                        ("slack_ticks", reservation.slack_ticks),
-                    ),
-                )
-            ]
-        if reservation.first_direction is not None and reservation.first_position is not None:
-            route_target = reservation.route_target or world.core.position
-            terminal_exception = (
-                "CORE_SERVICE"
-                if reservation.first_position == world.core.position
-                else None
-            )
-            viability = move_viability(
-                world,
-                worker.position,
-                reservation.first_position,
-                target=route_target,
-                node_limit=min(self.config.path_node_limit, 512),
-                require_continuation=(
-                    terminal_exception is None
-                    and reservation.first_position != route_target
-                ),
-                require_open_area=terminal_exception is None,
-                terminal_exception=terminal_exception,
-            )
-            if not viability.viable:
+            transit_hold = dict(service.overflow_slots).get(worker.id)
+            if transit_hold is not None and worker.position == transit_hold:
                 return [
                     ActionIntent.simple(
                         worker.id,
                         IntentAction.WAIT,
                         UnitMission.RETURN_CARGO,
-                        49 if service.admission_id == worker.id else 51,
-                        reason="NO_RETURN_ROUTE",
-                        metadata=viability.metadata,
+                        51,
+                        target_position=transit_hold,
+                        reason="WAIT_AT_TRANSIT_HOLD",
+                        metadata=(
+                            ("transit_hold", transit_hold),
+                            ("scheduled_deposit_tick", reservation.scheduled_deposit_tick),
+                            ("departure_tick", reservation.departure_tick),
+                            ("slack_ticks", reservation.slack_ticks),
+                            ("remaining_distance", reservation.route_distance),
+                        ),
                     )
                 ]
+            if transit_hold is not None:
+                hold_route = self._route(
+                    world,
+                    projection,
+                    worker,
+                    transit_hold,
+                    service,
+                    logistics=True,
+                )
+                if hold_route is not None and hold_route.first_direction is not None:
+                    return self._cargo_route_intents(
+                        world,
+                        projection,
+                        worker,
+                        service,
+                        reservation,
+                        transit_hold,
+                        hold_route,
+                        priority=51,
+                        reason="SERVICE_TRANSIT_HOLD_APPROACH",
+                    )
+            # No reachable transit hold exists.  Continue along the exact
+            # return route instead of freezing at a remote origin; the rolling
+            # calendar will compress or move the appointment on the next Tick.
+        if reservation.first_direction is not None and reservation.first_position is not None:
+            route_target = reservation.route_target or world.core.position
             ready = worker.id in service.ready_depositors
             priority = 49 if service.admission_id == worker.id else (50 if ready else 51)
             reason = "SERVICE_ADMISSION" if reservation.first_position == world.core.position else (
                 "SERVICE_PIPELINE_ADVANCE" if ready else "SERVICE_QUEUE_APPROACH"
             )
-            return [
-                ActionIntent.move(
-                    worker.id,
-                    UnitMission.RETURN_CARGO,
-                    priority,
-                    reservation.first_direction,
-                    reservation.first_position,
-                    risk=self._risk(projection, reservation.first_position),
-                    exclusive_destination=reservation.first_position == world.core.position,
-                    tie_break=(reservation.route_distance,),
-                    reason=reason,
-                    metadata=(
-                        ("allow_protected", True),
-                        (
-                            "allow_head_on_swap",
-                            reservation.first_position == world.core.position
-                            or worker.position == world.core.position,
-                        ),
-                        ("service_slot", reservation.route_target),
-                        (
-                            "allow_service_overlap",
-                            reservation.first_position in service.queue_cells,
-                        ),
-                        ("scheduled_deposit_tick", reservation.scheduled_deposit_tick),
-                        ("departure_tick", reservation.departure_tick),
-                    ) + viability.metadata,
-                ),
-                ActionIntent.simple(
-                    worker.id,
-                    IntentAction.WAIT,
-                    UnitMission.RETURN_CARGO,
-                    priority + 1,
-                    reason=(
-                        "WAITING_FOR_CORE_SLOT"
-                        if service.admission_id == worker.id
-                        else "WAITING_FOR_SERVICE_SLOT"
-                    ),
-                ),
-            ]
+            primary = Route(
+                reservation.route_distance or 1,
+                reservation.first_direction,
+                reservation.first_position,
+            )
+            return self._cargo_route_intents(
+                world,
+                projection,
+                worker,
+                service,
+                reservation,
+                route_target,
+                primary,
+                priority=priority,
+                reason=reason,
+            )
         return [
             ActionIntent.simple(
                 worker.id,
@@ -1471,6 +1567,116 @@ class WorkerPlanner:
                 reason="WAITING_FOR_DEPOSIT_ACTION",
             )
         ]
+
+    def _cargo_route_intents(
+        self,
+        world,
+        projection,
+        worker,
+        service,
+        reservation,
+        route_target,
+        primary_route,
+        *,
+        priority,
+        reason,
+    ):
+        """Return the shared service step plus at most two safe alternatives."""
+
+        assert world.core is not None
+        routes: list[Route] = [primary_route]
+        blocked_first_steps: set[Position] = set()
+        if primary_route.first_position is not None:
+            blocked_first_steps.add(primary_route.first_position)
+        if worker.position not in service.queue_cells:
+            while len(routes) < 3:
+                alternate = self._route(
+                    world,
+                    projection,
+                    worker,
+                    route_target,
+                    service,
+                    logistics=True,
+                    extra_blocked=frozenset(blocked_first_steps),
+                )
+                if (
+                    alternate is None
+                    or alternate.first_direction is None
+                    or alternate.first_position is None
+                    or alternate.first_position in blocked_first_steps
+                ):
+                    break
+                blocked_first_steps.add(alternate.first_position)
+                routes.append(alternate)
+
+        intents: list[ActionIntent] = []
+        for rank, route in enumerate(routes):
+            if route.first_direction is None or route.first_position is None:
+                continue
+            terminal_exception = (
+                "CORE_SERVICE"
+                if route.first_position == world.core.position
+                else None
+            )
+            viability = move_viability(
+                world,
+                worker.position,
+                route.first_position,
+                target=route_target,
+                node_limit=min(self.config.path_node_limit, 512),
+                require_continuation=(
+                    terminal_exception is None
+                    and route.first_position != route_target
+                ),
+                require_open_area=terminal_exception is None,
+                terminal_exception=terminal_exception,
+            )
+            if not viability.viable:
+                continue
+            intents.append(
+                ActionIntent.move(
+                    worker.id,
+                    UnitMission.RETURN_CARGO,
+                    priority + rank,
+                    route.first_direction,
+                    route.first_position,
+                    risk=self._risk(projection, route.first_position),
+                    destination_exclusivity=(
+                        DestinationExclusivity.PHYSICAL
+                        if route.first_position == world.core.position
+                        else DestinationExclusivity.NONE
+                    ),
+                    tie_break=(rank, route.distance),
+                    reason=reason if rank == 0 else "SERVICE_ROUTE_ALTERNATE",
+                    metadata=(
+                        ("route_rank", rank),
+                        ("allow_protected", True),
+                        (
+                            "allow_head_on_swap",
+                            route.first_position == world.core.position
+                            or worker.position == world.core.position,
+                        ),
+                        ("service_slot", route_target),
+                        ("scheduled_deposit_tick", reservation.scheduled_deposit_tick),
+                        ("departure_tick", reservation.departure_tick),
+                        ("remaining_distance", reservation.route_distance),
+                    ) + viability.metadata,
+                )
+            )
+        intents.append(
+            ActionIntent.simple(
+                worker.id,
+                IntentAction.WAIT,
+                UnitMission.RETURN_CARGO,
+                priority + 3,
+                reason=(
+                    "WAITING_FOR_CORE_SLOT"
+                    if service.admission_id == worker.id
+                    else "WAITING_FOR_SERVICE_SLOT"
+                ) if intents else "NO_RETURN_ROUTE",
+            )
+        )
+        return intents
 
     def _clear_core(self, world, projection, unit, service, exploration=None):
         assert world.core is not None

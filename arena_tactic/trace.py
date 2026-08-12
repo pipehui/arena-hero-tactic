@@ -42,13 +42,38 @@ class DecisionTraceBuilder:
         production_candidates: tuple[dict[str, object], ...],
         home_combat_assignment: HomeCombatAssignment = HomeCombatAssignment(),
         counter_siege: HomeCounterSiegeDecision = HomeCounterSiegeDecision(),
+        home_defense_active: bool = False,
     ) -> dict[str, object]:
+        decisions = self._decision_dicts(world, resolution, service)
         return {
             "schema_version": STRATEGY_LOG_SCHEMA_VERSION,
             "mode": "GLOBAL_MAP_SURVIVAL_ECONOMY",
             "outcomes": self._outcomes(),
             "tasks": [self.intent_dict(intent) for intent in resolution.selected],
+            "decisions": decisions,
+            "decision_summary": {
+                "final_reason_counts": dict(
+                    sorted(Counter(intent.reason for intent in resolution.selected).items())
+                ),
+                "wait_reason_counts": dict(
+                    sorted(
+                        Counter(
+                            intent.reason
+                            for intent in resolution.selected
+                            if intent.action is IntentAction.WAIT
+                        ).items()
+                    )
+                ),
+            },
             "resolution": self._resolution_dict(resolution),
+            "capacity_policy": {
+                "physical_capacity": 2,
+                "core_unit_capacity": 1,
+                "home_defense_active": home_defense_active,
+                "wartime_worker_exclusive": home_defense_active,
+                "wartime_combat_exclusive": home_defense_active,
+                "mixed_worker_combat_allowed": True,
+            },
             "world": self._world_dict(world, projection),
             "economy": self._economy_dict(
                 world,
@@ -68,6 +93,122 @@ class DecisionTraceBuilder:
             ),
             "core_safety": self._core_safety_dict(evacuation),
         }
+
+    def _decision_dicts(
+        self,
+        world: WorldModel,
+        resolution: IntentResolution,
+        service: CoreServiceQueue,
+    ) -> list[dict[str, object]]:
+        units = {unit.id: unit for unit in world.friendlies}
+        rejected_by_actor: dict[object, list] = {}
+        for row in resolution.rejected:
+            rejected_by_actor.setdefault(row.intent.actor_id, []).append(row)
+        reservations = {row.worker_id: row for row in service.return_reservations}
+        progress = {
+            worker_id: (position, stalled)
+            for worker_id, position, stalled in service.worker_progress
+        }
+        rows: list[dict[str, object]] = []
+        for final in resolution.selected:
+            actor = None if final.actor_id is None else units.get(final.actor_id)
+            rejected = sorted(
+                rejected_by_actor.get(final.actor_id, ()),
+                key=lambda row: (
+                    row.reason == "ACTOR_ALREADY_ASSIGNED",
+                    row.intent.sort_key(),
+                ),
+            )[:3]
+            critical = []
+            for row in rejected:
+                target = row.intent.target_position
+                blockers = []
+                if target is not None:
+                    blockers = [
+                        str(unit.id)
+                        for unit in world.friendlies
+                        if unit.id != row.intent.actor_id and unit.position == target
+                    ]
+                    blockers.extend(
+                        str(unit.id)
+                        for unit in world.enemies
+                        if unit.position == target
+                    )
+                    blockers.extend(
+                        str(core.id)
+                        for core in world.enemy_cores
+                        if core.position == target
+                    )
+                critical.append(
+                    {
+                        "intent": self.intent_dict(row.intent),
+                        "rejection_reason": row.reason,
+                        "blocking_actor_ids": sorted(blockers),
+                    }
+                )
+            service_state = None
+            if actor is not None and actor.unit_type is UnitType.WORKER:
+                reservation = reservations.get(actor.id)
+                position, stalled = progress.get(actor.id, (actor.position, 0))
+                feedback = self.memory.service_move_feedback.get(actor.id)
+                service_state = {
+                    "scheduled_deposit_tick": (
+                        None
+                        if reservation is None
+                        else reservation.scheduled_deposit_tick
+                    ),
+                    "departure_tick": (
+                        None if reservation is None else reservation.departure_tick
+                    ),
+                    "stage": None if reservation is None else reservation.status,
+                    "route_target": (
+                        None
+                        if reservation is None or reservation.route_target is None
+                        else list(reservation.route_target)
+                    ),
+                    "remaining_distance": (
+                        None if reservation is None else reservation.route_distance
+                    ),
+                    "transit_hold": (
+                        None
+                        if actor.id not in dict(service.overflow_slots)
+                        else list(dict(service.overflow_slots)[actor.id])
+                    ),
+                    "progress_position": list(position),
+                    "stalled_ticks": stalled,
+                    "resolver_feedback": (
+                        None
+                        if feedback is None
+                        else {
+                            "selected": feedback.selected,
+                            "destination": (
+                                None
+                                if feedback.destination is None
+                                else list(feedback.destination)
+                            ),
+                            "rejection_reason": feedback.rejection_reason,
+                            "stalled_ticks": feedback.stalled_ticks,
+                        }
+                    ),
+                }
+            rows.append(
+                {
+                    "actor_id": None if final.actor_id is None else str(final.actor_id),
+                    "actor_type": (
+                        "CORE" if actor is None else actor.unit_type.value
+                    ),
+                    "position": (
+                        list(world.core.position)
+                        if actor is None and world.core is not None
+                        else None if actor is None else list(actor.position)
+                    ),
+                    "final": self.intent_dict(final),
+                    "final_reason": final.reason,
+                    "key_rejections": critical,
+                    "service": service_state,
+                }
+            )
+        return rows
 
     def _outcomes(self) -> dict[str, object]:
         shot_hits = self.memory.event_counts["SHOT_HIT"]
@@ -1085,6 +1226,7 @@ class DecisionTraceBuilder:
             "direction": None if intent.direction is None else intent.direction.value,
             "reason": intent.reason,
             "risk": intent.risk,
+            "destination_exclusivity": intent.destination_exclusivity.value,
             "metadata": {
                 key: list(value) if isinstance(value, tuple) else value
                 for key, value in intent.metadata

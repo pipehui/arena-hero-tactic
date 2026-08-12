@@ -58,7 +58,7 @@ class _EventGame:
 
 class RuntimeAndPersistenceTests(unittest.TestCase):
     def test_schema_versions_are_upgraded(self) -> None:
-        self.assertEqual(LOG_SCHEMA_VERSION, 34)
+        self.assertEqual(LOG_SCHEMA_VERSION, 35)
         self.assertEqual(EXPLORATION_MEMORY_SCHEMA_VERSION, 12)
 
     def test_main_translates_sigterm_into_a_graceful_service_stop(self) -> None:
@@ -384,7 +384,7 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
         self.assertIsNone(queue["admission_id"])
         self.assertIsInstance(turn.plan.unit_actions[ready.id], MoveAction)
 
-    def test_replay_logger_writes_schema_34_and_redacts_secret(self) -> None:
+    def test_replay_logger_writes_schema_35_and_redacts_secret(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             logger = ReplayLogger(directory)
             logger.record_error(
@@ -397,10 +397,10 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
             text = logger.path.read_text(encoding="utf-8")
             first = json.loads(text.splitlines()[0])
 
-        self.assertEqual(first["schema_version"], 34)
+        self.assertEqual(first["schema_version"], 35)
         self.assertNotIn("hidden-token", text)
 
-    def test_turn_log_contains_detached_schema_34_strategy(self) -> None:
+    def test_turn_log_contains_detached_schema_35_strategy(self) -> None:
         turn = make_turn(tick=9, units=(unit(1, UnitType.WORKER, (1, 0)),))
         tactic = BalancedTactic()
         tactic.choose_actions(turn)
@@ -422,10 +422,61 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
             logger.close(status="completed", last_tick=9)
             records = [json.loads(line) for line in logger.path.read_text(encoding="utf-8").splitlines()]
 
-        self.assertEqual(records[0]["schema_version"], 34)
+        self.assertEqual(records[0]["schema_version"], 35)
         record = next(item for item in records if item["record_type"] == "turn")
-        self.assertEqual(record["strategy"]["schema_version"], 34)
+        self.assertEqual(record["strategy"]["schema_version"], 35)
         self.assertIn("resolution", record["strategy"])
+        decisions = record["strategy"]["decisions"]
+        self.assertTrue(decisions)
+        self.assertTrue(all(row["final_reason"] for row in decisions))
+        self.assertTrue(all(len(row["key_rejections"]) <= 3 for row in decisions))
+        self.assertIn("wait_reason_counts", record["strategy"]["decision_summary"])
+
+    def test_capacity_trace_keeps_wartime_policy_through_alert_lease(self) -> None:
+        core = friendly_core(position=(0, 0))
+        memory = TacticMemory(
+            core_id=core.id,
+            core_position=core.position,
+            home_defense_alert_until=20,
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(make_turn(tick=18, core=core, resources=0))
+        active = tactic.last_decision_trace["capacity_policy"]
+        self.assertTrue(active["home_defense_active"])
+        self.assertTrue(active["wartime_worker_exclusive"])
+
+        tactic.choose_actions(make_turn(tick=21, core=core, resources=0))
+        safe = tactic.last_decision_trace["capacity_policy"]
+        self.assertFalse(safe["home_defense_active"])
+
+    def test_visible_home_warning_starts_four_tick_capacity_lease(self) -> None:
+        core = friendly_core(position=(0, 0))
+        enemy = unit(
+            900,
+            UnitType.RANGER,
+            (0, -20),
+            controlled=False,
+        )
+        memory = TacticMemory(core_id=core.id, core_position=core.position)
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(
+            make_turn(tick=10, core=core, enemies=(enemy,), resources=0)
+        )
+        self.assertTrue(
+            tactic.last_decision_trace["capacity_policy"]["home_defense_active"]
+        )
+        self.assertEqual(memory.home_defense_alert_until, 14)
+
+        tactic.choose_actions(make_turn(tick=14, core=core, resources=0))
+        self.assertTrue(
+            tactic.last_decision_trace["capacity_policy"]["home_defense_active"]
+        )
+        tactic.choose_actions(make_turn(tick=15, core=core, resources=0))
+        self.assertFalse(
+            tactic.last_decision_trace["capacity_policy"]["home_defense_active"]
+        )
 
     def test_single_instance_lock_rejects_overlap_and_releases(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

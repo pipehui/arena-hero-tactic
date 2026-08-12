@@ -31,6 +31,7 @@ class UnitMission(str, Enum):
     RETURN_CARGO = "RETURN_CARGO"
     CLEAR_CORE = "CLEAR_CORE"
     CLEAR_SERVICE_CELL = "CLEAR_SERVICE_CELL"
+    DECONFLICT_CELL = "DECONFLICT_CELL"
     HARVEST = "HARVEST"
     HOME_GUARD = "HOME_GUARD"
     HOME_DEFENSE = "HOME_DEFENSE"
@@ -68,6 +69,14 @@ class IntentAction(str, Enum):
     PICKUP_BEACON = "PICKUP_BEACON"
     DROP_BEACON = "DROP_BEACON"
     SELF_DESTRUCT = "SELF_DESTRUCT"
+
+
+class DestinationExclusivity(str, Enum):
+    """Which occupants a movement reservation excludes at its destination."""
+
+    NONE = "NONE"
+    COMBAT = "COMBAT_EXCLUSIVE"
+    PHYSICAL = "PHYSICAL_EXCLUSIVE"
 
 
 class VanguardIntent(str, Enum):
@@ -204,6 +213,16 @@ class MoveFailure:
 
 
 @dataclass(frozen=True, slots=True)
+class ServiceMoveFeedback:
+    worker_id: UUID
+    tick: int
+    destination: Position | None
+    selected: bool
+    rejection_reason: str | None
+    stalled_ticks: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class WorldModel:
     tick: int
     resources: int
@@ -281,10 +300,25 @@ class ActionIntent:
     resource_cost: int = 0
     resource_gain: int = 0
     reserve_positions: tuple[Position, ...] = ()
+    destination_exclusivity: DestinationExclusivity = DestinationExclusivity.NONE
+    # Compatibility input retained for older planners and embedders.  A plain
+    # exclusive destination historically meant a combat/formation lease; it
+    # must never shrink the official physical capacity for Workers.
     exclusive_destination: bool = False
     tie_break: tuple[int, ...] = ()
     reason: str = ""
     metadata: Metadata = ()
+
+    def __post_init__(self) -> None:
+        if (
+            self.exclusive_destination
+            and self.destination_exclusivity is DestinationExclusivity.NONE
+        ):
+            object.__setattr__(
+                self,
+                "destination_exclusivity",
+                DestinationExclusivity.COMBAT,
+            )
 
     @classmethod
     def simple(
@@ -331,6 +365,7 @@ class ActionIntent:
         *,
         risk: int = 0,
         exclusive_destination: bool = False,
+        destination_exclusivity: DestinationExclusivity = DestinationExclusivity.NONE,
         tie_break: tuple[int, ...] = (),
         reason: str = "",
         metadata: Metadata = (),
@@ -344,6 +379,7 @@ class ActionIntent:
             target_position=destination,
             risk=risk,
             reserve_positions=(destination,),
+            destination_exclusivity=destination_exclusivity,
             exclusive_destination=exclusive_destination,
             tie_break=tie_break,
             reason=reason,

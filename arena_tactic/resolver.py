@@ -4,11 +4,12 @@ from collections import Counter, defaultdict
 from collections.abc import Mapping
 from uuid import UUID
 
-from arena_hero import Position
+from arena_hero import Position, UnitType
 
 from .geometry import manhattan
 from .models import (
     ActionIntent,
+    DestinationExclusivity,
     IntentAction,
     IntentResolution,
     RejectedIntent,
@@ -30,6 +31,7 @@ class IntentResolver:
         combat_exclusive: bool = False,
         combat_exclusive_center: Position | None = None,
         combat_exclusive_radius: int | None = None,
+        wartime_worker_exclusive: bool = False,
         protected_positions: frozenset[Position] = frozenset(),
         actor_priority_ceilings: Mapping[UUID, int] | None = None,
         actor_move_blocks: Mapping[UUID, frozenset[Position]] | None = None,
@@ -40,6 +42,7 @@ class IntentResolver:
         self.combat_exclusive = combat_exclusive
         self.combat_exclusive_center = combat_exclusive_center
         self.combat_exclusive_radius = combat_exclusive_radius
+        self.wartime_worker_exclusive = wartime_worker_exclusive
         if combat_exclusive_radius is not None and combat_exclusive_radius < 0:
             raise ValueError("combat_exclusive_radius must be non-negative")
         self.protected_positions = protected_positions
@@ -231,12 +234,6 @@ class IntentResolver:
                 projected_core_position,
             )
         )
-        invalid.update(
-            self._reservation_conflicts(
-                moves_by_destination,
-                projected_core_position,
-            )
-        )
         invalid.update(self._swap_conflicts(world, selected, final_units))
         invalid.update(
             self._core_conflicts(
@@ -299,61 +296,89 @@ class IntentResolver:
         invalid: dict[ActionIntent, str] = {}
         for destination, count in counts.items():
             unit_capacity = 1 if destination == projected_core_position else 2
-            contenders = [
-                selected[unit.id]
+            occupants = [
+                unit
                 for unit in world.friendlies
                 if final_units[unit.id] == destination
-                and unit.id in selected
+            ]
+            movers = [
+                selected[unit.id]
+                for unit in occupants
+                if unit.id in selected
                 and selected[unit.id].action is IntentAction.MOVE
             ]
-            service_overlap = any(
-                dict(intent.metadata).get("allow_service_overlap", False)
-                for intent in contenders
-            )
-            if not service_overlap and self._combat_cell_is_exclusive(
-                destination,
-                projected_core_position,
-            ):
-                unit_capacity = 1
-            if not service_overlap and any(
-                intent.exclusive_destination for intent in contenders
-            ):
-                unit_capacity = min(unit_capacity, 1)
-            if count <= unit_capacity:
-                continue
-            stationary = sum(
-                1
-                for unit in world.friendlies
-                if unit.position == destination
-                and not (
-                    unit.id in selected
-                    and selected[unit.id].action is IntentAction.MOVE
-                )
-            )
-            slots = max(0, unit_capacity - stationary)
-            contenders.sort(key=ActionIntent.sort_key)
-            for loser in contenders[slots:]:
-                invalid[loser] = "CELL_CAPACITY"
-        return invalid
+            movers.sort(key=ActionIntent.sort_key)
+            stationary = len(occupants) - len(movers)
 
-    def _reservation_conflicts(
-        self,
-        moves_by_destination: dict[Position, list[ActionIntent]],
-        projected_core_position: Position | None,
-    ) -> dict[ActionIntent, str]:
-        # An explicit exclusive reservation cannot be shared even if the game
-        # would technically allow two friendly entities there.
-        invalid: dict[ActionIntent, str] = {}
-        for destination, contenders in moves_by_destination.items():
-            if len(contenders) <= 1:
-                continue
-            if self._combat_cell_is_exclusive(
+            # Physical capacity is an immutable server rule.  Tactical
+            # exclusivity is checked below by occupant type and must never
+            # lower this number for unrelated candidates.
+            if count > unit_capacity:
+                slots = max(0, unit_capacity - stationary)
+                for loser in movers[slots:]:
+                    invalid.setdefault(loser, "PHYSICAL_CELL_CAPACITY")
+
+            physical = [
+                intent
+                for intent in movers
+                if intent.destination_exclusivity
+                is DestinationExclusivity.PHYSICAL
+            ]
+            if physical:
+                if stationary:
+                    for loser in physical:
+                        invalid[loser] = "PHYSICAL_EXCLUSIVE_OCCUPIED"
+                elif movers:
+                    winner = movers[0]
+                    if winner in physical:
+                        for loser in movers[1:]:
+                            invalid[loser] = "PHYSICAL_EXCLUSIVE"
+                    else:
+                        for loser in physical:
+                            invalid[loser] = "PHYSICAL_EXCLUSIVE"
+
+            combat_units = [
+                unit
+                for unit in occupants
+                if unit.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+            ]
+            combat_movers = [
+                selected[unit.id]
+                for unit in combat_units
+                if unit.id in selected
+                and selected[unit.id].action is IntentAction.MOVE
+            ]
+            combat_movers.sort(key=ActionIntent.sort_key)
+            combat_policy = self._combat_cell_is_exclusive(
                 destination,
                 projected_core_position,
-            ) or any(item.exclusive_destination for item in contenders):
-                contenders.sort(key=ActionIntent.sort_key)
-                for loser in contenders[1:]:
-                    invalid[loser] = "RESERVATION_CONFLICT"
+            ) or any(
+                intent.destination_exclusivity
+                is DestinationExclusivity.COMBAT
+                for intent in combat_movers
+            )
+            if combat_policy and len(combat_units) > 1:
+                stationary_combat = len(combat_units) - len(combat_movers)
+                keep = 0 if stationary_combat else 1
+                for loser in combat_movers[keep:]:
+                    invalid[loser] = "COMBAT_UNIT_EXCLUSIVE"
+
+            if self.wartime_worker_exclusive:
+                workers = [
+                    unit for unit in occupants if unit.unit_type is UnitType.WORKER
+                ]
+                if len(workers) > 1:
+                    worker_movers = [
+                        selected[unit.id]
+                        for unit in workers
+                        if unit.id in selected
+                        and selected[unit.id].action is IntentAction.MOVE
+                    ]
+                    worker_movers.sort(key=ActionIntent.sort_key)
+                    stationary_workers = len(workers) - len(worker_movers)
+                    keep = 0 if stationary_workers else 1
+                    for loser in worker_movers[keep:]:
+                        invalid[loser] = "WARTIME_WORKER_EXCLUSIVE"
         return invalid
 
     @staticmethod

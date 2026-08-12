@@ -183,8 +183,11 @@ class DefensePlanner:
         conflicts: dict[UUID, str] = {}
         conflict_priority = {
             "HEAD_ON_SWAP": 0,
-            "CELL_CAPACITY": 1,
-            "RESERVATION_CONFLICT": 2,
+            "PHYSICAL_CELL_CAPACITY": 1,
+            "PHYSICAL_EXCLUSIVE": 2,
+            "PHYSICAL_EXCLUSIVE_OCCUPIED": 2,
+            "COMBAT_UNIT_EXCLUSIVE": 3,
+            "WARTIME_WORKER_EXCLUSIVE": 4,
         }
         for rejected in resolution.rejected:
             actor_id = rejected.intent.actor_id
@@ -1301,7 +1304,14 @@ class DefensePlanner:
                 item.rejection_reason
                 for item in feedback
                 if item.rejection_reason
-                in {"CELL_CAPACITY", "RESERVATION_CONFLICT", "HEAD_ON_SWAP"}
+                in {
+                    "PHYSICAL_CELL_CAPACITY",
+                    "PHYSICAL_EXCLUSIVE",
+                    "PHYSICAL_EXCLUSIVE_OCCUPIED",
+                    "COMBAT_UNIT_EXCLUSIVE",
+                    "WARTIME_WORKER_EXCLUSIVE",
+                    "HEAD_ON_SWAP",
+                }
             ),
             None,
         )
