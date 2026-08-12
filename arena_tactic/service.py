@@ -13,6 +13,9 @@ from .models import (
     CargoReturnReservation,
     CoreOperationRequest,
     CoreOperationTimeline,
+    CoreServiceJob,
+    CoreServicePhase,
+    CoreSlotSchedule,
     CoreServiceWindow,
     CoreServiceQueue,
     EntitySnapshot,
@@ -570,63 +573,25 @@ class CoreServicePlanner:
             for cell in lane_cells
         )
         units_by_id = {unit.id: unit for unit in world.friendlies}
-        admission, service, reserved = self._select_admission(
-            world,
-            service_core_position,
-            previous_admission,
-            carriers,
-            wounded,
-            urgent,
-            ready,
-            ready_ids,
-            lane_index,
-            head,
-            units_by_id,
-            patient_gateway,
-            projection,
-        )
-        if (
-            self.memory.storage_saturated
-            and admission is None
-            and service in {"IDLE", "DEPOSIT_APPROACH"}
-        ):
-            service = "STORAGE_SATURATED_HOME_GUARD"
-        reserved = max(
-            reserved,
-            sum(
-                UNIT_MAX_HP[unit.unit_type] - unit.hp
-                for unit in wounded
-                if (
-                    unit.unit_type is UnitType.WORKER
-                    or (
-                        unit.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
-                        and unit.hp * 2 <= UNIT_MAX_HP[unit.unit_type]
-                    )
-                )
-            ),
-        )
-
-        admitted_unit = units_by_id.get(admission) if admission is not None else None
-        treatment_service = service in {"EMERGENCY_HEAL", "MAINTENANCE_HEAL"}
-        patient_threatened = bool(
-            treatment_service
-            and admitted_unit is not None
-            and (
-                projection.immediate_attackers(core.position) >= admitted_unit.hp
+        # Resource reservation is immediate, but admission and all physical
+        # service timing are decided exactly once by the unified calendar
+        # below.  The former patient selector and cargo selector must not
+        # compete before that calendar exists.
+        admission: UUID | None = None
+        service = "IDLE"
+        reserved = sum(
+            UNIT_MAX_HP[unit.unit_type] - unit.hp
+            for unit in wounded
+            if (
+                unit.unit_type is UnitType.WORKER
                 or (
-                    patient_gateway is not None
-                    and projection.immediate_attackers(patient_gateway)
-                    >= admitted_unit.hp
+                    unit.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+                    and unit.hp * 2 <= UNIT_MAX_HP[unit.unit_type]
                 )
             )
         )
-        paused_reason = (
-            "PATIENT_GATEWAY_LETHAL"
-            if patient_threatened
-            else "LANE_THREATENED"
-            if lane_threatened and not treatment_service
-            else None
-        )
+
+        admitted_unit = units_by_id.get(admission) if admission is not None else None
         patient_progress = self._patient_progress(
             world,
             projection,
@@ -642,11 +607,46 @@ class CoreServicePlanner:
             service_core_position,
             patient_progress,
         )
-        return_reservations = self._shift_reservations_for_patient(
-            world,
-            return_reservations,
-            patient_progress,
+        (
+            jobs,
+            slot_schedule,
+            admission,
             service,
+            patient_gateway,
+            return_reservations,
+            timeline,
+            service_windows,
+        ) = self._unified_service_schedule(
+            world,
+            projection,
+            carriers,
+            wounded,
+            patient_queue,
+            return_reservations,
+            service_core_position,
+            entrance,
+            exit_cell,
+            reserved,
+        )
+        admitted_unit = units_by_id.get(admission) if admission is not None else None
+        treatment_service = service in {"EMERGENCY_HEAL", "MAINTENANCE_HEAL"}
+        patient_threatened = bool(
+            treatment_service
+            and admitted_unit is not None
+            and (
+                projection.immediate_attackers(core.position) >= admitted_unit.hp
+                or (
+                    patient_gateway is not None
+                    and projection.immediate_attackers(patient_gateway) >= admitted_unit.hp
+                )
+            )
+        )
+        paused_reason = (
+            "PATIENT_GATEWAY_LETHAL"
+            if patient_threatened
+            else "LANE_THREATENED"
+            if lane_threatened and not treatment_service
+            else None
         )
         deposit_schedule = tuple(
             (row.worker_id, row.scheduled_deposit_tick)
@@ -663,21 +663,6 @@ class CoreServicePlanner:
         holding = tuple(
             unit for unit in approaching if unit not in active_approaching
         )
-        timeline = self._operation_timeline(
-            world,
-            projection,
-            admission,
-            service,
-            patient_progress,
-            ready,
-            head,
-            reserved,
-            exit_cell,
-            patient_gateway,
-            carriers,
-            return_reservations,
-        )
-        service_windows = self._service_windows(timeline)
         service_cell_leases = self._service_cell_leases(
             world,
             service_windows,
@@ -689,7 +674,7 @@ class CoreServicePlanner:
             world,
             service_cell_leases,
         )
-        core_slot_reserved = timeline.current_slot_reserved
+        core_slot_reserved = slot_schedule.slot_reserved
 
         release_reason = self._release_reason(
             previous_admission,
@@ -760,6 +745,8 @@ class CoreServicePlanner:
             service_windows=service_windows,
             patient_queue=patient_queue,
             service_cell_leases=service_cell_leases,
+            jobs=jobs,
+            slot_schedule=slot_schedule,
             blocking_units=blocking_units,
             reschedule_reasons=tuple(
                 sorted(
@@ -945,6 +932,527 @@ class CoreServicePlanner:
             if row.scheduled_deposit_tick is not None
         }
         return result
+
+    def _unified_service_schedule(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        carriers: tuple[EntitySnapshot, ...],
+        wounded: tuple[EntitySnapshot, ...],
+        patient_queue: tuple[PatientQueueEntry, ...],
+        reservations: tuple[CargoReturnReservation, ...],
+        core_position: Position,
+        entrance: Position | None,
+        exit_cell: Position | None,
+        reserved_resources: int,
+    ) -> tuple[
+        tuple[CoreServiceJob, ...],
+        CoreSlotSchedule,
+        UUID | None,
+        str,
+        Position | None,
+        tuple[CargoReturnReservation, ...],
+        CoreOperationTimeline,
+        tuple[CoreServiceWindow, ...],
+    ]:
+        """Schedule every Core visitor on one work-conserving calendar.
+
+        The old implementation selected one patient before building an
+        unrelated cargo calendar.  That allowed a distant casualty to freeze
+        the slot while nearby maintenance and deposits waited.  Here every
+        actor owns one job; a wounded loaded Worker therefore has a single
+        ordered ``DEPOSIT, HEAL`` (or ``HEAL, DEPOSIT``) visit.
+        """
+
+        assert world.core is not None
+        units = {unit.id: unit for unit in world.friendlies}
+        patient_rows = {row.patient_id: row for row in patient_queue}
+        reservation_rows = {row.worker_id: row for row in reservations}
+        actor_ids = {unit.id for unit in carriers} | {unit.id for unit in wounded}
+        for actor_id in tuple(self.memory.service_ready_since_ticks):
+            if actor_id not in actor_ids:
+                self.memory.service_ready_since_ticks.pop(actor_id, None)
+        for actor_id in tuple(self.memory.service_patient_gateways):
+            if actor_id not in {unit.id for unit in wounded}:
+                self.memory.service_patient_gateways.pop(actor_id, None)
+
+        urgent_resource_need = sum(
+            row.resource_cost for row in patient_queue if row.urgent
+        )
+        drafts: list[CoreServiceJob] = []
+        for actor_id in sorted(actor_ids, key=lambda value: value.bytes):
+            actor = units.get(actor_id)
+            if actor is None:
+                continue
+            patient = patient_rows.get(actor_id)
+            cargo = reservation_rows.get(actor_id)
+            missing = UNIT_MAX_HP[actor.unit_type] - actor.hp
+            can_deposit = bool(
+                actor.unit_type is UnitType.WORKER
+                and actor.cargo > 0
+                and (
+                    world.resources < world.resource_capacity
+                    or missing > 0
+                )
+            )
+            can_heal = missing > 0
+            if not can_deposit and not can_heal:
+                continue
+
+            if can_deposit and can_heal:
+                operations = (
+                    ("HEAL", "DEPOSIT")
+                    if world.resources >= world.resource_capacity
+                    and world.resources >= missing
+                    else ("DEPOSIT", "HEAL")
+                )
+            elif can_deposit:
+                operations = ("DEPOSIT",)
+            else:
+                operations = ("HEAL",)
+
+            # Loaded Workers use the exact cargo route consumed by WorkerPlanner.
+            # Other patients receive their own gateway and route; no patient is
+            # sent to a generic recovery ring merely because another patient is
+            # currently more urgent.
+            gateway = None
+            route_distance: int | None = None
+            first_direction: Direction | None = None
+            first_position: Position | None = None
+            if actor.position == core_position:
+                route_distance = 0
+            elif cargo is not None and can_deposit:
+                gateway = cargo.route_target
+                route_distance = cargo.route_distance
+                first_direction = cargo.first_direction
+                first_position = cargo.first_position
+            elif patient is not None:
+                gateway = patient.gateway
+                route_distance = patient.eta
+                if gateway is not None:
+                    if actor.position == gateway:
+                        first_direction = _cardinal_direction(actor.position, core_position)
+                        first_position = core_position
+                    else:
+                        route = weighted_route_to(
+                            world,
+                            actor.position,
+                            gateway,
+                            node_limit=self.config.path_node_limit,
+                            blocked=frozenset(
+                                projection.hostile_occupied
+                                - {actor.position, gateway}
+                            ),
+                            cell_costs=dict(
+                                projection.route_costs_for(actor.unit_type)
+                            ),
+                        )
+                        if route is not None:
+                            first_direction = route.first_direction
+                            first_position = route.first_position
+
+            earliest = (
+                None
+                if route_distance is None
+                else world.tick + route_distance
+            )
+            if route_distance is not None and route_distance <= 1:
+                ready_since = self.memory.service_ready_since_ticks.setdefault(
+                    actor_id, world.tick
+                )
+            else:
+                self.memory.service_ready_since_ticks.pop(actor_id, None)
+                ready_since = None
+            urgent = bool(patient is not None and patient.urgent)
+            aged_maintenance = bool(
+                patient is not None
+                and not urgent
+                and ready_since is not None
+                and world.tick - ready_since >= 8
+            )
+            priority = (
+                -100
+                if actor.position == core_position
+                else 0
+                if urgent
+                else 15
+                if aged_maintenance
+                else 20
+                if can_deposit
+                else 30
+            )
+            phase = (
+                CoreServicePhase.SERVICE
+                if route_distance == 0
+                else CoreServicePhase.ENTRY
+                if route_distance == 1
+                else CoreServicePhase.APPROACHING
+            )
+            drafts.append(
+                CoreServiceJob(
+                    actor_id=actor_id,
+                    operations=operations,
+                    phase=phase,
+                    route_distance=route_distance,
+                    first_direction=first_direction,
+                    first_position=first_position,
+                    gateway=gateway,
+                    earliest_service_tick=earliest,
+                    service_tick=None,
+                    exit_tick=None,
+                    priority=priority,
+                    ready_since_tick=ready_since,
+                    resource_cost=missing if can_heal else 0,
+                    resource_gain=actor.cargo if can_deposit else 0,
+                    reason=(
+                        "COMPOUND_WOUNDED_CARGO"
+                        if can_deposit and can_heal
+                        else "PATIENT"
+                        if can_heal
+                        else "CARGO"
+                    ),
+                )
+            )
+
+        reachable = [job for job in drafts if job.earliest_service_tick is not None]
+        unreachable = [job for job in drafts if job.earliest_service_tick is None]
+        scheduled: list[CoreServiceJob] = []
+        cursor = world.tick
+        projected_resources = world.resources
+        remaining_urgent_need = urgent_resource_need
+        while reachable:
+            ready_jobs = [
+                job for job in reachable if job.earliest_service_tick <= cursor
+            ]
+            if not ready_jobs:
+                cursor = min(job.earliest_service_tick for job in reachable)
+                ready_jobs = [
+                    job for job in reachable if job.earliest_service_tick <= cursor
+                ]
+
+            def executable(job: CoreServiceJob) -> bool:
+                first = job.operations[0]
+                if first != "HEAL":
+                    return True
+                # Maintenance may fill a real idle gap, but never consume funds
+                # already reserved for an emergency patient arriving later.
+                actor = units[job.actor_id]
+                patient = patient_rows.get(job.actor_id)
+                if projected_resources < job.resource_cost:
+                    return False
+                return bool(
+                    patient is not None
+                    and patient.urgent
+                    or projected_resources - job.resource_cost
+                    >= remaining_urgent_need
+                    or actor.position == core_position
+                    and not any(row.urgent for row in patient_queue)
+                )
+
+            executable_jobs = [job for job in ready_jobs if executable(job)]
+            if not executable_jobs:
+                funding = [
+                    job for job in reachable if job.operations[0] == "DEPOSIT"
+                ]
+                if funding:
+                    cursor = max(
+                        cursor,
+                        min(job.earliest_service_tick for job in funding),
+                    )
+                    executable_jobs = [
+                        job
+                        for job in funding
+                        if job.earliest_service_tick <= cursor
+                    ]
+                else:
+                    # Keep an underfunded patient visible in the soft calendar;
+                    # RecoveryPlanner will approach while the Core remains free.
+                    executable_jobs = ready_jobs
+
+            funding_needed = projected_resources < remaining_urgent_need
+            chosen = min(
+                executable_jobs,
+                key=lambda job: (
+                    0
+                    if funding_needed and job.operations[0] == "DEPOSIT"
+                    else 1,
+                    job.priority,
+                    job.ready_since_tick
+                    if job.ready_since_tick is not None
+                    else 1 << 60,
+                    job.earliest_service_tick,
+                    b"" if job.actor_id is None else job.actor_id.bytes,
+                ),
+            )
+            start = max(cursor, chosen.earliest_service_tick)
+            actor = units[chosen.actor_id]
+            phase = (
+                CoreServicePhase.SERVICE
+                if actor.position == core_position and start == world.tick
+                else CoreServicePhase.ENTRY
+                if chosen.route_distance == 1 and start <= world.tick + 1
+                else CoreServicePhase.APPROACHING
+            )
+            final = start + len(chosen.operations) - 1
+            chosen = replace(
+                chosen,
+                phase=phase,
+                service_tick=start,
+                exit_tick=final + 1,
+            )
+            scheduled.append(chosen)
+            reachable.remove(next(job for job in reachable if job.actor_id == chosen.actor_id))
+            for operation in chosen.operations:
+                if operation == "DEPOSIT":
+                    projected_resources = min(
+                        world.resource_capacity,
+                        projected_resources + chosen.resource_gain,
+                    )
+                elif operation == "HEAL" and projected_resources >= chosen.resource_cost:
+                    projected_resources -= chosen.resource_cost
+                    patient = patient_rows.get(chosen.actor_id)
+                    if patient is not None and patient.urgent:
+                        remaining_urgent_need = max(
+                            0, remaining_urgent_need - chosen.resource_cost
+                        )
+            # Final service at ``final``; egress and next entry share final+1,
+            # so the next actor can perform service at final+2.
+            cursor = final + 2
+
+        jobs = tuple(
+            sorted(
+                (*scheduled, *unreachable),
+                key=lambda job: (
+                    job.service_tick if job.service_tick is not None else 1 << 60,
+                    job.priority,
+                    b"" if job.actor_id is None else job.actor_id.bytes,
+                ),
+            )
+        )
+        jobs_by_id = {job.actor_id: job for job in jobs}
+
+        updated_reservations: list[CargoReturnReservation] = []
+        for row in reservations:
+            job = jobs_by_id.get(row.worker_id)
+            if job is None or "DEPOSIT" not in job.operations or job.service_tick is None:
+                updated_reservations.append(row)
+                continue
+            deposit_tick = job.service_tick + job.operations.index("DEPOSIT")
+            distance = row.route_distance
+            departure = (
+                None if distance is None else deposit_tick - distance
+            )
+            status = (
+                "UNROUTABLE"
+                if distance is None
+                else "ON_CORE"
+                if distance == 0
+                else "RETURNING"
+                if "HEAL" in job.operations or departure is None or world.tick >= departure
+                else "WAIT_FOR_DEPARTURE"
+            )
+            updated_reservations.append(
+                replace(
+                    row,
+                    scheduled_deposit_tick=deposit_tick,
+                    departure_tick=departure,
+                    slack_ticks=(
+                        None if departure is None else max(0, departure - world.tick)
+                    ),
+                    status=status,
+                    delay_reason=(
+                        "UNIFIED_SERVICE_CALENDAR"
+                        if row.scheduled_deposit_tick != deposit_tick
+                        else row.delay_reason
+                    ),
+                )
+            )
+        reservations = tuple(
+            sorted(
+                updated_reservations,
+                key=lambda row: (
+                    row.scheduled_deposit_tick
+                    if row.scheduled_deposit_tick is not None
+                    else 1 << 60,
+                    row.worker_id.bytes,
+                ),
+            )
+        )
+        self.memory.service_deposit_ticks = {
+            row.worker_id: row.scheduled_deposit_tick
+            for row in reservations
+            if row.scheduled_deposit_tick is not None
+        }
+
+        occupant = next(
+            (unit for unit in world.friendlies if unit.position == core_position),
+            None,
+        )
+        current_job = jobs_by_id.get(occupant.id) if occupant is not None else None
+        admission: UUID | None = None
+        if current_job is not None and current_job.service_tick == world.tick:
+            admission = current_job.actor_id
+        elif occupant is None:
+            incoming = next(
+                (
+                    job
+                    for job in jobs
+                    if job.route_distance == 1
+                    and job.service_tick == world.tick + 1
+                ),
+                None,
+            )
+            admission = None if incoming is None else incoming.actor_id
+        else:
+            # A healthy/finished occupant can leave while an adjacent actor
+            # enters through the movement dependency chain.
+            incoming = next(
+                (
+                    job
+                    for job in jobs
+                    if job.route_distance == 1
+                    and job.service_tick == world.tick + 1
+                ),
+                None,
+            )
+            if current_job is None and incoming is not None:
+                admission = incoming.actor_id
+
+        admitted_job = jobs_by_id.get(admission)
+        current_operation = None
+        if current_job is not None and current_job.service_tick is not None:
+            operation_index = world.tick - current_job.service_tick
+            if 0 <= operation_index < len(current_job.operations):
+                current_operation = current_job.operations[operation_index]
+        next_operation = (
+            admitted_job.operations[0]
+            if admitted_job is not None and current_operation is None
+            else current_operation
+        )
+        admitted_patient = patient_rows.get(admission) if admission is not None else None
+        service = (
+            "HEAL_FUNDING"
+            if next_operation == "DEPOSIT"
+            and urgent_resource_need > world.resources
+            else "DEPOSIT"
+            if next_operation == "DEPOSIT"
+            else "EMERGENCY_HEAL"
+            if next_operation == "HEAL" and admitted_patient is not None and admitted_patient.urgent
+            else "MAINTENANCE_HEAL"
+            if next_operation == "HEAL"
+            else "DEPOSIT_APPROACH"
+            if carriers
+            else "RECOVERY_APPROACH"
+            if wounded
+            else "IDLE"
+        )
+        patient_gateway = (
+            admitted_job.gateway
+            if admitted_job is not None and "HEAL" in admitted_job.operations
+            else next(
+                (job.gateway for job in jobs if "HEAL" in job.operations),
+                None,
+            )
+        )
+
+        egress_rows = tuple(
+            cell
+            for _, cell in cardinal_neighbors(core_position)
+            if cell in world.known_passable
+            and cell not in world.known_obstacles
+            and cell not in projection.hostile_occupied
+            and projection.immediate_attackers(cell) == 0
+            and cell not in {entrance}
+        )
+        next_job = next(
+            (job for job in jobs if job.service_tick is not None and job.service_tick >= world.tick),
+            None,
+        )
+        slot_reserved = bool(occupant is not None or admission is not None)
+        production_allowed = bool(egress_rows) and admission is None
+        if occupant is not None and current_job is not None:
+            production_allowed = False
+        elif next_job is not None and next_job.service_tick <= world.tick + 1:
+            production_allowed = False
+        reason = (
+            "CURRENT_SERVICE"
+            if current_job is not None
+            else "SERVICE_DUE_THIS_TICK"
+            if admission is not None
+            else "SAFE_BEFORE_FUTURE_SERVICE"
+            if production_allowed
+            else "NO_SAFE_SPAWN_EGRESS"
+            if not egress_rows
+            else "SERVICE_DUE_NEXT_TICK"
+        )
+        schedule = CoreSlotSchedule(
+            tick=world.tick,
+            jobs=jobs,
+            current_job_id=None if current_job is None else current_job.actor_id,
+            next_job_id=None if next_job is None else next_job.actor_id,
+            slot_owner_id=None if occupant is None else occupant.id,
+            slot_reserved=slot_reserved,
+            production_allowed=production_allowed,
+            spawn_egress_cell=min(egress_rows, default=exit_cell),
+            reason=reason,
+        )
+        requests: list[CoreOperationRequest] = []
+        windows: list[CoreServiceWindow] = []
+        for job in jobs:
+            if job.actor_id is None or job.service_tick is None or job.exit_tick is None:
+                continue
+            for index, operation in enumerate(job.operations):
+                service_tick = job.service_tick + index
+                requests.append(
+                    CoreOperationRequest(
+                        actor_id=job.actor_id,
+                        operation=operation,
+                        eta=max(0, service_tick - world.tick),
+                        occupy_tick=service_tick,
+                        release_tick=job.exit_tick,
+                        priority=job.priority,
+                        resource_cost=job.resource_cost if operation == "HEAL" else 0,
+                        resource_gain=job.resource_gain if operation == "DEPOSIT" else 0,
+                        gateway=job.gateway,
+                    )
+                )
+                windows.append(
+                    CoreServiceWindow(
+                        actor_id=job.actor_id,
+                        operation=operation,
+                        enter_tick=max(world.tick, job.service_tick - 1),
+                        service_tick=service_tick,
+                        exit_tick=job.exit_tick,
+                        gateway=job.gateway,
+                        status=job.phase.value,
+                    )
+                )
+        timeline = CoreOperationTimeline(
+            tick=world.tick,
+            requests=tuple(requests),
+            current_slot_owner=None if occupant is None else occupant.id,
+            current_slot_reserved=slot_reserved,
+            next_service_eta=(
+                None
+                if next_job is None or next_job.service_tick is None
+                else max(0, next_job.service_tick - world.tick)
+            ),
+            next_service_tick=None if next_job is None else next_job.service_tick,
+            next_release_tick=None if next_job is None else next_job.exit_tick,
+            production_allowed=production_allowed,
+            spawn_egress_cell=schedule.spawn_egress_cell,
+            reason=reason,
+        )
+        return (
+            jobs,
+            schedule,
+            admission,
+            service,
+            patient_gateway,
+            reservations,
+            timeline,
+            tuple(windows),
+        )
 
     def _shift_reservations_for_patient(
         self,
@@ -1135,14 +1643,38 @@ class CoreServicePlanner:
     ) -> tuple[PatientQueueEntry, ...]:
         rows: list[PatientQueueEntry] = []
         for patient in wounded:
-            gateway = self._choose_patient_gateway(
-                world,
-                projection,
-                patient,
-                entrance,
-                exit_cell,
-                core_position,
-            )
+            gateway = self.memory.service_patient_gateways.get(patient.id)
+            if gateway is not None:
+                persisted_route = route_to(
+                    world,
+                    patient.position,
+                    gateway,
+                    node_limit=self.config.path_node_limit,
+                    blocked=frozenset(
+                        projection.hostile_occupied - {patient.position, gateway}
+                    ),
+                )
+                if (
+                    manhattan(gateway, core_position) != 1
+                    or gateway in world.known_obstacles
+                    or gateway in projection.hostile_occupied
+                    or projection.immediate_attackers(gateway) >= patient.hp
+                    or persisted_route is None
+                ):
+                    gateway = None
+            if gateway is None:
+                gateway = self._choose_patient_gateway(
+                    world,
+                    projection,
+                    patient,
+                    entrance,
+                    exit_cell,
+                    core_position,
+                )
+            if gateway is None:
+                self.memory.service_patient_gateways.pop(patient.id, None)
+            else:
+                self.memory.service_patient_gateways[patient.id] = gateway
             if patient.position == core_position:
                 eta = 0
             elif gateway is None:

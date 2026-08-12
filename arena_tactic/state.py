@@ -98,6 +98,11 @@ class TacticMemory:
     service_return_progress: dict[UUID, tuple[int | None, int]] = field(default_factory=dict)
     service_cargo_first_seen_ticks: dict[UUID, int] = field(default_factory=dict)
     service_deposit_ticks: dict[UUID, int] = field(default_factory=dict)
+    # Session-only fairness age for actors that can physically enter the Core.
+    # The unified service calendar is rebuilt from the authoritative Turn, but
+    # this small value prevents maintenance patients from starving forever.
+    service_ready_since_ticks: dict[UUID, int] = field(default_factory=dict)
+    service_patient_gateways: dict[UUID, Position] = field(default_factory=dict)
     patient_admission_progress: PatientAdmissionProgress | None = None
     storage_saturated: bool = False
     worker_home_guard_targets: dict[UUID, Position] = field(default_factory=dict)
@@ -179,6 +184,8 @@ class TacticMemory:
         self.service_return_progress.clear()
         self.service_cargo_first_seen_ticks.clear()
         self.service_deposit_ticks.clear()
+        self.service_ready_since_ticks.clear()
+        self.service_patient_gateways.clear()
         self.patient_admission_progress = None
         self.storage_saturated = False
         self.worker_home_guard_targets.clear()

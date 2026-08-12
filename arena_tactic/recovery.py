@@ -49,6 +49,7 @@ class RecoveryPlanner:
             and not (unit.unit_type is UnitType.WORKER and unit.cargo > 0)
         )
         protected = service_protected_positions(world, service)
+        jobs = {job.actor_id: job for job in service.jobs}
         intents: list[ActionIntent] = []
         reserved_staging: set[Position] = set()
         for unit in wounded:
@@ -66,15 +67,68 @@ class RecoveryPlanner:
                 )
             urgent = unit.hp * 2 <= UNIT_MAX_HP[unit.unit_type]
             priority = 40 if urgent else 45
+            service_job = jobs.get(unit.id)
             scheduled = bool(
-                service.timeline is not None
-                and any(
-                    request.actor_id == unit.id and request.operation == "HEAL"
-                    for request in service.timeline.requests
-                )
+                service_job is not None and "HEAL" in service_job.operations
             )
             admitted = service.admission_id == unit.id
             missing = UNIT_MAX_HP[unit.unit_type] - unit.hp
+            if (
+                unit.position == world.core.position
+                and service_job is not None
+                and not admitted
+                and service_job.service_tick is not None
+                and service_job.service_tick > world.tick
+            ):
+                # An underfunded patient cannot occupy the only Core Unit slot
+                # while the single funding Worker waits outside.  Yield to a
+                # safe recovery cell, keep the same HEAL job, then re-enter as
+                # soon as the deposit has funded treatment.
+                egress_rows = []
+                for index, (direction, destination) in enumerate(
+                    cardinal_neighbors(unit.position)
+                ):
+                    if (
+                        destination in world.known_obstacles
+                        or destination in projection.hostile_occupied
+                        or destination == service.entrance
+                        or destination in service.queue_cells
+                        or projection.immediate_attackers(destination) >= unit.hp
+                    ):
+                        continue
+                    egress_rows.append(
+                        (
+                            (
+                                int(destination != service.exit_cell),
+                                projection.future_attackers(destination),
+                                projection.threat_heat.get(destination, 0),
+                                index,
+                            ),
+                            direction,
+                            destination,
+                        )
+                    )
+                for score, direction, destination in sorted(egress_rows):
+                    intents.append(
+                        ActionIntent.move(
+                            unit.id,
+                            UnitMission.RECOVER,
+                            priority - 1,
+                            direction,
+                            destination,
+                            risk=self._risk(projection, destination),
+                            exclusive_destination=True,
+                            tie_break=score,
+                            reason="PATIENT_YIELD_FOR_FUNDING",
+                            metadata=(
+                                ("allow_protected", True),
+                                ("allow_head_on_swap", True),
+                                ("service_tick", service_job.service_tick),
+                            ),
+                        )
+                    )
+                if egress_rows:
+                    continue
             if (
                 admitted
                 and service.paused_reason is None
@@ -94,11 +148,12 @@ class RecoveryPlanner:
                 continue
 
             target = None
-            if (admitted or scheduled) and service.paused_reason is None:
+            if scheduled and service.paused_reason is None:
                 target = (
-                    service.patient_gateway
-                    if service.patient_gateway is not None
-                    and unit.position != service.patient_gateway
+                    service_job.gateway
+                    if service_job is not None
+                    and service_job.gateway is not None
+                    and unit.position != service_job.gateway
                     else world.core.position
                 )
             if target is None:
@@ -154,6 +209,54 @@ class RecoveryPlanner:
                         node_limit=self.config.path_node_limit,
                         lookahead_node_limit=self.config.worker_escape_lookahead_nodes,
                     )
+                    job_step = next(
+                        (
+                            step
+                            for step in steps
+                            if service_job is not None
+                            and service_job.first_position == step.destination
+                            and step.route_reachable
+                            and step.survival_terminals > 0
+                            and step.forward_exits >= 2
+                            and step.immediate_attackers < unit.hp
+                            and step.future_attackers < unit.hp
+                            and not any(
+                                enemy.visible_now
+                                and enemy.unit_type
+                                in {UnitType.VANGUARD, UnitType.RANGER}
+                                for enemy in projection.enemies
+                            )
+                        ),
+                        None,
+                    )
+                    if job_step is not None:
+                        # The unified calendar and the actor now consume the
+                        # same safe first step.  Alternative high-exit moves
+                        # remain available if the resolver rejects it, but may
+                        # no longer make a calm wounded Worker drift away from
+                        # treatment or oscillate between staging cells.
+                        intents.append(
+                            ActionIntent.move(
+                                unit.id,
+                                UnitMission.RECOVER,
+                                priority - 1,
+                                job_step.direction,
+                                job_step.destination,
+                                risk=self.worker_safety.risk(
+                                    projection, job_step.destination
+                                ),
+                                exclusive_destination=True,
+                                tie_break=job_step.score,
+                                reason="CORE_SERVICE_ROUTE_ADVANCE",
+                                metadata=(
+                                    ("allow_protected", True),
+                                    ("allow_head_on_swap", True),
+                                    ("forward_exits", job_step.forward_exits),
+                                    ("survival_terminals", job_step.survival_terminals),
+                                    ("service_tick", service_job.service_tick),
+                                ),
+                            )
+                        )
                     for step in steps:
                         intents.append(
                             ActionIntent.move(

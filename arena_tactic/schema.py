@@ -1,6 +1,6 @@
 """Version identifiers shared by runtime logs and durable checkpoints."""
 
-STRATEGY_LOG_SCHEMA_VERSION = 30
+STRATEGY_LOG_SCHEMA_VERSION = 31
 EXPLORATION_MEMORY_SCHEMA_VERSION = 12
 
 

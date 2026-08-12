@@ -43,6 +43,15 @@ class UnitMission(str, Enum):
     WAIT = "WAIT"
 
 
+class CoreServicePhase(str, Enum):
+    """Physical lifecycle shared by deposits, healing and slot-using spawn."""
+
+    APPROACHING = "APPROACHING"
+    ENTRY = "ENTRY"
+    SERVICE = "SERVICE"
+    EGRESS = "EGRESS"
+
+
 class IntentAction(str, Enum):
     WAIT = "WAIT"
     MOVE = "MOVE"
@@ -398,6 +407,48 @@ class CargoReturnReservation:
 
 
 @dataclass(frozen=True, slots=True)
+class CoreServiceJob:
+    """One actor's indivisible visit to the single Unit slot on the Core.
+
+    A wounded loaded Worker owns one job with two operations rather than a
+    cargo appointment competing with an unrelated treatment appointment.
+    ``service_tick`` is the first operation Tick; subsequent operations occupy
+    consecutive Ticks and ``exit_tick`` is the following egress Tick.
+    """
+
+    actor_id: UUID | None
+    operations: tuple[str, ...]
+    phase: CoreServicePhase
+    route_distance: int | None
+    first_direction: Direction | None
+    first_position: Position | None
+    gateway: Position | None
+    earliest_service_tick: int | None
+    service_tick: int | None
+    exit_tick: int | None
+    priority: int
+    ready_since_tick: int | None
+    resource_cost: int = 0
+    resource_gain: int = 0
+    reason: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class CoreSlotSchedule:
+    """Work-conserving calendar for the Core's single Unit service slot."""
+
+    tick: int
+    jobs: tuple[CoreServiceJob, ...] = ()
+    current_job_id: UUID | None = None
+    next_job_id: UUID | None = None
+    slot_owner_id: UUID | None = None
+    slot_reserved: bool = False
+    production_allowed: bool = True
+    spawn_egress_cell: Position | None = None
+    reason: str = "NO_SERVICE_JOB"
+
+
+@dataclass(frozen=True, slots=True)
 class CoreServiceQueue:
     service: str
     admission_id: UUID | None
@@ -423,6 +474,8 @@ class CoreServiceQueue:
     service_windows: tuple["CoreServiceWindow", ...] = ()
     patient_queue: tuple["PatientQueueEntry", ...] = ()
     service_cell_leases: tuple["ServiceCellLease", ...] = ()
+    jobs: tuple[CoreServiceJob, ...] = ()
+    slot_schedule: CoreSlotSchedule | None = None
     blocking_units: tuple[tuple[UUID, Position, str], ...] = ()
     reschedule_reasons: tuple[str, ...] = ()
     reserved_resources: int = 0

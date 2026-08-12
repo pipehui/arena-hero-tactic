@@ -18,6 +18,7 @@ from arena_hero import (
 from arena_tactic import (
     BalancedTactic,
     CrisisForceBaseline,
+    PatientAdmissionProgress,
     TacticConfig,
     TacticMemory,
     ThreatHeatCell,
@@ -1699,6 +1700,130 @@ class EconomyAndLogisticsTests(unittest.TestCase):
             if item["actor_id"] == str(patient.id)
         )
         self.assertEqual(patient_task["mission"], UnitMission.RECOVER.value)
+
+    def test_adjacent_maintenance_patient_fills_gap_before_far_work(self) -> None:
+        memory = TacticMemory(opening_complete=True)
+        memory.known_passable.update(
+            (x, y) for x in range(-12, 13) for y in range(-12, 13)
+        )
+        carrier = unit(1, UnitType.WORKER, (5, 0), cargo=1)
+        far_urgent = unit(2, UnitType.RANGER, (8, 0), hp=1)
+        near_maintenance = unit(3, UnitType.VANGUARD, (0, 1), hp=3)
+        turn = make_turn(
+            tick=100,
+            units=(carrier, far_urgent, near_maintenance),
+            resources=5,
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(turn)
+
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        self.assertEqual(queue["admission_id"], str(near_maintenance.id))
+        action = turn.plan.unit_actions[near_maintenance.id]
+        self.assertIsInstance(action, MoveAction)
+        self.assertEqual(action.direction, Direction.UP)
+
+    def test_ready_urgent_patient_preempts_sticky_remote_patient_and_cargo(self) -> None:
+        remote_id = uid(2)
+        memory = TacticMemory(
+            opening_complete=True,
+            patient_admission_progress=PatientAdmissionProgress(
+                patient_id=remote_id,
+                gateway=(1, 0),
+                started_tick=90,
+                last_position=(8, 0),
+                stalled_ticks=0,
+                entry_distance=8,
+            ),
+        )
+        memory.known_passable.update(
+            (x, y) for x in range(-12, 13) for y in range(-12, 13)
+        )
+        carrier = unit(1, UnitType.WORKER, (1, 0), cargo=1)
+        remote_urgent = unit(2, UnitType.RANGER, (8, 0), hp=1)
+        ready_urgent = unit(3, UnitType.RANGER, (0, 1), hp=1)
+        turn = make_turn(
+            tick=100,
+            units=(carrier, remote_urgent, ready_urgent),
+            resources=2,
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(turn)
+
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        self.assertEqual(queue["admission_id"], str(ready_urgent.id))
+        action = turn.plan.unit_actions[ready_urgent.id]
+        self.assertIsInstance(action, MoveAction)
+        self.assertEqual(action.direction, Direction.UP)
+
+    def test_every_injured_worker_keeps_a_core_service_job_and_moves_home(self) -> None:
+        near_patient = unit(2, UnitType.RANGER, (1, 0), hp=1)
+        injured_worker = unit(3, UnitType.WORKER, (0, 5), hp=1)
+        memory = TacticMemory(opening_complete=True)
+        memory.known_passable.update(
+            (x, y) for x in range(-2, 3) for y in range(-1, 7)
+        )
+        turn = make_turn(
+            units=(near_patient, injured_worker),
+            resources=5,
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(turn)
+
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        worker_jobs = [
+            job
+            for job in queue["jobs"]
+            if job["actor_id"] == str(injured_worker.id)
+        ]
+        self.assertEqual(len(worker_jobs), 1)
+        self.assertIn("HEAL", worker_jobs[0]["operations"])
+        action = turn.plan.unit_actions[injured_worker.id]
+        self.assertIsInstance(action, MoveAction)
+        dx, dy = action.direction.delta
+        destination = (
+            injured_worker.position[0] + dx,
+            injured_worker.position[1] + dy,
+        )
+        self.assertLess(
+            manhattan(destination, (0, 0)),
+            manhattan(injured_worker.position, (0, 0)),
+        )
+
+    def test_wounded_loaded_worker_has_one_compound_core_service_job(self) -> None:
+        worker = unit(1, UnitType.WORKER, (1, 0), hp=1, cargo=1)
+        turn = make_turn(units=(worker,), resources=0)
+        tactic = BalancedTactic()
+
+        tactic.choose_actions(turn)
+
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        jobs = [job for job in queue["jobs"] if job["actor_id"] == str(worker.id)]
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["operations"], ["DEPOSIT", "HEAL"])
+
+    def test_underfunded_core_patient_yields_to_one_funding_carrier(self) -> None:
+        patient = unit(2, UnitType.RANGER, (0, 0), hp=1)
+        carrier = unit(1, UnitType.WORKER, (1, 0), cargo=1)
+        turn = make_turn(units=(patient, carrier), resources=0)
+        tactic = BalancedTactic()
+
+        tactic.choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.unit_actions[patient.id], MoveAction)
+        patient_task = next(
+            task
+            for task in tactic.last_decision_trace["tasks"]
+            if task["actor_id"] == str(patient.id)
+        )
+        self.assertEqual(patient_task["reason"], "PATIENT_YIELD_FOR_FUNDING")
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        jobs = queue["jobs"]
+        self.assertEqual(jobs[0]["actor_id"], str(carrier.id))
+        self.assertEqual(jobs[0]["operations"], ["DEPOSIT"])
 
     def test_admitted_patient_can_traverse_the_only_service_entrance(self) -> None:
         patient = unit(2, UnitType.RANGER, (2, 0), hp=1)

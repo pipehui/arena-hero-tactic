@@ -916,6 +916,60 @@ class DecisionTraceBuilder:
                 }
                 for window in service.service_windows
             ],
+            "jobs": [
+                {
+                    "actor_id": None if job.actor_id is None else str(job.actor_id),
+                    "operations": list(job.operations),
+                    "phase": job.phase.value,
+                    "route_distance": job.route_distance,
+                    "first_direction": (
+                        None if job.first_direction is None else job.first_direction.value
+                    ),
+                    "first_position": (
+                        None if job.first_position is None else list(job.first_position)
+                    ),
+                    "gateway": None if job.gateway is None else list(job.gateway),
+                    "earliest_service_tick": job.earliest_service_tick,
+                    "service_tick": job.service_tick,
+                    "exit_tick": job.exit_tick,
+                    "priority": job.priority,
+                    "ready_since_tick": job.ready_since_tick,
+                    "resource_cost": job.resource_cost,
+                    "resource_gain": job.resource_gain,
+                    "reason": job.reason,
+                }
+                for job in service.jobs
+            ],
+            "slot_schedule": (
+                None
+                if service.slot_schedule is None
+                else {
+                    "tick": service.slot_schedule.tick,
+                    "current_job_id": (
+                        None
+                        if service.slot_schedule.current_job_id is None
+                        else str(service.slot_schedule.current_job_id)
+                    ),
+                    "next_job_id": (
+                        None
+                        if service.slot_schedule.next_job_id is None
+                        else str(service.slot_schedule.next_job_id)
+                    ),
+                    "slot_owner_id": (
+                        None
+                        if service.slot_schedule.slot_owner_id is None
+                        else str(service.slot_schedule.slot_owner_id)
+                    ),
+                    "slot_reserved": service.slot_schedule.slot_reserved,
+                    "production_allowed": service.slot_schedule.production_allowed,
+                    "spawn_egress": (
+                        None
+                        if service.slot_schedule.spawn_egress_cell is None
+                        else list(service.slot_schedule.spawn_egress_cell)
+                    ),
+                    "reason": service.slot_schedule.reason,
+                }
+            ),
             "patient_queue": [
                 {
                     "patient_id": str(patient.patient_id),

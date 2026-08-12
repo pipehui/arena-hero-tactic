@@ -909,6 +909,7 @@ class WorkerPlanner:
         return intents
 
     def _update_escape(self, world, projection, worker):
+        wounded = worker.hp < UNIT_MAX_HP[UnitType.WORKER]
         relevant = tuple(
             enemy
             for enemy in projection.enemies
@@ -939,6 +940,12 @@ class WorkerPlanner:
                 or worker.position in enemy.movement_corridor
             )
         )
+        if wounded:
+            # A wounded Worker's sticky RECOVER job already uses the shared
+            # danger heat-map.  A remote/fog-wide alert must not send it away
+            # from treatment; only a genuinely local visible threat may
+            # temporarily pre-empt the return route.
+            shared_threats = direct_threats
         threats = tuple(
             sorted(set(direct_threats) | set(shared_threats), key=lambda item: item.bytes)
         )
@@ -969,6 +976,20 @@ class WorkerPlanner:
             if (enemy := projection.enemy(threat_id)) is not None
             and enemy.age <= self.config.enemy_track_ttl
         )
+        if fresh and wounded:
+            fresh = tuple(
+                threat_id
+                for threat_id in fresh
+                if (enemy := projection.enemy(threat_id)) is not None
+                and enemy.age <= 2
+                and max(
+                    0,
+                    manhattan(enemy.observed_position, worker.position) - enemy.age,
+                ) <= self.config.worker_escape_clearance_radius
+            )
+            if not fresh:
+                self.memory.worker_escape_states.pop(worker.id, None)
+                return None
         if fresh:
             state = WorkerEscapeState(
                 "FOG_RETREAT",
