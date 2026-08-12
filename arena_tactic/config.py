@@ -107,10 +107,15 @@ class TacticConfig:
     outer_screen_home_ranger_reserve: int = 4
     outer_screen_hold_ticks: int = 4
     outer_screen_fog_ttl: int = 2
+    outer_screen_stance_lease_ticks: int = 4
+    outer_screen_no_progress_ticks: int = 2
+    outer_screen_reverse_suppress_ticks: int = 2
     vanguard_engage_distance: int = 4
     combat_exclusive_radius: int = 13
     peaceful_squad_radii: tuple[int, ...] = (5, 10, 15)
     squad_max_separation: int = 4
+    squad_reassembly_no_progress_ticks: int = 2
+    squad_reassembly_break_ticks: int = 4
     ranger_repeat_miss_limit: int = 2
     ranger_miss_suppress_ticks: int = 2
 
@@ -210,9 +215,14 @@ class TacticConfig:
             self.outer_screen_home_ranger_reserve,
             self.outer_screen_hold_ticks,
             self.outer_screen_fog_ttl,
+            self.outer_screen_stance_lease_ticks,
+            self.outer_screen_no_progress_ticks,
+            self.outer_screen_reverse_suppress_ticks,
             self.vanguard_engage_distance,
             self.combat_exclusive_radius,
             self.squad_max_separation,
+            self.squad_reassembly_no_progress_ticks,
+            self.squad_reassembly_break_ticks,
             self.ranger_repeat_miss_limit,
             self.ranger_miss_suppress_ticks,
             self.core_retreat_radius,
@@ -252,6 +262,8 @@ class TacticConfig:
             raise ValueError("outer screen radius must be ordered")
         if self.outer_screen_continue_radius < self.outer_screen_max_radius:
             raise ValueError("outer screen continuation must cover acquisition radius")
+        if self.squad_reassembly_break_ticks < self.squad_reassembly_no_progress_ticks:
+            raise ValueError("reassembly break must not precede its no-progress limit")
         if (
             not self.exploration_sector_radii
             or tuple(sorted(set(self.exploration_sector_radii)))

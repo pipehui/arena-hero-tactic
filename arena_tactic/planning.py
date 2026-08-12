@@ -18,12 +18,41 @@ _STEPS: tuple[tuple[Direction, int, int], ...] = (
     (Direction.LEFT, -1, 0),
 )
 
+@dataclass(frozen=True, slots=True)
+class MoveViability:
+    """Pure proof that a first step does not enter a known sealed branch."""
+
+    forward_exits: int
+    continuation_reachable: bool
+    local_open: bool
+    unknown_frontier: bool
+    viable: bool
+    terminal_exception: str | None = None
+    rejection_reason: str | None = None
+
+    @property
+    def metadata(self) -> tuple[tuple[str, object], ...]:
+        return (
+            ("forward_exits", self.forward_exits),
+            ("continuation_reachable", self.continuation_reachable),
+            ("local_open", self.local_open),
+            ("unknown_frontier", self.unknown_frontier),
+            ("dead_end_rejected", not self.viable),
+            ("terminal_exception", self.terminal_exception),
+            ("viability_rejection", self.rejection_reason),
+        )
+
+
+_viability_cache_world: WorldModel | None = None
+_viability_cache: dict[tuple[object, ...], MoveViability] = {}
+
 
 @dataclass(frozen=True, slots=True)
 class Route:
     distance: int
     first_direction: Direction | None
     first_position: Position | None
+    viability: MoveViability | None = None
 
 
 def path_to(
@@ -227,6 +256,145 @@ def route_to(
         return None
     first_direction = parent[1]
     return Route(distance, first_direction, add_direction(start, first_direction))
+
+
+def move_viability(
+    world: WorldModel,
+    origin: Position,
+    destination: Position,
+    *,
+    target: Position | None = None,
+    blocked: frozenset[Position] = frozenset(),
+    node_limit: int = 256,
+    lookahead_depth: int = 2,
+    require_continuation: bool = False,
+    require_open_area: bool = False,
+    terminal_exception: str | None = None,
+) -> MoveViability:
+    """Classify a first step after removing the cell it just left.
+
+    Ordinary navigation must not count the origin as an escape route.  A
+    destination beside unexplored fog is not declared a dead end until the
+    authoritative world model has actually observed the surrounding terrain.
+    """
+
+    global _viability_cache_world
+    global _viability_cache
+    if _viability_cache_world is not world:
+        _viability_cache_world = world
+        _viability_cache = {}
+    cache_key = (
+        origin,
+        destination,
+        target,
+        blocked,
+        node_limit,
+        lookahead_depth,
+        require_continuation,
+        require_open_area,
+        terminal_exception,
+    )
+    cached = _viability_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    obstacles = world.known_obstacles
+    passable = world.known_passable
+    blocked_cells = set(blocked)
+    blocked_cells.discard(origin)
+    blocked_cells.discard(destination)
+    if target is not None:
+        blocked_cells.discard(target)
+
+    def known_open(cell: Position) -> bool:
+        return (
+            cell in passable
+            and cell not in obstacles
+            and cell not in blocked_cells
+        )
+
+    forward = tuple(
+        neighbor
+        for _, neighbor in cardinal_neighbors(destination)
+        if neighbor != origin and known_open(neighbor)
+    )
+    forward_exits = len(forward)
+    local_open = forward_exits >= 2
+    unknown_frontier = False
+
+    queue = deque(((destination, 0, origin),))
+    visited = {origin, destination}
+    while queue:
+        cell, depth, parent = queue.popleft()
+        onward: list[Position] = []
+        for _, neighbor in cardinal_neighbors(cell):
+            if neighbor == parent or neighbor in obstacles or neighbor in blocked_cells:
+                continue
+            if neighbor not in passable:
+                if neighbor not in world.visible_cells:
+                    unknown_frontier = True
+                continue
+            onward.append(neighbor)
+        if len(onward) >= 2:
+            local_open = True
+        if depth >= lookahead_depth:
+            continue
+        for neighbor in onward:
+            if neighbor in visited:
+                continue
+            visited.add(neighbor)
+            queue.append((neighbor, depth + 1, cell))
+
+    continuation_reachable = False
+    if target is not None:
+        if destination == target:
+            continuation_reachable = True
+        else:
+            onward_blocked = set(blocked_cells)
+            onward_blocked.add(origin)
+            onward_blocked.discard(destination)
+            onward_blocked.discard(target)
+            continuation_reachable = (
+                route_to(
+                    world,
+                    destination,
+                    target,
+                    node_limit=max(1, node_limit),
+                    blocked=frozenset(onward_blocked),
+                    allow_unknown_endpoint=True,
+                )
+                is not None
+            )
+
+    has_forward_space = forward_exits > 0 or unknown_frontier
+    viable = terminal_exception is not None or (
+        has_forward_space
+        and (not require_continuation or continuation_reachable)
+        and (
+            not require_open_area
+            or local_open
+            or unknown_frontier
+            or continuation_reachable
+        )
+    )
+    rejection_reason = None
+    if not viable:
+        rejection_reason = (
+            "NO_ROUTE_CONTINUATION"
+            if require_continuation and not continuation_reachable
+            else "DEAD_END_INTERMEDIATE"
+        )
+    result = MoveViability(
+        forward_exits=forward_exits,
+        continuation_reachable=continuation_reachable,
+        local_open=local_open,
+        unknown_frontier=unknown_frontier,
+        viable=viable,
+        terminal_exception=terminal_exception,
+        rejection_reason=rejection_reason,
+    )
+    _viability_cache[cache_key] = result
+    return result
 
 
 def weighted_route_to(

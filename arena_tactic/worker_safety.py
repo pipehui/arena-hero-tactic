@@ -6,7 +6,7 @@ from arena_hero import Direction, Position, UnitType
 
 from .geometry import cardinal_neighbors, manhattan
 from .models import EntitySnapshot, WorldModel
-from .planning import Route, weighted_route_to
+from .planning import move_viability, Route, weighted_route_to
 from .projection import TacticalMap
 
 
@@ -128,6 +128,26 @@ class WorkerSafetyEvaluator:
                 or projection.immediate_attackers(destination) >= worker.hp
             ):
                 continue
+            terminal_exception = (
+                "CORE_SERVICE"
+                if world.core is not None
+                and destination == world.core.position
+                else None
+            )
+            viability = move_viability(
+                world,
+                worker.position,
+                destination,
+                target=target,
+                blocked=blocked,
+                node_limit=min(node_limit, 512),
+                require_continuation=(
+                    terminal_exception is None and destination != target
+                ),
+                terminal_exception=terminal_exception,
+            )
+            if not viability.viable:
+                continue
             if destination == target:
                 route = Route(1, direction, destination)
             else:
@@ -156,14 +176,7 @@ class WorkerSafetyEvaluator:
                 WorkerStepSafety(
                     direction=direction,
                     destination=destination,
-                    forward_exits=self.forward_safe_exits(
-                        world,
-                        projection,
-                        destination,
-                        worker.hp,
-                        origin=worker.position,
-                        target=target,
-                    ),
+                    forward_exits=viability.forward_exits,
                     survival_terminals=self.survival_terminals(
                         world,
                         projection,

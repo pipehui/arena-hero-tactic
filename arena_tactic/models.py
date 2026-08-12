@@ -658,6 +658,49 @@ class EnemyRangerFireEstimate:
 
 
 @dataclass(frozen=True, slots=True)
+class RangerStanceOption:
+    ranger_id: UUID
+    target_id: UUID
+    role: str
+    stance: Position
+    first_direction: Direction | None
+    first_position: Position | None
+    route_distance: int
+    visible_candidates: tuple[Position, ...]
+    firing_candidates: tuple[Position, ...]
+    risk: int
+    viable: bool = True
+    rejection_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ScreeningContactDecision:
+    target_id: UUID
+    target_visible: bool
+    candidate_cells: tuple[Position, ...]
+    contact_ranger_id: UUID | None
+    fire_support_ranger_id: UUID | None
+    options: tuple[RangerStanceOption, ...] = ()
+    visible_before: int = 0
+    visible_after: int = 0
+    reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RangerStanceLease:
+    target_id: UUID
+    ranger_id: UUID
+    role: str
+    stance: Position
+    assigned_tick: int
+    expires_tick: int
+    last_position: Position
+    last_route_distance: int
+    no_progress_ticks: int = 0
+    last_direction: Direction | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class EnemyActionEstimate:
     target_id: UUID
     confidence: str
@@ -754,9 +797,35 @@ class SquadState:
 
 
 @dataclass(frozen=True, slots=True)
+class SquadRendezvousLease:
+    vanguard_id: UUID
+    ranger_id: UUID
+    rendezvous: Position
+    assigned_tick: int
+    best_separation: int
+    stalled_ticks: int = 0
+    last_vanguard_position: Position | None = None
+    last_ranger_position: Position | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CoreMoveCandidateEvaluation:
+    direction: Direction
+    destination: Position
+    forward_exits: int
+    local_open: bool
+    unknown_frontier: bool
+    service_exits: int
+    viable: bool
+    rejection_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class CoreEvacuationCampaign:
     active: bool
     started_tick: int | None
     safe_ticks: int
     last_destination: Position | None
     reason: str | None
+    candidate_evaluations: tuple[CoreMoveCandidateEvaluation, ...] = ()
+    no_escape_route: bool = False

@@ -613,8 +613,74 @@ class DecisionTraceBuilder:
                     "candidate_coverage": dict(intent.metadata).get(
                         "candidate_coverage"
                     ),
+                    "screening_role": dict(intent.metadata).get(
+                        "screening_role"
+                    ),
+                    "visible_candidates": [
+                        list(cell)
+                        for cell in dict(intent.metadata).get(
+                            "visible_candidates", ()
+                        )
+                    ],
+                    "route_distance": dict(intent.metadata).get(
+                        "route_distance"
+                    ),
                 }
                 for intent in dynamic_fire_lines
+            ],
+            "screening_contact": [
+                {
+                    "target_id": str(decision.target_id),
+                    "target_visible": decision.target_visible,
+                    "candidate_cells": [
+                        list(cell) for cell in decision.candidate_cells
+                    ],
+                    "contact_ranger_id": (
+                        None
+                        if decision.contact_ranger_id is None
+                        else str(decision.contact_ranger_id)
+                    ),
+                    "fire_support_ranger_id": (
+                        None
+                        if decision.fire_support_ranger_id is None
+                        else str(decision.fire_support_ranger_id)
+                    ),
+                    "visible_before": decision.visible_before,
+                    "visible_after": decision.visible_after,
+                    "reason": decision.reason,
+                    "options": [
+                        {
+                            "ranger_id": str(option.ranger_id),
+                            "role": option.role,
+                            "theoretical_stance": list(option.stance),
+                            "first_direction": (
+                                None
+                                if option.first_direction is None
+                                else option.first_direction.value
+                            ),
+                            "first_position": (
+                                None
+                                if option.first_position is None
+                                else list(option.first_position)
+                            ),
+                            "route_distance": option.route_distance,
+                            "visible_candidates": [
+                                list(cell) for cell in option.visible_candidates
+                            ],
+                            "firing_candidates": [
+                                list(cell) for cell in option.firing_candidates
+                            ],
+                            "risk": option.risk,
+                            "viable": option.viable,
+                            "rejection_reason": option.rejection_reason,
+                        }
+                        for option in decision.options
+                    ],
+                }
+                for decision in sorted(
+                    self.memory.screening_contact_decisions.values(),
+                    key=lambda item: item.target_id.bytes,
+                )
             ],
             "vanguard_intercepts": [
                 {
@@ -707,6 +773,20 @@ class DecisionTraceBuilder:
                         else list(squad.support_target)
                     ),
                     "target_assigned_tick": squad.target_assigned_tick,
+                    "rendezvous": (
+                        None
+                        if (
+                            lease := self.memory.squad_rendezvous_leases.get(
+                                (squad.vanguard_id, squad.ranger_id)
+                            )
+                        ) is None
+                        else {
+                            "cell": list(lease.rendezvous),
+                            "assigned_tick": lease.assigned_tick,
+                            "best_separation": lease.best_separation,
+                            "stalled_ticks": lease.stalled_ticks,
+                        }
+                    ),
                 }
                 for squad in sorted(
                     self.memory.squad_states.values(),
@@ -797,6 +877,20 @@ class DecisionTraceBuilder:
                 else list(evacuation.last_destination)
             ),
             "reason": evacuation.reason,
+            "no_escape_route": evacuation.no_escape_route,
+            "move_candidates": [
+                {
+                    "direction": candidate.direction.value,
+                    "destination": list(candidate.destination),
+                    "forward_exits": candidate.forward_exits,
+                    "local_open": candidate.local_open,
+                    "unknown_frontier": candidate.unknown_frontier,
+                    "service_exits": candidate.service_exits,
+                    "viable": candidate.viable,
+                    "rejection_reason": candidate.rejection_reason,
+                }
+                for candidate in evacuation.candidate_evaluations
+            ],
             "recent_combat_loss_ticks": list(self.memory.recent_combat_loss_ticks),
             "strategic_relocation_pending": self.memory.strategic_relocation_pending,
             "strategic_relocation_safe_ticks": self.memory.strategic_relocation_safe_ticks,

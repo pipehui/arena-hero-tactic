@@ -10,10 +10,12 @@ from .config import TacticConfig
 from .geometry import (
     DIRECTION_ORDER,
     cardinal_neighbors,
+    diamond,
     direction_between,
     manhattan,
     ranger_firing_positions,
     ranger_line_is_clear,
+    vision_is_clear,
 )
 from .models import (
     ActionIntent,
@@ -24,6 +26,9 @@ from .models import (
     HomeCombatAssignment,
     HostileApproachEstimate,
     IntentAction,
+    RangerStanceLease,
+    RangerStanceOption,
+    ScreeningContactDecision,
     ShotPlan,
     ScreeningGroupState,
     UnitMission,
@@ -34,8 +39,14 @@ from .models import (
     WorldModel,
 )
 from .projection import TacticalMap
-from .planning import route_from_field, route_to, weighted_distance_field
-from .rules import UNIT_MAX_HP
+from .planning import (
+    MoveViability,
+    move_viability,
+    route_from_field,
+    route_to,
+    weighted_distance_field,
+)
+from .rules import UNIT_MAX_HP, UNIT_VISION_RADIUS
 from .state import TacticMemory
 
 
@@ -70,6 +81,7 @@ class CombatPlanner:
             self.memory.engaged_enemy_until.clear()
             return
         self._sync_screening_groups(world, projection)
+        self._refresh_ranger_stance_leases(world, projection)
         for enemy in world.enemies:
             if enemy.unit_type not in {UnitType.VANGUARD, UnitType.RANGER}:
                 continue
@@ -84,6 +96,54 @@ class CombatPlanner:
         for key, feedback in tuple(self.memory.vanguard_sweep_feedback.items()):
             if world.tick > feedback.suppressed_until + self.config.ranger_miss_suppress_ticks:
                 self.memory.vanguard_sweep_feedback.pop(key, None)
+
+    def _refresh_ranger_stance_leases(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+    ) -> None:
+        active_targets = set(self.memory.screening_groups)
+        for target_id in tuple(self.memory.screening_contact_decisions):
+            if target_id not in active_targets:
+                self.memory.screening_contact_decisions.pop(target_id, None)
+        for key, lease in tuple(self.memory.ranger_stance_leases.items()):
+            target_id, ranger_id = key
+            ranger = world.friendly(ranger_id)
+            group = self.memory.screening_groups.get(target_id)
+            if (
+                group is None
+                or ranger is None
+                or ranger_id not in group.ranger_ids
+                or ranger.hp * 2 <= UNIT_MAX_HP[UnitType.RANGER]
+            ):
+                self.memory.ranger_stance_leases.pop(key, None)
+                continue
+            blocked = frozenset(
+                (projection.hostile_occupied | projection.service_positions)
+                - {ranger.position, lease.stance}
+            )
+            route = route_to(
+                world,
+                ranger.position,
+                lease.stance,
+                node_limit=self.config.path_node_limit,
+                blocked=blocked,
+            )
+            route_distance = 0 if ranger.position == lease.stance else (
+                self.config.path_node_limit if route is None else route.distance
+            )
+            progressed = route_distance < lease.last_route_distance
+            stalled = (
+                0
+                if route_distance == 0 or progressed
+                else lease.no_progress_ticks + 1
+            )
+            self.memory.ranger_stance_leases[key] = replace(
+                lease,
+                last_position=ranger.position,
+                last_route_distance=route_distance,
+                no_progress_ticks=stalled,
+            )
 
     def _sync_screening_groups(
         self,
@@ -672,11 +732,22 @@ class CombatPlanner:
 
     def _firing_stance_intents(self, world, projection, state):
         assert world.core is not None
+        self.memory.screening_contact_decisions.clear()
         intents: list[ActionIntent] = []
         reserved_stances: set[Position] = set()
         reserved_destinations: set[Position] = set()
         stance_candidates: list[
-            tuple[tuple[int, ...], bytes, EntitySnapshot, Direction, Position, UUID, Position]
+            tuple[
+                tuple[int, ...],
+                bytes,
+                EntitySnapshot,
+                Direction,
+                Position,
+                UUID,
+                Position,
+                RangerStanceOption,
+                MoveViability,
+            ]
         ] = []
         urgent_missions = tuple(
             mission
@@ -688,6 +759,80 @@ class CombatPlanner:
                 < mission.required_hits
             )
         )
+        mission_by_target = {mission.target_id: mission for mission in urgent_missions}
+        screen_target_by_ranger: dict[UUID, UUID] = {}
+        screen_roles: dict[tuple[UUID, UUID], str] = {}
+        rejected_options: defaultdict[UUID, list[RangerStanceOption]] = defaultdict(list)
+        for group in sorted(
+            self.memory.screening_groups.values(),
+            key=lambda item: (item.started_tick, item.target_id.bytes),
+        ):
+            if group.phase == "HOME_HANDOFF":
+                continue
+            target = world.enemy(group.target_id)
+            mission = mission_by_target.get(group.target_id)
+            candidates = () if mission is None else mission.candidate_cells
+            healthy_rangers = tuple(
+                ranger
+                for ranger_id in group.ranger_ids
+                if (ranger := state.ranger_by_id.get(ranger_id)) is not None
+                and ranger.hp * 2 > UNIT_MAX_HP[UnitType.RANGER]
+            )
+            contact = min(
+                healthy_rangers,
+                key=lambda ranger: (
+                    -len(
+                        self._visible_ranger_candidates(
+                            world,
+                            ranger.position,
+                            candidates,
+                        )
+                    ),
+                    manhattan(
+                        ranger.position,
+                        target.position if target is not None else ranger.position,
+                    ),
+                    ranger.id.bytes,
+                ),
+                default=None,
+            )
+            support = next(
+                (
+                    ranger
+                    for ranger in sorted(healthy_rangers, key=lambda item: item.id.bytes)
+                    if contact is None or ranger.id != contact.id
+                ),
+                None,
+            )
+            for ranger in healthy_rangers:
+                screen_target_by_ranger[ranger.id] = group.target_id
+                screen_roles[(group.target_id, ranger.id)] = (
+                    "CONTACT"
+                    if contact is not None and ranger.id == contact.id
+                    else "FIRE_SUPPORT"
+                )
+            visible_before = len(
+                {
+                    cell
+                    for ranger in healthy_rangers
+                    for cell in self._visible_ranger_candidates(
+                        world,
+                        ranger.position,
+                        candidates,
+                    )
+                }
+            )
+            self.memory.screening_contact_decisions[group.target_id] = (
+                ScreeningContactDecision(
+                    target_id=group.target_id,
+                    target_visible=target is not None,
+                    candidate_cells=candidates,
+                    contact_ranger_id=None if contact is None else contact.id,
+                    fire_support_ranger_id=None if support is None else support.id,
+                    visible_before=visible_before,
+                    reason="VISIBLE_CONTACT" if target is not None else "FOG_CONTACT",
+                )
+            )
         for ranger_id in sorted(state.available, key=lambda item: item.bytes):
             ranger = state.ranger_by_id[ranger_id]
             blocked = frozenset(
@@ -705,7 +850,13 @@ class CombatPlanner:
             )
             options: dict[
                 tuple[Direction, Position],
-                tuple[tuple[int, ...], UUID, Position],
+                tuple[
+                    tuple[int, ...],
+                    UUID,
+                    Position,
+                    RangerStanceOption,
+                    MoveViability,
+                ],
             ] = {}
             ranked_missions = sorted(
                 urgent_missions,
@@ -720,6 +871,12 @@ class CombatPlanner:
                 if enemy is None:
                     continue
                 screening = self.memory.screening_groups.get(mission.target_id)
+                assigned_screen_target = screen_target_by_ranger.get(ranger_id)
+                if (
+                    assigned_screen_target is not None
+                    and mission.target_id != assigned_screen_target
+                ):
+                    continue
                 if screening is not None and ranger_id not in screening.ranger_ids:
                     # Home-reserve Rangers may fire from their current cell,
                     # but only the assigned pair may leave the inner defense
@@ -737,7 +894,11 @@ class CombatPlanner:
                         or stance in projection.hostile_occupied
                         or stance in projection.service_positions
                         or manhattan(stance, world.core.position)
-                        > self.config.home_pursuit_radius
+                        > (
+                            self.config.outer_screen_continue_radius
+                            if screening is not None
+                            else self.config.home_pursuit_radius
+                        )
                     ):
                         continue
                     coverage = sum(
@@ -764,27 +925,218 @@ class CombatPlanner:
                     direction = route.first_direction
                     if destination is None:
                         continue
+                    role = screen_roles.get(
+                        (mission.target_id, ranger.id),
+                        "DYNAMIC_FIRE",
+                    )
+                    current_visible = self._visible_ranger_candidates(
+                        world,
+                        ranger.position,
+                        mission.candidate_cells,
+                    )
+                    destination_visible = self._visible_ranger_candidates(
+                        world,
+                        destination,
+                        mission.candidate_cells,
+                    )
+                    firing_candidates = tuple(
+                        mission.candidate_cells[index]
+                        for index in ranked_coverage
+                    )
+                    viability = move_viability(
+                        world,
+                        ranger.position,
+                        destination,
+                        target=stance,
+                        blocked=blocked,
+                        node_limit=min(self.config.path_node_limit, 512),
+                        require_continuation=destination != stance,
+                        terminal_exception=(
+                            "ATTACK" if destination == stance else None
+                        ),
+                    )
+                    if not viability.viable:
+                        rejected_options[mission.target_id].append(
+                            RangerStanceOption(
+                                ranger.id,
+                                mission.target_id,
+                                role,
+                                stance,
+                                direction,
+                                destination,
+                                route.distance,
+                                destination_visible,
+                                firing_candidates,
+                                0,
+                                viable=False,
+                                rejection_reason=(
+                                    viability.rejection_reason
+                                    or "NO_VIABLE_CONTINUATION"
+                                ),
+                            )
+                        )
+                        continue
+                    immediate_attackers = projection.immediate_attackers(destination)
+                    future_attackers = projection.future_attackers(destination)
+                    current_lethal = (
+                        projection.immediate_attackers(ranger.position) >= ranger.hp
+                    )
+                    if immediate_attackers >= ranger.hp and not current_lethal:
+                        rejected_options[mission.target_id].append(
+                            RangerStanceOption(
+                                ranger.id,
+                                mission.target_id,
+                                role,
+                                stance,
+                                direction,
+                                destination,
+                                route.distance,
+                                destination_visible,
+                                firing_candidates,
+                                immediate_attackers * 100 + future_attackers * 10,
+                                viable=False,
+                                rejection_reason="LETHAL_DESTINATION",
+                            )
+                        )
+                        continue
+                    if (
+                        screening is not None
+                        and current_visible
+                        and not destination_visible
+                        and not current_lethal
+                    ):
+                        rejected_options[mission.target_id].append(
+                            RangerStanceOption(
+                                ranger.id,
+                                mission.target_id,
+                                role,
+                                stance,
+                                direction,
+                                destination,
+                                route.distance,
+                                destination_visible,
+                                firing_candidates,
+                                immediate_attackers * 100 + future_attackers * 10,
+                                viable=False,
+                                rejection_reason="CONTACT_LOST",
+                            )
+                        )
+                        continue
+                    weighted_visibility = sum(
+                        len(mission.candidate_cells) - index
+                        for index, cell in enumerate(mission.candidate_cells)
+                        if cell in destination_visible
+                    )
+                    history = self.memory.position_history.get(ranger.id, ())
+                    reverse_window = history[
+                        -(
+                            self.config.outer_screen_reverse_suppress_ticks
+                            + 1
+                        ) : -1
+                    ]
+                    if (
+                        destination in reverse_window
+                        and len(destination_visible) <= len(current_visible)
+                        and not current_lethal
+                    ):
+                        rejected_options[mission.target_id].append(
+                            RangerStanceOption(
+                                ranger.id,
+                                mission.target_id,
+                                role,
+                                stance,
+                                direction,
+                                destination,
+                                route.distance,
+                                destination_visible,
+                                firing_candidates,
+                                immediate_attackers * 100 + future_attackers * 10,
+                                viable=False,
+                                rejection_reason="RECENT_REVERSE_WITHOUT_GAIN",
+                            )
+                        )
+                        continue
+                    lease = self.memory.ranger_stance_leases.get(
+                        (mission.target_id, ranger.id)
+                    )
+                    lease_rank = int(
+                        not (
+                            lease is not None
+                            and world.tick <= lease.expires_tick
+                            and lease.no_progress_ticks
+                            < self.config.outer_screen_no_progress_ticks
+                            and lease.stance == stance
+                            and lease.role == role
+                        )
+                    )
                     score = (
                         mission_rank,
+                        0 if role == "CONTACT" else 1 if role == "FIRE_SUPPORT" else 2,
+                        -len(destination_visible) if screening is not None else 0,
+                        -weighted_visibility if screening is not None else 0,
+                        int(
+                            screening is not None
+                            and enemy.position not in destination_visible
+                        ),
+                        int(
+                            screening is not None
+                            and mission.candidate_cells[0] not in destination_visible
+                        ),
+                        lease_rank,
                         min(ranked_coverage),
                         -coverage,
-                        projection.immediate_attackers(destination),
-                        projection.future_attackers(destination),
+                        immediate_attackers,
+                        future_attackers,
                         route.distance,
                         manhattan(stance, world.core.position),
                         stance[0],
                         stance[1],
                         DIRECTION_ORDER.index(direction),
                     )
+                    stance_option = RangerStanceOption(
+                        ranger_id=ranger.id,
+                        target_id=mission.target_id,
+                        role=role,
+                        stance=stance,
+                        first_direction=direction,
+                        first_position=destination,
+                        route_distance=route.distance,
+                        visible_candidates=destination_visible,
+                        firing_candidates=firing_candidates,
+                        risk=immediate_attackers * 100 + future_attackers * 10,
+                    )
                     key = direction, destination
                     previous = options.get(key)
-                    row = score, mission.target_id, stance
+                    row = (
+                        score,
+                        mission.target_id,
+                        stance,
+                        stance_option,
+                        viability,
+                    )
                     if previous is None or row[0] < previous[0]:
                         options[key] = row
             ranked = sorted(
                 (
-                    (score, direction, destination, target_id, stance)
-                    for (direction, destination), (score, target_id, stance)
+                    (
+                        score,
+                        direction,
+                        destination,
+                        target_id,
+                        stance,
+                        stance_option,
+                        viability,
+                    )
+                    for (
+                        direction,
+                        destination,
+                    ), (
+                        score,
+                        target_id,
+                        stance,
+                        stance_option,
+                        viability,
+                    )
                     in options.items()
                 ),
                 key=lambda row: row[0],
@@ -798,11 +1150,22 @@ class CombatPlanner:
                     destination,
                     target_id,
                     stance,
+                    stance_option,
+                    viability,
                 )
-                for score, direction, destination, target_id, stance in ranked[:6]
+                for (
+                    score,
+                    direction,
+                    destination,
+                    target_id,
+                    stance,
+                    stance_option,
+                    viability,
+                ) in ranked[:6]
             )
 
         assigned_rangers: set[UUID] = set()
+        chosen_options: defaultdict[UUID, list[RangerStanceOption]] = defaultdict(list)
         for (
             score,
             _,
@@ -811,6 +1174,8 @@ class CombatPlanner:
             destination,
             target_id,
             stance,
+            stance_option,
+            viability,
         ) in sorted(stance_candidates, key=lambda row: (row[0], row[1], row[6])):
             if (
                 ranger.id in assigned_rangers
@@ -819,6 +1184,7 @@ class CombatPlanner:
             ):
                 continue
             assigned_rangers.add(ranger.id)
+            chosen_options[target_id].append(stance_option)
             reserved_stances.add(stance)
             reserved_destinations.add(destination)
             intents.append(
@@ -828,20 +1194,316 @@ class CombatPlanner:
                     52,
                     direction,
                     destination,
-                    risk=score[3] * 100 + score[4] * 10,
+                    risk=stance_option.risk,
                     exclusive_destination=True,
                     tie_break=score,
                     reason="ADVANCE_TO_DYNAMIC_FIRE_LINE",
                     metadata=(
                         ("target_id", str(target_id)),
                         ("firing_stance", stance),
-                        ("candidate_coverage", -score[2]),
-                        ("route_distance", score[5]),
+                        ("screening_role", stance_option.role),
+                        ("visible_candidates", stance_option.visible_candidates),
+                        ("candidate_coverage", len(stance_option.firing_candidates)),
+                        ("route_distance", stance_option.route_distance),
                         ("stance_exclusive", True),
-                    ),
+                    ) + viability.metadata,
                 )
             )
+            previous_lease = self.memory.ranger_stance_leases.get(
+                (target_id, ranger.id)
+            )
+            same_lease = bool(
+                previous_lease is not None
+                and previous_lease.stance == stance
+                and previous_lease.role == stance_option.role
+            )
+            self.memory.ranger_stance_leases[(target_id, ranger.id)] = (
+                RangerStanceLease(
+                    target_id=target_id,
+                    ranger_id=ranger.id,
+                    role=stance_option.role,
+                    stance=stance,
+                    assigned_tick=(
+                        previous_lease.assigned_tick
+                        if same_lease and previous_lease is not None
+                        else world.tick
+                    ),
+                    expires_tick=(
+                        previous_lease.expires_tick
+                        if same_lease and previous_lease is not None
+                        else world.tick + self.config.outer_screen_stance_lease_ticks
+                    ),
+                    last_position=ranger.position,
+                    last_route_distance=stance_option.route_distance,
+                    no_progress_ticks=(
+                        previous_lease.no_progress_ticks
+                        if same_lease and previous_lease is not None
+                        else 0
+                    ),
+                    last_direction=direction,
+                )
+            )
+        intents.extend(
+            self._complete_screening_contact_intents(
+                world,
+                projection,
+                state,
+                assigned_rangers,
+                screen_roles,
+            )
+        )
+        for target_id, decision in tuple(
+            self.memory.screening_contact_decisions.items()
+        ):
+            group = self.memory.screening_groups.get(target_id)
+            after_cells: set[Position] = set()
+            if group is not None:
+                chosen_by_ranger = {
+                    option.ranger_id: option
+                    for option in chosen_options.get(target_id, ())
+                }
+                planned_positions = {
+                    intent.actor_id: intent.target_position
+                    for intent in intents
+                    if intent.action is IntentAction.MOVE
+                    and intent.actor_id in group.ranger_ids
+                    and dict(intent.metadata).get("target_id") == str(target_id)
+                    and intent.target_position is not None
+                }
+                for ranger_id in group.ranger_ids:
+                    ranger = state.ranger_by_id.get(ranger_id)
+                    if ranger is None:
+                        continue
+                    option = chosen_by_ranger.get(ranger_id)
+                    position = (
+                        planned_positions.get(ranger_id)
+                        or (
+                            option.first_position
+                            if option is not None
+                            and option.first_position is not None
+                            else ranger.position
+                        )
+                    )
+                    after_cells.update(
+                        self._visible_ranger_candidates(
+                            world,
+                            position,
+                            decision.candidate_cells,
+                        )
+                    )
+            self.memory.screening_contact_decisions[target_id] = replace(
+                decision,
+                options=tuple(
+                    (*chosen_options.get(target_id, ()),
+                     *rejected_options.get(target_id, ())[:24])
+                ),
+                visible_after=len(after_cells),
+            )
         return intents
+
+    @staticmethod
+    def _visible_ranger_candidates(
+        world: WorldModel,
+        position: Position,
+        candidates: tuple[Position, ...],
+    ) -> tuple[Position, ...]:
+        radius = UNIT_VISION_RADIUS[UnitType.RANGER]
+        return tuple(
+            cell
+            for cell in candidates
+            if manhattan(position, cell) <= radius
+            and vision_is_clear(position, cell, world.known_obstacles)
+        )
+
+    def _complete_screening_contact_intents(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        state: _FireAllocation,
+        assigned_rangers: set[UUID],
+        screen_roles: dict[tuple[UUID, UUID], str],
+    ) -> list[ActionIntent]:
+        intents: list[ActionIntent] = []
+        for group in sorted(
+            self.memory.screening_groups.values(),
+            key=lambda item: (item.started_tick, item.target_id.bytes),
+        ):
+            if group.phase == "HOME_HANDOFF":
+                continue
+            target = world.enemy(group.target_id)
+            track = world.track(group.target_id)
+            decision = self.memory.screening_contact_decisions.get(group.target_id)
+            candidates = () if decision is None else decision.candidate_cells
+            for ranger_id in group.ranger_ids:
+                ranger = state.ranger_by_id.get(ranger_id)
+                if (
+                    ranger is None
+                    or ranger.id not in state.available
+                    or ranger.id in assigned_rangers
+                    or ranger.hp * 2 <= UNIT_MAX_HP[UnitType.RANGER]
+                ):
+                    continue
+                role = screen_roles.get((group.target_id, ranger.id), "FIRE_SUPPORT")
+                visible = self._visible_ranger_candidates(
+                    world,
+                    ranger.position,
+                    candidates,
+                )
+                if target is not None and visible:
+                    intents.append(
+                        ActionIntent.simple(
+                            ranger.id,
+                            IntentAction.WAIT,
+                            UnitMission.HOME_DEFENSE,
+                            53,
+                            target_id=group.target_id,
+                            target_position=target.position,
+                            reason="HOLD_CONTACT",
+                            metadata=(
+                                ("target_id", str(group.target_id)),
+                                ("screening_role", role),
+                                ("visible_candidates", visible),
+                            ),
+                        )
+                    )
+                    continue
+                last_position = (
+                    target.position
+                    if target is not None
+                    else None if track is None else track.position
+                )
+                track_fresh = bool(
+                    target is not None
+                    or (
+                        track is not None
+                        and world.tick - track.last_seen_tick
+                        <= self.config.outer_screen_fog_ttl
+                    )
+                )
+                if last_position is not None and track_fresh:
+                    reacquire = self._reacquire_contact_route(
+                        world,
+                        projection,
+                        ranger,
+                        last_position,
+                    )
+                    if reacquire is not None:
+                        direction, destination, goal, route_distance = reacquire
+                        intents.append(
+                            ActionIntent.move(
+                                ranger.id,
+                                UnitMission.HOME_DEFENSE,
+                                52,
+                                direction,
+                                destination,
+                                risk=(
+                                    projection.immediate_attackers(destination) * 100
+                                    + projection.future_attackers(destination) * 10
+                                ),
+                                exclusive_destination=True,
+                                reason="REACQUIRE_CONTACT",
+                                metadata=(
+                                    ("target_id", str(group.target_id)),
+                                    ("screening_role", role),
+                                    ("reacquire_goal", goal),
+                                    ("route_distance", route_distance),
+                                ),
+                            )
+                        )
+                        continue
+                intents.append(
+                    ActionIntent.simple(
+                        ranger.id,
+                        IntentAction.WAIT,
+                        UnitMission.HOME_DEFENSE,
+                        54,
+                        target_id=group.target_id,
+                        target_position=last_position,
+                        reason="CONTACT_REPOSITION_BLOCKED",
+                        metadata=(
+                            ("target_id", str(group.target_id)),
+                            ("screening_role", role),
+                        ),
+                    )
+                )
+        return intents
+
+    def _reacquire_contact_route(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        ranger: EntitySnapshot,
+        last_position: Position,
+    ) -> tuple[Direction, Position, Position, int] | None:
+        blocked = frozenset(
+            (projection.hostile_occupied | projection.service_positions)
+            - {ranger.position}
+        )
+        goals = tuple(
+            sorted(
+                (
+                    cell
+                    for cell in diamond(
+                        last_position,
+                        UNIT_VISION_RADIUS[UnitType.RANGER],
+                    )
+                    if cell not in world.known_obstacles
+                    and cell in world.known_passable
+                    and cell not in blocked
+                    and manhattan(cell, last_position)
+                    <= UNIT_VISION_RADIUS[UnitType.RANGER]
+                    and vision_is_clear(cell, last_position, world.known_obstacles)
+                ),
+                key=lambda cell: (
+                    self.memory.cell_last_visible.get(cell, -1),
+                    manhattan(ranger.position, cell),
+                    cell,
+                ),
+            )
+        )
+        options: list[
+            tuple[int, int, Position, Direction, Position]
+        ] = []
+        for goal in goals[:24]:
+            route = route_to(
+                world,
+                ranger.position,
+                goal,
+                node_limit=self.config.path_node_limit,
+                blocked=blocked,
+            )
+            if route is None or route.first_direction is None or route.first_position is None:
+                continue
+            destination = route.first_position
+            if projection.immediate_attackers(destination) >= ranger.hp:
+                continue
+            viability = move_viability(
+                world,
+                ranger.position,
+                destination,
+                target=goal,
+                blocked=blocked,
+                node_limit=min(self.config.path_node_limit, 512),
+                require_continuation=destination != goal,
+                terminal_exception=(
+                    "REACQUIRE_CONTACT" if destination == goal else None
+                ),
+            )
+            if not viability.viable:
+                continue
+            options.append(
+                (
+                    route.distance,
+                    projection.future_attackers(destination),
+                    goal,
+                    route.first_direction,
+                    destination,
+                )
+            )
+        if not options:
+            return None
+        route_distance, _, goal, direction, destination = min(options)
+        return direction, destination, goal, route_distance
 
     @staticmethod
     def _resolved_fire_missions(state):
@@ -1980,7 +2642,9 @@ class CombatPlanner:
             (world.core.position, *(unit.position for unit in protected_units)),
             key=lambda cell: manhattan(target.position, cell),
         )
-        options: list[tuple[tuple[int, ...], Direction, Position]] = []
+        options: list[
+            tuple[tuple[int, ...], Direction, Position, MoveViability]
+        ] = []
         occupied = projection.occupied_cells
         current_route_block = min(
             manhattan(cell, vanguard.position)
@@ -2056,6 +2720,28 @@ class CombatPlanner:
                 or candidate_coverage > current_coverage
             )
             if improves_intercept:
+                terminal_exception = (
+                    "ATTACK" if candidate_coverage > 0 else None
+                )
+                viability = move_viability(
+                    world,
+                    vanguard.position,
+                    destination,
+                    target=assigned_intercept,
+                    blocked=path_blocks,
+                    node_limit=min(self.config.path_node_limit, 512),
+                    require_continuation=(
+                        terminal_exception is None
+                        and destination != assigned_intercept
+                    ),
+                    require_open_area=(
+                        terminal_exception is None
+                        and destination == assigned_intercept
+                    ),
+                    terminal_exception=terminal_exception,
+                )
+                if not viability.viable:
+                    continue
                 score = (
                     next_path_cost,
                     -candidate_coverage,
@@ -2067,7 +2753,7 @@ class CombatPlanner:
                     self.memory.congestion_counts.get(destination, 0),
                     index,
                 )
-                options.append((score, direction, destination))
+                options.append((score, direction, destination, viability))
         intents = [
             ActionIntent.move(
                 vanguard.id,
@@ -2090,9 +2776,11 @@ class CombatPlanner:
                     ("intercept_path_after", score[0]),
                     ("candidate_coverage_before", current_coverage),
                     ("candidate_coverage_after", -score[1]),
-                ),
+                ) + viability.metadata,
             )
-            for score, direction, destination in sorted(options)[:4]
+            for score, direction, destination, viability in sorted(
+                options, key=lambda row: row[0]
+            )[:4]
         ]
         if options:
             intents.append(

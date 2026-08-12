@@ -5,7 +5,7 @@ from arena_hero import BeaconStatus, CoreState, UnitType
 from .config import TacticConfig
 from .geometry import manhattan, manhattan_ring
 from .models import ActionIntent, IntentAction, UnitMission, WorldModel
-from .planning import weighted_route_to
+from .planning import move_viability, weighted_route_to
 from .projection import TacticalMap
 from .state import TacticMemory
 from .rules import UNIT_MAX_HP
@@ -120,6 +120,18 @@ class BeaconPlanner:
             )
             if route is None or route.first_direction is None:
                 continue
+            viability = move_viability(
+                world,
+                worker.position,
+                route.first_position,
+                target=target,
+                blocked=frozenset(blocked),
+                node_limit=min(self.config.path_node_limit, 512),
+                require_continuation=route.first_position != target,
+                require_open_area=route.first_position == target,
+            )
+            if not viability.viable:
+                continue
             if not self._manual_direction_allowed(
                 worker.id,
                 route.first_direction,
@@ -141,6 +153,7 @@ class BeaconPlanner:
                     risk=remembered,
                     tie_break=(route.distance,),
                     reason="LOCAL_SAFE_BEACON_ACQUIRE",
+                    metadata=viability.metadata,
                 ),
                 ActionIntent.simple(
                     worker.id,
@@ -213,6 +226,18 @@ class BeaconPlanner:
             )
             if route is None or route.first_direction is None:
                 continue
+            viability = move_viability(
+                world,
+                actor.position,
+                route.first_position,
+                target=target,
+                blocked=frozenset(blocked - {target}),
+                node_limit=min(self.config.path_node_limit, 512),
+                require_continuation=route.first_position != target,
+                require_open_area=route.first_position == target,
+            )
+            if not viability.viable:
+                continue
             if not self._manual_direction_allowed(
                 actor.id,
                 route.first_direction,
@@ -243,7 +268,7 @@ class BeaconPlanner:
                     risk=score[0] * 10 + score[1],
                     tie_break=(route.distance,),
                     reason="SECURE_BEACON_NEAR_CORE",
-                    metadata=(("guard_cell", target),),
+                    metadata=(("guard_cell", target),) + viability.metadata,
                 ),
                 ActionIntent.simple(
                     actor.id,
@@ -301,6 +326,19 @@ class BeaconPlanner:
         if route is None or route.first_direction is None:
             self._clear_mission()
             return []
+        viability = move_viability(
+            world,
+            actor.position,
+            route.first_position,
+            target=target,
+            blocked=frozenset(blocked),
+            node_limit=min(self.config.path_node_limit, 512),
+            require_continuation=route.first_position != target,
+            require_open_area=route.first_position == target,
+        )
+        if not viability.viable:
+            self._clear_mission()
+            return []
         if not self._manual_direction_allowed(
             actor.id,
             route.first_direction,
@@ -330,6 +368,7 @@ class BeaconPlanner:
                 risk=remembered,
                 tie_break=(route.distance,),
                 reason="CONTINUE_BEACON_APPROACH",
+                metadata=viability.metadata,
             ),
             ActionIntent.simple(
                 actor.id,

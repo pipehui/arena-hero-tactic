@@ -23,6 +23,8 @@ from arena_tactic import (
     TacticMemory,
     ThreatHeatCell,
     UnitMission,
+    WorkerScoutPhase,
+    WorkerScoutState,
 )
 from arena_tactic.models import MissionState
 from arena_tactic.geometry import manhattan
@@ -33,6 +35,83 @@ from tests.helpers import enemy_core, friendly_core, make_turn, uid, unit
 
 
 class EconomyAndLogisticsTests(unittest.TestCase):
+    def test_remote_scout_does_not_enter_a_known_three_wall_pocket(self) -> None:
+        worker = unit(1, UnitType.WORKER, (0, 0))
+        goal = (0, 40)
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(5, 0),
+            opening_complete=True,
+            known_passable={
+                (0, 0),
+                (0, 1),
+                (-1, 0),
+                (1, 0),
+                (0, -1),
+                goal,
+            },
+            known_obstacles={(-1, 1), (1, 1), (0, 2)},
+            unit_missions={
+                worker.id: MissionState(UnitMission.EXPLORE, goal, 1)
+            },
+            worker_scout_states={
+                worker.id: WorkerScoutState(
+                    worker_id=worker.id,
+                    slot=0,
+                    sector_index=0,
+                    stage=0,
+                    phase=WorkerScoutPhase.SECTOR_SCOUT,
+                    target=goal,
+                    assigned_tick=1,
+                )
+            },
+        )
+        turn = make_turn(
+            tick=2,
+            core=friendly_core(position=(5, 0)),
+            units=(worker,),
+            obstacle_cells=((-1, 1), (1, 1), (0, 2)),
+            resources=0,
+        )
+
+        BalancedTactic(memory=memory).choose_actions(turn)
+
+        action = turn.plan.unit_actions[worker.id]
+        self.assertNotEqual(getattr(action, "direction", None), Direction.DOWN)
+
+    def test_worker_may_enter_a_dead_end_that_contains_its_resource(self) -> None:
+        worker = unit(1, UnitType.WORKER, (0, 0))
+        turn = make_turn(
+            core=friendly_core(position=(5, 0)),
+            units=(worker,),
+            resource_cells=((0, 1),),
+            obstacle_cells=((-1, 1), (1, 1), (0, 2)),
+            resources=0,
+        )
+
+        BalancedTactic().choose_actions(turn)
+
+        action = turn.plan.unit_actions[worker.id]
+        self.assertIsInstance(action, MoveAction)
+        self.assertEqual(action.direction, Direction.DOWN)
+
+    def test_worker_escape_does_not_choose_a_known_dead_end(self) -> None:
+        worker = unit(1, UnitType.WORKER, (0, 0))
+        enemy = unit(100, UnitType.RANGER, (0, -3), controlled=False)
+        turn = make_turn(
+            core=friendly_core(position=(5, 5)),
+            units=(worker,),
+            enemies=(enemy,),
+            obstacle_cells=((-1, 1), (1, 1), (0, 2)),
+            resources=0,
+        )
+
+        BalancedTactic().choose_actions(turn)
+
+        action = turn.plan.unit_actions[worker.id]
+        self.assertNotEqual(getattr(action, "direction", None), Direction.DOWN)
+
+
     def test_emergency_patient_can_enter_core_through_safe_service_exit(self) -> None:
         memory = TacticMemory(
             core_id=uid(10_000),

@@ -11,13 +11,22 @@ from .config import TacticConfig
 from .geometry import (
     DIRECTION_ORDER,
     cardinal_neighbors,
+    count_open_neighbors,
     manhattan,
     manhattan_ring,
     ranger_firing_positions,
     ranger_line_is_clear,
 )
-from .models import ActionIntent, EntitySnapshot, IntentAction, SquadState, UnitMission, WorldModel
-from .planning import path_to, route_to
+from .models import (
+    ActionIntent,
+    EntitySnapshot,
+    IntentAction,
+    SquadRendezvousLease,
+    SquadState,
+    UnitMission,
+    WorldModel,
+)
+from .planning import move_viability, path_to, route_to
 from .projection import TacticalMap
 from .rules import UNIT_MAX_HP
 from .state import TacticMemory
@@ -227,56 +236,10 @@ class DefensePlanner:
                     )
                 )
 
-            firing_cells = tuple(
-                sorted(
-                    {
-                        stance
-                        for candidate in candidates[:3]
-                        for stance in ranger_firing_positions(candidate)
-                        if stance in world.known_passable
-                        and stance not in world.known_obstacles
-                        and stance not in projection.hostile_occupied
-                        and stance not in reserved
-                        and manhattan(stance, world.core.position)
-                        <= self.config.outer_screen_continue_radius
-                        and ranger_line_is_clear(
-                            stance, candidate, world.known_obstacles
-                        )
-                    },
-                    key=lambda cell: (
-                        -sum(
-                            ranger_line_is_clear(
-                                cell, candidate, world.known_obstacles
-                            )
-                            for candidate in candidates
-                        ),
-                        projection.immediate_attackers(cell),
-                        projection.future_attackers(cell),
-                        manhattan(cell, target_position),
-                        cell,
-                    ),
-                )
-            )
-            for ranger in rangers:
-                assert ranger is not None
-                target_cell = next(
-                    (cell for cell in firing_cells if cell not in reserved),
-                    ranger.position,
-                )
-                reserved.add(target_cell)
-                intents.extend(
-                    self._move_or_wait(
-                        world,
-                        projection,
-                        ranger,
-                        target_cell,
-                        frozenset(reserved - {target_cell}),
-                        "OUTER_SCREEN_FIRE_SUPPORT",
-                        mission=UnitMission.HOME_DEFENSE,
-                        move_priority=51,
-                        wait_priority=54,
-                    )
-                )
+            # Ranger attack, contact keeping and firing-line movement are all
+            # owned by CombatPlanner.  Emitting another positioning intent
+            # here used to let a generic zero-risk step override the dynamic
+            # firing line and even walk the last observer out of vision.
         return intents
 
     def _sector_defense(
@@ -752,11 +715,90 @@ class DefensePlanner:
         protected: frozenset[Position],
     ) -> list[ActionIntent]:
         assert world.core is not None
-        # In a peaceful moving formation the Vanguard owns the outer patrol
-        # anchor and the Ranger follows at firing distance.  Pulling the
-        # Vanguard back to an inner stationary Ranger produced a permanent
-        # 4/5-cell reassembly oscillation.  Prefer advancing the Ranger; only
-        # fall back to moving the Vanguard when the Ranger truly has no route.
+        key = (vanguard.id, ranger.id)
+        separation = manhattan(vanguard.position, ranger.position)
+        previous = self.memory.squad_rendezvous_leases.get(key)
+        stalled = 0
+        if previous is not None:
+            progressed = separation < previous.best_separation
+            stalled = 0 if progressed else previous.stalled_ticks + 1
+
+        blocked = frozenset(
+            (protected | projection.hostile_occupied)
+            - {vanguard.position, ranger.position}
+        )
+        between = path_to(
+            world,
+            vanguard.position,
+            ranger.position,
+            node_limit=self.config.path_node_limit,
+            blocked=blocked,
+        )
+        rendezvous = (
+            previous.rendezvous
+            if previous is not None
+            and previous.rendezvous in world.known_passable
+            and previous.rendezvous not in blocked
+            else (
+                between[len(between) // 2]
+                if between
+                else ranger.position
+            )
+        )
+        assigned_tick = (
+            previous.assigned_tick
+            if previous is not None and previous.rendezvous == rendezvous
+            else world.tick
+        )
+        self.memory.squad_rendezvous_leases[key] = SquadRendezvousLease(
+            vanguard_id=vanguard.id,
+            ranger_id=ranger.id,
+            rendezvous=rendezvous,
+            assigned_tick=assigned_tick,
+            best_separation=min(
+                separation,
+                previous.best_separation if previous is not None else separation,
+            ),
+            stalled_ticks=stalled,
+            last_vanguard_position=vanguard.position,
+            last_ranger_position=ranger.position,
+        )
+
+        # Let the outer Vanguard hold while the Ranger is genuinely closing.
+        # If authoritative positions fail to improve for two Ticks, move the
+        # holder toward the mutually reachable midpoint instead of extending
+        # an unbounded PARTNER_HOLD lease.
+        if stalled >= self.config.squad_reassembly_no_progress_ticks:
+            intents = self._move_or_wait(
+                world,
+                projection,
+                vanguard,
+                rendezvous,
+                protected,
+                "SQUAD_REASSEMBLE_RENDEZVOUS",
+            )
+            intents.append(
+                ActionIntent.simple(
+                    ranger.id,
+                    IntentAction.WAIT,
+                    UnitMission.PATROL,
+                    72,
+                    target_position=rendezvous,
+                    reason="SQUAD_REASSEMBLE_RENDEZVOUS_HOLD",
+                    metadata=(
+                        ("stalled_ticks", stalled),
+                        ("rendezvous", rendezvous),
+                    ),
+                )
+            )
+            if stalled >= self.config.squad_reassembly_break_ticks:
+                # The pair identity may be rebuilt on the next Tick.  With
+                # more than one squad this lets nearest healthy partners be
+                # matched again; with one pair the new midpoint still avoids
+                # freezing either member indefinitely.
+                self.memory.squad_states.pop(key, None)
+            return intents
+
         ranger_route = self._route(
             world,
             projection,
@@ -863,6 +905,7 @@ class DefensePlanner:
                 and cell not in world.known_obstacles
                 and cell not in protected
                 and cell not in projection.hostile_occupied
+                and count_open_neighbors(cell, world.known_obstacles) >= 2
             )
 
         primary = [cell for cell in sector if usable(cell)]
@@ -919,6 +962,8 @@ class DefensePlanner:
                 )
             ]
         moves: list[ActionIntent] = []
+        rejected_dead_end = False
+        rejected_no_progress = False
         for index, direction in enumerate(DIRECTION_ORDER):
             dx, dy = direction.delta
             destination = unit.position[0] + dx, unit.position[1] + dy
@@ -928,6 +973,47 @@ class DefensePlanner:
                 or destination in projection.hostile_occupied
                 or destination in protected
             ):
+                continue
+            terminal_exception = self._combat_terminal_exception(
+                world,
+                unit,
+                destination,
+                mission,
+            )
+            viability = move_viability(
+                world,
+                unit.position,
+                destination,
+                target=target,
+                blocked=frozenset(protected | projection.hostile_occupied),
+                node_limit=min(self.config.path_node_limit, 512),
+                require_continuation=(
+                    terminal_exception is None and destination != target
+                ),
+                terminal_exception=terminal_exception,
+            )
+            if not viability.viable:
+                rejected_dead_end = True
+                continue
+            if destination == target:
+                remaining_distance = 0
+            else:
+                remaining = route_to(
+                    world,
+                    destination,
+                    target,
+                    node_limit=min(self.config.path_node_limit, 512),
+                    blocked=frozenset(
+                        (protected | projection.hostile_occupied | {unit.position})
+                        - {destination, target}
+                    ),
+                )
+                remaining_distance = None if remaining is None else remaining.distance
+            if (
+                remaining_distance is None
+                or remaining_distance >= preferred.distance
+            ):
+                rejected_no_progress = True
                 continue
             is_preferred = (
                 preferred.first_direction is direction
@@ -943,10 +1029,15 @@ class DefensePlanner:
                     exclusive_destination=True,
                     tie_break=(
                         0 if is_preferred else 1,
-                        manhattan(destination, target),
+                        remaining_distance,
                         index,
                     ),
                     reason=reason,
+                    metadata=viability.metadata
+                    + (
+                        ("route_distance_before", preferred.distance),
+                        ("route_distance_after", remaining_distance),
+                    ),
                 )
             )
         moves.sort(key=ActionIntent.sort_key)
@@ -957,10 +1048,39 @@ class DefensePlanner:
                 mission,
                 wait_priority,
                 target_position=target,
-                reason=f"{reason}_ROUTE_BLOCKED_THIS_TICK",
+                reason=(
+                    f"{reason}_NO_VIABLE_CONTINUATION"
+                    if rejected_dead_end and not moves
+                    else f"{reason}_ROUTE_BLOCKED_THIS_TICK"
+                ),
+                metadata=(
+                    ("dead_end_rejected", rejected_dead_end),
+                    ("no_progress_rejected", rejected_no_progress),
+                ),
             )
         )
         return moves
+
+    @staticmethod
+    def _combat_terminal_exception(world, unit, destination, mission):
+        if mission not in {UnitMission.ATTACK, UnitMission.HOME_DEFENSE}:
+            return None
+        if unit.unit_type is UnitType.VANGUARD and any(
+            manhattan(destination, enemy.position) == 1
+            for enemy in world.enemies
+        ):
+            return "ATTACK"
+        if unit.unit_type is UnitType.RANGER and any(
+            destination in ranger_firing_positions(enemy.position)
+            and ranger_line_is_clear(
+                destination,
+                enemy.position,
+                world.known_obstacles,
+            )
+            for enemy in world.enemies
+        ):
+            return "ATTACK"
+        return None
 
     def _firing_band(self, world, projection, anchor, protected):
         assert world.core is not None
@@ -973,6 +1093,7 @@ class DefensePlanner:
                     and cell not in world.known_obstacles
                     and cell not in protected
                     and cell not in projection.hostile_occupied
+                    and count_open_neighbors(cell, world.known_obstacles) >= 2
                     and ranger_line_is_clear(cell, anchor, world.known_obstacles)
                 },
                 key=lambda cell: (
@@ -999,6 +1120,13 @@ class DefensePlanner:
         for key, squad in tuple(self.memory.squad_states.items()):
             if squad.vanguard_id not in living or squad.ranger_id not in living:
                 self.memory.squad_states.pop(key, None)
+        active_pairs = {
+            (squad.vanguard_id, squad.ranger_id)
+            for squad in self.memory.squad_states.values()
+        }
+        for key in tuple(self.memory.squad_rendezvous_leases):
+            if key not in active_pairs or not set(key) <= living:
+                self.memory.squad_rendezvous_leases.pop(key, None)
         paired_v = {squad.vanguard_id for squad in self.memory.squad_states.values()}
         paired_r = {squad.ranger_id for squad in self.memory.squad_states.values()}
         vanguards = sorted(

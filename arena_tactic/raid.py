@@ -21,7 +21,7 @@ from .models import (
     UnitMission,
     WorldModel,
 )
-from .planning import route_to
+from .planning import move_viability, route_to
 from .projection import TacticalMap
 from .rules import UNIT_MAX_HP
 from .state import TacticMemory
@@ -793,6 +793,28 @@ class RaidPlanner:
         )
         if route is None or route.first_direction is None:
             return [self._wait(unit, f"{reason}_BLOCKED")]
+        terminal_exception = None
+        if reason in {"RAID_ADVANCE", "RAID_SIEGE_POSITION"}:
+            terminal_exception = "ATTACK" if route.first_position == target else None
+        elif reason == "RAID_RETURN" and route.first_position == target:
+            terminal_exception = "CORE_SERVICE"
+        viability = move_viability(
+            world,
+            unit.position,
+            route.first_position,
+            target=target,
+            blocked=frozenset(blocked),
+            node_limit=min(self.config.path_node_limit, 512),
+            require_continuation=(
+                terminal_exception is None and route.first_position != target
+            ),
+            require_open_area=(
+                terminal_exception is None and route.first_position == target
+            ),
+            terminal_exception=terminal_exception,
+        )
+        if not viability.viable:
+            return [self._wait(unit, f"{reason}_NO_VIABLE_CONTINUATION")]
         immediate, future, remembered = projection.exposure(route.first_position)
         return [
             ActionIntent.move(
@@ -805,6 +827,7 @@ class RaidPlanner:
                 exclusive_destination=True,
                 tie_break=(route.distance,),
                 reason=reason,
+                metadata=viability.metadata,
             ),
             self._wait(unit, f"{reason}_BLOCKED_THIS_TICK"),
         ]

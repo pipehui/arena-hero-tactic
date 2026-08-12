@@ -21,8 +21,10 @@ from .models import (
     WorldModel,
 )
 from .planning import (
+    MoveViability,
     exploration_candidates,
     information_gain,
+    move_viability,
     Route,
     route_from_field,
     sector_scout_candidates,
@@ -683,6 +685,32 @@ class WorkerPlanner:
                     reason="RESOURCE_MANUAL_LEASE_HOLD",
                 )
             ]
+        blocked, _ = self._exploration_navigation(
+            world,
+            projection,
+            worker,
+            service,
+        )
+        route_viability = move_viability(
+            world,
+            worker.position,
+            route.first_position,
+            target=resource,
+            blocked=blocked,
+            node_limit=min(self.config.path_node_limit, 512),
+            require_continuation=route.first_position != resource,
+            terminal_exception=(
+                "RESOURCE" if route.first_position == resource else None
+            ),
+        )
+        if not route_viability.viable:
+            return self._resource_stall_fallback(
+                world,
+                projection,
+                service,
+                worker,
+                resource,
+            )
         intents = [
             ActionIntent.move(
                 worker.id,
@@ -693,14 +721,9 @@ class WorkerPlanner:
                 risk=self._risk(projection, route.first_position),
                 tie_break=(route.distance,),
                 reason="GLOBAL_RESOURCE_MATCH",
+                metadata=route_viability.metadata,
             ),
         ]
-        blocked, _ = self._exploration_navigation(
-            world,
-            projection,
-            worker,
-            service,
-        )
         alternatives = []
         for index, (direction, destination) in enumerate(
             cardinal_neighbors(worker.position)
@@ -714,6 +737,20 @@ class WorkerPlanner:
                 or not self._manual_allowed(worker.id, direction, world.tick)
             ):
                 continue
+            viability = move_viability(
+                world,
+                worker.position,
+                destination,
+                target=resource,
+                blocked=blocked,
+                node_limit=min(self.config.path_node_limit, 512),
+                require_continuation=destination != resource,
+                terminal_exception=(
+                    "RESOURCE" if destination == resource else None
+                ),
+            )
+            if not viability.viable:
+                continue
             score = (
                 projection.immediate_attackers(destination),
                 projection.future_attackers(destination),
@@ -722,7 +759,7 @@ class WorkerPlanner:
                 self.memory.congestion_counts.get(destination, 0),
                 index,
             )
-            alternatives.append((score, direction, destination))
+            alternatives.append((score, direction, destination, viability))
         intents.extend(
             ActionIntent.move(
                 worker.id,
@@ -733,9 +770,11 @@ class WorkerPlanner:
                 risk=score[0] * 100 + score[1] * 10 + score[2],
                 tie_break=score,
                 reason="RESOURCE_SAFE_DETOUR",
-                metadata=(("goal", resource),),
+                metadata=(("goal", resource),) + viability.metadata,
             )
-            for score, direction, destination in sorted(alternatives)[:3]
+            for score, direction, destination, viability in sorted(
+                alternatives, key=lambda row: row[0]
+            )[:3]
         )
         intents.append(
             ActionIntent.simple(
@@ -775,6 +814,16 @@ class WorkerPlanner:
                 or not self._manual_allowed(worker.id, direction, world.tick)
             ):
                 continue
+            viability = move_viability(
+                world,
+                worker.position,
+                destination,
+                blocked=blocked,
+                node_limit=min(self.config.path_node_limit, 256),
+                require_open_area=True,
+            )
+            if not viability.viable:
+                continue
             gain = information_gain(
                 destination,
                 tick=world.tick,
@@ -787,7 +836,7 @@ class WorkerPlanner:
                 self.memory.congestion_counts.get(destination, 0),
                 index,
             )
-            rows.append((score, direction, destination, gain))
+            rows.append((score, direction, destination, gain, viability))
         intents = [
             ActionIntent.move(
                 worker.id,
@@ -798,9 +847,15 @@ class WorkerPlanner:
                 risk=score[0] * 10 + score[1],
                 tie_break=score,
                 reason="RESOURCE_STALL_SCOUT_FALLBACK",
-                metadata=(("released_target", old_target), ("information_gain", gain)),
+                metadata=(
+                    ("released_target", old_target),
+                    ("information_gain", gain),
+                )
+                + viability.metadata,
             )
-            for score, direction, destination, gain in sorted(rows)[:3]
+            for score, direction, destination, gain, viability in sorted(
+                rows, key=lambda row: row[0]
+            )[:3]
         ]
         intents.append(
             ActionIntent.simple(
@@ -845,7 +900,8 @@ class WorkerPlanner:
                 risk=self._risk(projection, route.first_position),
                 tie_break=(-gain, route.distance),
                 reason="INFORMATION_GAIN",
-                metadata=(("information_gain", gain), ("goal", target)),
+                metadata=(("information_gain", gain), ("goal", target))
+                + (() if route.viability is None else route.viability.metadata),
             ),
         ]
         blocked, _ = self._exploration_navigation(
@@ -859,6 +915,10 @@ class WorkerPlanner:
         if len(history) >= 2:
             previous = history[-2]
         alternatives = []
+        require_continuation = (
+            manhattan(worker.position, target)
+            <= self.config.exploration_search_radius
+        )
         for index, (direction, destination) in enumerate(
             cardinal_neighbors(worker.position)
         ):
@@ -871,6 +931,18 @@ class WorkerPlanner:
                 or projection.immediate_attackers(destination) >= worker.hp
             ):
                 continue
+            viability = move_viability(
+                world,
+                worker.position,
+                destination,
+                target=target,
+                blocked=blocked,
+                node_limit=min(self.config.path_node_limit, 512),
+                require_continuation=require_continuation,
+                require_open_area=not require_continuation,
+            )
+            if not viability.viable:
+                continue
             immediate, future, remembered = projection.worker_exposure(destination)
             score = (
                 immediate,
@@ -881,7 +953,7 @@ class WorkerPlanner:
                 self.memory.congestion_counts.get(destination, 0),
                 index,
             )
-            alternatives.append((score, direction, destination))
+            alternatives.append((score, direction, destination, viability))
         intents.extend(
             ActionIntent.move(
                 worker.id,
@@ -892,9 +964,12 @@ class WorkerPlanner:
                 risk=score[0] * 100 + score[1] * 10 + score[2],
                 tie_break=score,
                 reason="EXPLORATION_ALTERNATE_STEP",
-                metadata=(("information_gain", gain), ("goal", target)),
+                metadata=(("information_gain", gain), ("goal", target))
+                + viability.metadata,
             )
-            for score, direction, destination in sorted(alternatives)[:3]
+            for score, direction, destination, viability in sorted(
+                alternatives, key=lambda row: row[0]
+            )[:3]
         )
         intents.append(
             ActionIntent.simple(
@@ -1048,6 +1123,21 @@ class WorkerPlanner:
                 worker.hp,
                 origin=worker.position,
             )
+            retreat_target = world.core.destination or world.core.position
+            viability = move_viability(
+                world,
+                worker.position,
+                destination,
+                target=retreat_target,
+                blocked=projection.hostile_occupied,
+                node_limit=min(self.config.path_node_limit, 256),
+                require_open_area=True,
+                terminal_exception=(
+                    "CORE_SERVICE" if destination == retreat_target else None
+                ),
+            )
+            if not viability.viable or horizon == 0:
+                continue
             recent = self._recent_threat(projection, destination, state.threat_ids)
             heat = projection.worker_exposure(destination)[2]
             minimum, total = self._enemy_distances(
@@ -1066,7 +1156,7 @@ class WorkerPlanner:
                 int(destination == previous),
                 index,
             )
-            rows.append((score, direction, destination))
+            rows.append((score, direction, destination, viability))
         # A fresh threat lease must produce spatial progress.  Merely making
         # the previous cell look slightly cooler caused the live A-B-A-B
         # oscillation: every fogged Tick undid the preceding escape step.  A
@@ -1121,9 +1211,11 @@ class WorkerPlanner:
                     ("escape_phase", state.phase),
                     ("safe_horizon", -score[0]),
                     ("first_step_heat", score[5]),
-                ),
+                ) + viability.metadata,
             )
-            for score, direction, destination in sorted(rows)
+            for score, direction, destination, viability in sorted(
+                rows, key=lambda row: row[0]
+            )
         ]
         intents.append(
             ActionIntent.simple(
@@ -1226,6 +1318,25 @@ class WorkerPlanner:
                 allow_directional_fallback=True,
             )
             if route is not None and route.first_direction is not None:
+                viability = move_viability(
+                    world,
+                    worker.position,
+                    route.first_position,
+                    target=service.exit_cell,
+                    node_limit=min(self.config.path_node_limit, 256),
+                    require_open_area=True,
+                )
+                if not viability.viable:
+                    return [
+                        ActionIntent.simple(
+                            worker.id,
+                            IntentAction.WAIT,
+                            UnitMission.RETURN_CARGO,
+                            50,
+                            reason="NO_VIABLE_CONTINUATION",
+                            metadata=viability.metadata,
+                        )
+                    ]
                 return [
                     ActionIntent.move(
                         worker.id,
@@ -1234,7 +1345,8 @@ class WorkerPlanner:
                         route.first_direction,
                         route.first_position,
                         reason="CORE_FULL_RELEASE_SLOT",
-                        metadata=(("allow_protected", True),),
+                        metadata=(("allow_protected", True),)
+                        + viability.metadata,
                     )
                 ]
         if reservation is None or reservation.status == "UNROUTABLE":
@@ -1276,6 +1388,36 @@ class WorkerPlanner:
                 )
             ]
         if reservation.first_direction is not None and reservation.first_position is not None:
+            route_target = reservation.route_target or world.core.position
+            terminal_exception = (
+                "CORE_SERVICE"
+                if reservation.first_position == world.core.position
+                else None
+            )
+            viability = move_viability(
+                world,
+                worker.position,
+                reservation.first_position,
+                target=route_target,
+                node_limit=min(self.config.path_node_limit, 512),
+                require_continuation=(
+                    terminal_exception is None
+                    and reservation.first_position != route_target
+                ),
+                require_open_area=terminal_exception is None,
+                terminal_exception=terminal_exception,
+            )
+            if not viability.viable:
+                return [
+                    ActionIntent.simple(
+                        worker.id,
+                        IntentAction.WAIT,
+                        UnitMission.RETURN_CARGO,
+                        49 if service.admission_id == worker.id else 51,
+                        reason="NO_RETURN_ROUTE",
+                        metadata=viability.metadata,
+                    )
+                ]
             ready = worker.id in service.ready_depositors
             priority = 49 if service.admission_id == worker.id else (50 if ready else 51)
             reason = "SERVICE_ADMISSION" if reservation.first_position == world.core.position else (
@@ -1306,7 +1448,7 @@ class WorkerPlanner:
                         ),
                         ("scheduled_deposit_tick", reservation.scheduled_deposit_tick),
                         ("departure_tick", reservation.departure_tick),
-                    ),
+                    ) + viability.metadata,
                 ),
                 ActionIntent.simple(
                     worker.id,
@@ -1349,6 +1491,20 @@ class WorkerPlanner:
                 continue
             if destination in protected and destination != preferred:
                 continue
+            viability = move_viability(
+                world,
+                unit.position,
+                destination,
+                target=scout_target,
+                blocked=frozenset(protected - {destination}),
+                node_limit=min(self.config.path_node_limit, 256),
+                require_continuation=(
+                    scout_target is not None and destination != scout_target
+                ),
+                require_open_area=scout_target is None,
+            )
+            if not viability.viable:
+                continue
             score = (
                 projection.immediate_attackers(destination),
                 projection.future_attackers(destination),
@@ -1357,7 +1513,7 @@ class WorkerPlanner:
                 occupied.get(destination, 0),
                 index,
             )
-            candidates.append((score, direction, destination))
+            candidates.append((score, direction, destination, viability))
         intents = [
             ActionIntent.move(
                 unit.id,
@@ -1385,9 +1541,11 @@ class WorkerPlanner:
                         occupied.get(destination, 0) == 1,
                     ),
                     ("scout_target", scout_target),
-                ),
+                ) + viability.metadata,
             )
-            for score, direction, destination in sorted(candidates)
+            for score, direction, destination, viability in sorted(
+                candidates, key=lambda row: row[0]
+            )
         ]
         intents.append(
             ActionIntent.simple(
@@ -1420,6 +1578,16 @@ class WorkerPlanner:
                 or destination in projection.hostile_occupied
             ):
                 continue
+            viability = move_viability(
+                world,
+                unit.position,
+                destination,
+                blocked=frozenset(protected),
+                node_limit=min(self.config.path_node_limit, 256),
+                require_open_area=True,
+            )
+            if not viability.viable:
+                continue
             score = (
                 projection.immediate_attackers(destination),
                 projection.future_attackers(destination),
@@ -1429,7 +1597,7 @@ class WorkerPlanner:
                 -manhattan(destination, world.core.position),
                 index,
             )
-            rows.append((score, direction, destination))
+            rows.append((score, direction, destination, viability))
         intents = [
             ActionIntent.move(
                 unit.id,
@@ -1451,9 +1619,11 @@ class WorkerPlanner:
                         "allow_service_overlap",
                         occupied.get(destination, 0) == 1,
                     ),
-                ),
+                ) + viability.metadata,
             )
-            for score, direction, destination in sorted(rows)
+            for score, direction, destination, viability in sorted(
+                rows, key=lambda row: row[0]
+            )
         ]
         intents.append(
             ActionIntent.simple(
@@ -1497,6 +1667,16 @@ class WorkerPlanner:
                 or projection.immediate_attackers(destination) >= unit.hp
             ):
                 continue
+            viability = move_viability(
+                world,
+                unit.position,
+                destination,
+                blocked=frozenset(leased | infrastructure),
+                node_limit=min(self.config.path_node_limit, 256),
+                require_open_area=True,
+            )
+            if not viability.viable:
+                continue
             score = (
                 projection.future_attackers(destination),
                 projection.worker_exposure(destination)[2],
@@ -1504,7 +1684,7 @@ class WorkerPlanner:
                 -manhattan(destination, world.core.position),
                 index,
             )
-            rows.append((score, direction, destination))
+            rows.append((score, direction, destination, viability))
         intents = [
             ActionIntent.move(
                 unit.id,
@@ -1519,9 +1699,11 @@ class WorkerPlanner:
                 metadata=(
                     ("allow_protected", False),
                     ("allow_head_on_swap", True),
-                ),
+                ) + viability.metadata,
             )
-            for score, direction, destination in sorted(rows)
+            for score, direction, destination, viability in sorted(
+                rows, key=lambda row: row[0]
+            )
         ]
         intents.append(
             ActionIntent.simple(
@@ -1576,6 +1758,20 @@ class WorkerPlanner:
                 extra_blocked=frozenset(protected - {assigned_overflow}),
             )
             if overflow_route is not None and overflow_route.first_direction is not None:
+                viability = move_viability(
+                    world,
+                    worker.position,
+                    overflow_route.first_position,
+                    target=assigned_overflow,
+                    blocked=frozenset(protected - {assigned_overflow}),
+                    node_limit=min(self.config.path_node_limit, 512),
+                    require_continuation=(
+                        overflow_route.first_position != assigned_overflow
+                    ),
+                )
+                if not viability.viable:
+                    overflow_route = None
+            if overflow_route is not None and overflow_route.first_direction is not None:
                 return [
                     ActionIntent.move(
                         worker.id,
@@ -1590,7 +1786,7 @@ class WorkerPlanner:
                         metadata=(
                             ("overflow_slot", assigned_overflow),
                             ("scheduled_deposit_tick", scheduled_tick),
-                        ),
+                        ) + viability.metadata,
                     ),
                     ActionIntent.simple(
                         worker.id,
@@ -1642,6 +1838,26 @@ class WorkerPlanner:
                 or projection.immediate_attackers(destination) >= worker.hp
             ):
                 continue
+            stage_target = (
+                service.queue_cells[-1]
+                if service.queue_cells
+                else world.core.position
+            )
+            viability = move_viability(
+                world,
+                worker.position,
+                destination,
+                target=stage_target,
+                blocked=frozenset(protected - {stage_target}),
+                node_limit=min(self.config.path_node_limit, 512),
+                require_continuation=returning_to_stage,
+                require_open_area=not returning_to_stage,
+                terminal_exception=(
+                    "CORE_SERVICE" if destination == world.core.position else None
+                ),
+            )
+            if not viability.viable:
+                continue
             destination_distance = manhattan(destination, world.core.position)
             score = (
                 projection.future_attackers(destination),
@@ -1664,7 +1880,7 @@ class WorkerPlanner:
                 ),
                 index,
             )
-            rows.append((score, direction, destination))
+            rows.append((score, direction, destination, viability))
         intents = [
             ActionIntent.move(
                 worker.id,
@@ -1679,9 +1895,11 @@ class WorkerPlanner:
                     if returning_to_stage
                     else "CLEAR_SERVICE_APPROACH"
                 ),
-                metadata=(("allow_protected", False),),
+                metadata=(("allow_protected", False),) + viability.metadata,
             )
-            for score, direction, destination in sorted(rows)
+            for score, direction, destination, viability in sorted(
+                rows, key=lambda row: row[0]
+            )
         ]
         intents.append(
             ActionIntent.simple(
@@ -2188,6 +2406,16 @@ class WorkerPlanner:
             immediate, future, remembered = projection.worker_exposure(destination)
             if immediate >= worker.hp:
                 continue
+            viability = move_viability(
+                world,
+                worker.position,
+                destination,
+                blocked=blocked,
+                node_limit=min(self.config.path_node_limit, 256),
+                require_open_area=True,
+            )
+            if not viability.viable:
+                continue
             gain = information_gain(
                 destination,
                 tick=world.tick,
@@ -2204,10 +2432,10 @@ class WorkerPlanner:
                 self.memory.visit_counts.get(destination, 0),
                 index,
             )
-            options.append((score, direction, destination))
+            options.append((score, direction, destination, viability))
         if not options:
             return None
-        _, direction, target = min(options)
+        _, direction, target, viability = min(options, key=lambda row: row[0])
         return (
             replace(
                 state,
@@ -2219,7 +2447,7 @@ class WorkerPlanner:
                 backoff_until=0,
                 reachable_candidates=len(options),
             ),
-            Route(1, direction, target),
+            Route(1, direction, target, viability),
         )
 
     def _exploration_wait_reason(self, world, projection, worker, service):
@@ -2244,6 +2472,22 @@ class WorkerPlanner:
             return "ALL_SCOUT_TARGETS_BLOCKED"
         if all(projection.immediate_attackers(cell) >= worker.hp for cell in terrain_legal):
             return "NO_SURVIVABLE_MOVE"
+        if all(
+            not move_viability(
+                world,
+                worker.position,
+                cell,
+                blocked=frozenset(
+                    set(projection.hostile_occupied)
+                    | protected
+                    | set(projection.immediate_damage)
+                ),
+                node_limit=min(self.config.path_node_limit, 256),
+                require_open_area=True,
+            ).viable
+            for cell in terrain_legal
+        ):
+            return "NO_VIABLE_CONTINUATION"
         return "NO_REACHABLE_FRONTIER"
 
     def _home_alert(self, world: WorldModel, projection: TacticalMap) -> bool:
@@ -2267,7 +2511,9 @@ class WorkerPlanner:
     ) -> Route | None:
         if worker.position == target:
             return Route(0, None, None)
-        options: list[tuple[tuple[int, ...], Direction, Position]] = []
+        options: list[
+            tuple[tuple[int, ...], Direction, Position, MoveViability]
+        ] = []
         for index, (direction, destination) in enumerate(
             cardinal_neighbors(worker.position)
         ):
@@ -2279,6 +2525,17 @@ class WorkerPlanner:
                     and destination != target
                 )
             ):
+                continue
+            viability = move_viability(
+                world,
+                worker.position,
+                destination,
+                target=target,
+                blocked=blocked,
+                node_limit=min(self.config.path_node_limit, 256),
+                require_open_area=True,
+            )
+            if not viability.viable:
                 continue
             immediate, future, remembered = projection.worker_exposure(destination)
             options.append(
@@ -2293,15 +2550,19 @@ class WorkerPlanner:
                     ),
                     direction,
                     destination,
+                    viability,
                 )
             )
         if not options:
             return None
-        _, direction, destination = min(options)
+        _, direction, destination, viability = min(
+            options, key=lambda row: row[0]
+        )
         return Route(
             manhattan(worker.position, target),
             direction,
             destination,
+            viability,
         )
 
     def _exploration_navigation(self, world, projection, actor, service):

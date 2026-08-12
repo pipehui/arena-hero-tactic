@@ -15,7 +15,10 @@ from .models import (
     MoveAttempt,
     MoveFailure,
     PatientAdmissionProgress,
+    RangerStanceLease,
+    ScreeningContactDecision,
     WorkerTaskProgress,
+    SquadRendezvousLease,
     SquadState,
     WorkerEscapeState,
     WorkerPatrolMode,
@@ -128,7 +131,16 @@ class TacticMemory:
     recent_home_threat_position: Position | None = None
 
     squad_states: dict[tuple[UUID, UUID], SquadState] = field(default_factory=dict)
+    squad_rendezvous_leases: dict[tuple[UUID, UUID], SquadRendezvousLease] = field(
+        default_factory=dict
+    )
     screening_groups: dict[UUID, ScreeningGroupState] = field(default_factory=dict)
+    screening_contact_decisions: dict[UUID, ScreeningContactDecision] = field(
+        default_factory=dict
+    )
+    ranger_stance_leases: dict[tuple[UUID, UUID], RangerStanceLease] = field(
+        default_factory=dict
+    )
     defense_sector_anchors: dict[str, tuple[Position, int]] = field(
         default_factory=dict
     )
@@ -208,7 +220,10 @@ class TacticMemory:
         self.strategic_relocation_goal = None
         self.recent_home_threat_position = None
         self.squad_states.clear()
+        self.squad_rendezvous_leases.clear()
         self.screening_groups.clear()
+        self.screening_contact_decisions.clear()
+        self.ranger_stance_leases.clear()
         self.defense_sector_anchors.clear()
         self.raid_target_id = None
         self.raid_last_seen_tick = None

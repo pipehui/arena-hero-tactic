@@ -3,7 +3,7 @@ from __future__ import annotations
 from arena_hero import CoreState, Position, UnitType
 
 from .config import TacticConfig
-from .geometry import cardinal_neighbors, manhattan, manhattan_ring
+from .geometry import cardinal_neighbors, count_open_neighbors, manhattan, manhattan_ring
 from .models import (
     ActionIntent,
     CoreServiceQueue,
@@ -13,7 +13,7 @@ from .models import (
     UnitMission,
     WorldModel,
 )
-from .planning import weighted_route_to
+from .planning import move_viability, weighted_route_to
 from .projection import TacticalMap
 from .rules import UNIT_MAX_HP
 from .service import service_protected_positions
@@ -96,6 +96,17 @@ class RecoveryPlanner:
                         or projection.immediate_attackers(destination) >= unit.hp
                     ):
                         continue
+                    viability = move_viability(
+                        world,
+                        unit.position,
+                        destination,
+                        target=service.exit_cell,
+                        blocked=frozenset(protected - {unit.position, destination}),
+                        node_limit=min(self.config.path_node_limit, 256),
+                        require_open_area=True,
+                    )
+                    if not viability.viable:
+                        continue
                     egress_rows.append(
                         (
                             (
@@ -106,9 +117,12 @@ class RecoveryPlanner:
                             ),
                             direction,
                             destination,
+                            viability,
                         )
                     )
-                for score, direction, destination in sorted(egress_rows):
+                for score, direction, destination, viability in sorted(
+                    egress_rows, key=lambda row: row[0]
+                ):
                     intents.append(
                         ActionIntent.move(
                             unit.id,
@@ -124,7 +138,7 @@ class RecoveryPlanner:
                                 ("allow_protected", True),
                                 ("allow_head_on_swap", True),
                                 ("service_tick", service_job.service_tick),
-                            ),
+                            ) + viability.metadata,
                         )
                     )
                 if egress_rows:
@@ -370,14 +384,32 @@ class RecoveryPlanner:
                 immediate = projection.immediate_attackers(destination)
                 if immediate >= unit.hp or immediate >= current:
                     continue
+                viability = move_viability(
+                    world,
+                    unit.position,
+                    destination,
+                    target=world.core.position,
+                    blocked=projection.hostile_occupied,
+                    node_limit=min(self.config.path_node_limit, 256),
+                    require_open_area=True,
+                    terminal_exception=(
+                        "CORE_SERVICE"
+                        if destination == world.core.position
+                        else None
+                    ),
+                )
+                if not viability.viable:
+                    continue
                 score = (
                     immediate,
                     projection.future_attackers(destination),
                     manhattan(destination, world.core.position),
                     index,
                 )
-                rows.append((score, direction, destination))
-            for score, direction, destination in sorted(rows):
+                rows.append((score, direction, destination, viability))
+            for score, direction, destination, viability in sorted(
+                rows, key=lambda row: row[0]
+            ):
                 intents.append(
                     ActionIntent.move(
                         unit.id,
@@ -389,7 +421,7 @@ class RecoveryPlanner:
                         exclusive_destination=True,
                         tie_break=score,
                         reason="LETHAL_EXPOSURE_WITHDRAWAL",
-                        metadata=(("allow_protected", True),),
+                        metadata=(("allow_protected", True),) + viability.metadata,
                     )
                 )
         return intents
@@ -417,6 +449,7 @@ class RecoveryPlanner:
                     or cell in reserved
                     or projection.immediate_attackers(cell) >= unit.hp
                     or projection.future_attackers(cell) >= unit.hp
+                    or count_open_neighbors(cell, world.known_obstacles) < 2
                 ):
                     continue
                 score = (

@@ -16,12 +16,180 @@ from arena_hero import (
     WaitAction,
 )
 
-from arena_tactic import BalancedTactic, TacticMemory
+from arena_tactic import (
+    ActionIntent,
+    BalancedTactic,
+    IntentResolver,
+    ScreeningGroupState,
+    TacticMemory,
+    UnitMission,
+    build_tactical_map,
+)
 from arena_tactic.geometry import manhattan_ring, ranger_firing_positions, ranger_line_is_clear
+from arena_tactic.world import build_world_model
 from tests.helpers import enemy_core, friendly_core, make_turn, uid, unit
 
 
 class CombatDefenseTests(unittest.TestCase):
+    def test_outer_screen_ranger_does_not_take_the_zero_risk_contact_losing_step(self) -> None:
+        core = friendly_core(position=(405, -156))
+        vanguards = (
+            unit(1, UnitType.VANGUARD, (400, -146)),
+            unit(2, UnitType.VANGUARD, (402, -146)),
+        )
+        rangers = (
+            unit(3, UnitType.RANGER, (401, -147)),
+            unit(4, UnitType.RANGER, (404, -142)),
+        )
+        enemy = unit(100, UnitType.RANGER, (400, -143), controlled=False)
+        memory = TacticMemory(
+            opening_complete=True,
+            core_id=core.id,
+            core_position=core.position,
+        )
+        memory.screening_groups[enemy.id] = ScreeningGroupState(
+            target_id=enemy.id,
+            vanguard_ids=(vanguards[0].id, vanguards[1].id),
+            ranger_ids=(rangers[0].id, rangers[1].id),
+            started_tick=1,
+            last_seen_tick=1,
+            last_distance=18,
+        )
+        tactic = BalancedTactic(memory=memory)
+        turn = make_turn(
+            tick=2,
+            core=core,
+            units=(*vanguards, *rangers),
+            enemies=(enemy,),
+            obstacle_cells=(
+                (400, -145),
+                (402, -145),
+                (402, -138),
+                (404, -138),
+                (405, -139),
+                (406, -143),
+                (406, -142),
+                (407, -140),
+                (412, -141),
+                (412, -139),
+                (414, -140),
+            ),
+            resources=0,
+        )
+
+        tactic.choose_actions(turn)
+
+        action = turn.plan.unit_actions[rangers[1].id]
+        task = next(
+            item
+            for item in tactic.last_decision_trace["tasks"]
+            if item["actor_id"] == str(rangers[1].id)
+        )
+        self.assertFalse(
+            isinstance(action, MoveAction) and action.direction is Direction.RIGHT,
+            "the zero-risk move leaves the target-facing side of the screen",
+        )
+        self.assertIsInstance(action, MoveAction)
+        self.assertEqual(action.direction, Direction.LEFT)
+        self.assertNotEqual(task["reason"], "OUTER_SCREEN_FIRE_SUPPORT")
+        contact = tactic.last_decision_trace["combat"]["screening_contact"][0]
+        self.assertGreaterEqual(contact["visible_after"], contact["visible_before"])
+        self.assertEqual(
+            contact["options"][0]["first_position"],
+            [403, -142],
+        )
+
+        advanced_rangers = (
+            rangers[0],
+            unit(4, UnitType.RANGER, (403, -142)),
+        )
+        follow_up = make_turn(
+            tick=3,
+            core=core,
+            units=(*vanguards, *advanced_rangers),
+            enemies=(enemy,),
+            obstacle_cells=(
+                (400, -145),
+                (402, -145),
+                (402, -138),
+                (404, -138),
+                (405, -139),
+                (406, -143),
+                (406, -142),
+                (407, -140),
+                (412, -141),
+                (412, -139),
+                (414, -140),
+            ),
+            resources=0,
+        )
+        tactic.choose_actions(follow_up)
+        follow_up_action = follow_up.plan.unit_actions[advanced_rangers[1].id]
+        self.assertFalse(
+            isinstance(follow_up_action, MoveAction)
+            and follow_up_action.direction is Direction.RIGHT,
+            "the contact lease must not immediately reverse a useful advance",
+        )
+
+    def test_stalled_reassembly_moves_the_holder_after_two_ticks(self) -> None:
+        vanguard = unit(1, UnitType.VANGUARD, (5, 0))
+        ranger = unit(2, UnitType.RANGER, (0, 1))
+        tactic = BalancedTactic()
+
+        for tick in range(1, 4):
+            turn = make_turn(
+                tick=tick,
+                units=(vanguard, ranger),
+                resources=0,
+            )
+            tactic.choose_actions(turn)
+
+        vanguard_task = next(
+            item
+            for item in tactic.last_decision_trace["tasks"]
+            if item["actor_id"] == str(vanguard.id)
+        )
+        self.assertIsInstance(turn.plan.unit_actions[vanguard.id], MoveAction)
+        self.assertEqual(vanguard_task["reason"], "SQUAD_REASSEMBLE_RENDEZVOUS")
+
+    def test_ranger_support_conflict_does_not_fall_back_into_a_dead_end(self) -> None:
+        ranger = unit(1, UnitType.RANGER, (0, 0))
+        blocker = unit(2, UnitType.VANGUARD, (-1, -1))
+        memory = TacticMemory(opening_complete=True)
+        turn = make_turn(
+            core=friendly_core(position=(5, 5)),
+            units=(ranger, blocker),
+            obstacle_cells=((-1, 1), (1, 1), (0, 2)),
+            resources=0,
+        )
+        tactic = BalancedTactic(memory=memory)
+        world = build_world_model(turn, memory, tactic.config)
+        projection = build_tactical_map(world, tactic.config)
+        support = tactic._kernel.defense._move_or_wait(
+            world,
+            projection,
+            world.friendly(ranger.id),
+            (-2, 0),
+            frozenset({(0, -1), (1, 0)}),
+            "RANGER_SUPPORT",
+        )
+        claim = ActionIntent.move(
+            blocker.id,
+            UnitMission.PATROL,
+            1,
+            Direction.DOWN,
+            (-1, 0),
+            exclusive_destination=True,
+            reason="TEST_RESERVATION",
+        )
+
+        resolution = IntentResolver().resolve(world, [claim, *support])
+
+        selected = resolution.for_actor(ranger.id)
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.action.value, "WAIT")
+        self.assertNotEqual(selected.direction, Direction.DOWN)
+
     def test_home_vanguards_receive_unique_intercept_cells(self) -> None:
         vanguards = (
             unit(1, UnitType.VANGUARD, (-2, -2)),
@@ -492,6 +660,10 @@ class CombatDefenseTests(unittest.TestCase):
                     "LETHAL_FIRE_PACKAGE",
                     "URGENT_REMAINDER",
                     "URGENT_CROSS_COVERAGE",
+                    "ADVANCE_TO_DYNAMIC_FIRE_LINE",
+                    "HOLD_CONTACT",
+                    "REACQUIRE_CONTACT",
+                    "CONTACT_REPOSITION_BLOCKED",
                 }
                 for task in group_tasks
             )

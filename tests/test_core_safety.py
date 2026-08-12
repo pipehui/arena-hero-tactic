@@ -22,6 +22,105 @@ from tests.helpers import friendly_core, make_turn, uid, unit
 
 
 class CoreSafetyTests(unittest.TestCase):
+    def test_core_evacuation_rejects_a_three_wall_pocket(self) -> None:
+        enemies = tuple(
+            unit(100 + index, UnitType.RANGER, (0, 3 + index), controlled=False)
+            for index in range(4)
+        )
+        turn = make_turn(
+            enemies=enemies,
+            obstacle_cells=((-1, -1), (1, -1), (0, -2)),
+            resources=20,
+        )
+
+        BalancedTactic().choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.core_action, StartMoveAction)
+        self.assertNotEqual(turn.plan.core_action.direction, Direction.UP)
+
+    def test_moving_core_cancels_a_newly_revealed_dead_end_destination(self) -> None:
+        core = friendly_core(moving=True, direction=Direction.RIGHT)
+        turn = make_turn(
+            core=core,
+            obstacle_cells=((1, -1), (1, 1), (2, 0)),
+            resources=0,
+        )
+
+        BalancedTactic().choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.core_action, CancelMoveAction)
+
+    def test_core_may_pass_a_narrow_cell_that_opens_within_two_steps(self) -> None:
+        enemies = tuple(
+            unit(100 + index, UnitType.RANGER, (0, 3 + index), controlled=False)
+            for index in range(4)
+        )
+        turn = make_turn(
+            enemies=enemies,
+            obstacle_cells=((-1, 0), (1, 0), (-1, -1), (1, -1)),
+            resources=20,
+        )
+
+        BalancedTactic().choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.core_action, StartMoveAction)
+        self.assertEqual(turn.plan.core_action.direction, Direction.UP)
+
+    def test_core_rejects_a_narrow_corridor_that_closes_ahead(self) -> None:
+        enemies = tuple(
+            unit(100 + index, UnitType.RANGER, (0, 3 + index), controlled=False)
+            for index in range(4)
+        )
+        turn = make_turn(
+            enemies=enemies,
+            obstacle_cells=(
+                (-1, -1),
+                (1, -1),
+                (-1, -2),
+                (1, -2),
+                (0, -3),
+            ),
+            resources=20,
+        )
+
+        BalancedTactic().choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.core_action, StartMoveAction)
+        self.assertNotEqual(turn.plan.core_action.direction, Direction.UP)
+
+    def test_core_waits_when_every_escape_direction_is_a_dead_end(self) -> None:
+        enemies = self._overwhelming_enemy()
+        turn = make_turn(
+            enemies=enemies,
+            obstacle_cells=(
+                (-1, -1),
+                (-2, 0),
+                (-1, 1),
+                (1, -1),
+                (2, 0),
+                (1, 1),
+                (0, -2),
+                (0, 2),
+            ),
+            resources=0,
+        )
+        tactic = BalancedTactic()
+
+        tactic.choose_actions(turn)
+
+        self.assertNotIsInstance(turn.plan.core_action, StartMoveAction)
+        safety = tactic.last_decision_trace["core_safety"]
+        self.assertTrue(safety["no_escape_route"])
+        self.assertTrue(
+            all(
+                not candidate["viable"]
+                and candidate["rejection_reason"]
+                == "CORE_DEAD_END_DESTINATION"
+                for candidate in safety["move_candidates"]
+            )
+        )
+
+
     def test_core_does_not_build_beacon_shield_after_certain_carrier_death(self) -> None:
         carrier = unit(1, UnitType.WORKER, (0, 2), hp=1)
         attacker = unit(100, UnitType.RANGER, (0, 5), controlled=False)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from arena_hero import CoreState, Position, UnitType
+from arena_hero import CoreState, Direction, Position, UnitType
 
 from .config import TacticConfig
 from .geometry import (
@@ -15,11 +15,12 @@ from .geometry import (
 from .models import (
     ActionIntent,
     CoreEvacuationCampaign,
+    CoreMoveCandidateEvaluation,
     IntentAction,
     UnitMission,
     WorldModel,
 )
-from .planning import route_to
+from .planning import MoveViability, move_viability, route_to
 from .projection import EnemyProjection, TacticalMap
 from .rules import CORE_BASE_SHIELD_CAP, CORE_BEACON_SHIELD_CAP, CORE_MAX_HP, UNIT_MAX_HP
 from .state import TacticMemory
@@ -42,12 +43,16 @@ class CoreSafetyPlanner:
     def __init__(self, config: TacticConfig, memory: TacticMemory) -> None:
         self.config = config
         self.memory = memory
+        self._candidate_evaluations: tuple[CoreMoveCandidateEvaluation, ...] = ()
+        self._no_escape_route = False
 
     def intents(
         self,
         world: WorldModel,
         projection: TacticalMap,
     ) -> tuple[CoreEvacuationCampaign, list[ActionIntent]]:
+        self._candidate_evaluations = ()
+        self._no_escape_route = False
         if world.core is None:
             return CoreEvacuationCampaign(False, None, 0, None, None), []
         core = world.core
@@ -154,6 +159,10 @@ class CoreSafetyPlanner:
         self.memory.failed_core_destinations[destination] = (
             world.tick + self.config.core_move_failure_ttl
         )
+        dead_end = any(
+            evaluation.destination == destination and not evaluation.viable
+            for evaluation in self._candidate_evaluations
+        )
         return [
             ActionIntent.simple(
                 None,
@@ -161,7 +170,11 @@ class CoreSafetyPlanner:
                 UnitMission.CORE_SURVIVAL,
                 0,
                 target_position=destination,
-                reason="MIGRATION_DESTINATION_INVALID",
+                reason=(
+                    "CORE_DEAD_END_DESTINATION"
+                    if dead_end
+                    else "MIGRATION_DESTINATION_INVALID"
+                ),
             )
         ]
 
@@ -192,7 +205,8 @@ class CoreSafetyPlanner:
                         max(1, world.resources),
                     ),
                     reason="EVACUATION_BLOCKED_HEAL",
-                )
+                ),
+                self._no_escape_wait(),
             ]
         if core.shield < CORE_BASE_SHIELD_CAP:
             return [
@@ -203,9 +217,21 @@ class CoreSafetyPlanner:
                     5,
                     resource_cost=1,
                     reason="EVACUATION_BLOCKED_REPAIR",
-                )
+                ),
+                self._no_escape_wait(),
             ]
-        return []
+        return [self._no_escape_wait()]
+
+    @staticmethod
+    def _no_escape_wait() -> ActionIntent:
+        return ActionIntent.simple(
+            None,
+            IntentAction.WAIT,
+            UnitMission.CORE_SURVIVAL,
+            6,
+            reason="NO_CORE_ESCAPE_ROUTE",
+            metadata=(("dead_end_rejected", True),),
+        )
 
     def _peaceful_intents(
         self,
@@ -280,7 +306,10 @@ class CoreSafetyPlanner:
             if len(self.memory.core_position_history) >= 2
             else None
         )
-        options: list[tuple[tuple[int, ...], object, Position]] = []
+        options: list[
+            tuple[tuple[int, ...], Direction, Position, MoveViability, int]
+        ] = []
+        evaluations: list[CoreMoveCandidateEvaluation] = []
         occupied = dict(world.occupied_cells)
         for index, (direction, destination) in enumerate(cardinal_neighbors(world.core.position)):
             if (
@@ -291,13 +320,49 @@ class CoreSafetyPlanner:
                 or occupied.get(destination, 0) > 1
             ):
                 continue
+            dynamic_blocked = set(projection.hostile_occupied)
+            dynamic_blocked.update(world.visible_resources)
+            dynamic_blocked.update(
+                cell for cell, count in occupied.items() if count > 1
+            )
+            viability = move_viability(
+                world,
+                world.core.position,
+                destination,
+                blocked=frozenset(dynamic_blocked),
+                node_limit=min(self.config.path_node_limit, 256),
+                require_open_area=True,
+            )
+            service_exits = sum(
+                neighbor in world.known_passable
+                and neighbor not in world.known_obstacles
+                and neighbor not in projection.hostile_occupied
+                and neighbor not in world.visible_resources
+                for _, neighbor in cardinal_neighbors(destination)
+            )
+            evaluation = CoreMoveCandidateEvaluation(
+                direction=direction,
+                destination=destination,
+                forward_exits=viability.forward_exits,
+                local_open=viability.local_open,
+                unknown_frontier=viability.unknown_frontier,
+                service_exits=service_exits,
+                viable=viability.viable,
+                rejection_reason=(
+                    "CORE_DEAD_END_DESTINATION"
+                    if not viability.viable
+                    else None
+                ),
+            )
+            evaluations.append(evaluation)
+            if not viability.viable:
+                continue
             immediate = projection.immediate_attackers(destination)
             future = projection.future_attackers(destination)
             cover = sum(
                 neighbor in world.known_obstacles
                 for _, neighbor in cardinal_neighbors(destination)
             )
-            exits = count_open_neighbors(destination, world.known_obstacles)
             cargo_follow = min(
                 (
                     manhattan(destination, unit.position)
@@ -310,17 +375,22 @@ class CoreSafetyPlanner:
             score = (
                 immediate,
                 future,
+                -max(viability.forward_exits, int(viability.unknown_frontier)),
                 away,
                 -cover,
-                -exits,
+                -service_exits,
                 cargo_follow,
                 int(previous is not None and destination == previous),
                 index,
             )
-            options.append((score, direction, destination))
+            options.append((score, direction, destination, viability, service_exits))
+        self._candidate_evaluations = tuple(evaluations)
         if not options:
+            self._no_escape_route = True
             return None
-        score, direction, destination = min(options)
+        score, direction, destination, viability, service_exits = min(
+            options, key=lambda row: row[0]
+        )
         self.memory.last_core_move_destination = destination
         return ActionIntent(
             actor_id=None,
@@ -332,6 +402,7 @@ class CoreSafetyPlanner:
             reserve_positions=(destination,),
             tie_break=score,
             reason=self.memory.evacuation_reason or "EVACUATE",
+            metadata=viability.metadata + (("service_exits", service_exits),),
         )
 
     def _moving_destination_invalid(self, world, projection, destination):
@@ -346,7 +417,47 @@ class CoreSafetyPlanner:
             projection.future_attackers(destination)
             > projection.future_attackers(world.core.position) + 1
         )
-        return hard_invalid or materially_worse
+        dynamic_blocked = set(projection.hostile_occupied)
+        dynamic_blocked.update(world.visible_resources)
+        dynamic_blocked.update(
+            cell for cell, count in world.occupied_cells if count > 1
+        )
+        viability = move_viability(
+            world,
+            world.core.position,
+            destination,
+            blocked=frozenset(dynamic_blocked),
+            node_limit=min(self.config.path_node_limit, 256),
+            require_open_area=True,
+        )
+        service_exits = sum(
+            neighbor in world.known_passable
+            and neighbor not in world.known_obstacles
+            and neighbor not in projection.hostile_occupied
+            and neighbor not in world.visible_resources
+            for _, neighbor in cardinal_neighbors(destination)
+        )
+        self._candidate_evaluations = (
+            CoreMoveCandidateEvaluation(
+                direction=next(
+                    direction
+                    for direction, cell in cardinal_neighbors(world.core.position)
+                    if cell == destination
+                ),
+                destination=destination,
+                forward_exits=viability.forward_exits,
+                local_open=viability.local_open,
+                unknown_frontier=viability.unknown_frontier,
+                service_exits=service_exits,
+                viable=viability.viable,
+                rejection_reason=(
+                    "CORE_DEAD_END_DESTINATION"
+                    if not viability.viable
+                    else None
+                ),
+            ),
+        )
+        return hard_invalid or materially_worse or not viability.viable
 
     def _strategic_relocation(self, world, projection):
         assert world.core is not None
@@ -400,6 +511,20 @@ class CoreSafetyPlanner:
         )
         if route is None or route.first_direction is None:
             return None
+        viability = move_viability(
+            world,
+            world.core.position,
+            route.first_position,
+            target=goal,
+            blocked=frozenset(
+                set(projection.hostile_occupied)
+                | {position for position, _ in world.remembered_resources}
+            ),
+            node_limit=min(self.config.path_node_limit, 512),
+            require_continuation=True,
+        )
+        if not viability.viable:
+            return None
         return ActionIntent(
             actor_id=None,
             action=IntentAction.START_MOVE,
@@ -410,6 +535,7 @@ class CoreSafetyPlanner:
             reserve_positions=(route.first_position,),
             tie_break=(route.distance,),
             reason="WORKER_VERIFIED_STRATEGIC_RELOCATION",
+            metadata=viability.metadata,
         )
 
     def _site_valid(self, world, projection, cell):
@@ -441,6 +567,8 @@ class CoreSafetyPlanner:
             safe_ticks=self.memory.evacuation_safe_ticks,
             last_destination=self.memory.last_core_move_destination,
             reason=self.memory.evacuation_reason,
+            candidate_evaluations=self._candidate_evaluations,
+            no_escape_route=self._no_escape_route,
         )
 
     @staticmethod
