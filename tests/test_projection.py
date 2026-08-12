@@ -137,7 +137,7 @@ class TacticalMapTests(unittest.TestCase):
         self.assertNotIn(worker.id, world.observers(enemy.position))
         self.assertIn(ranger.id, world.observers(enemy.position))
         escape = tactic.memory.worker_escape_states[worker.id]
-        self.assertEqual(escape.phase, "GLOBAL_ALERT_RETREAT")
+        self.assertEqual(escape.phase, "FLEEING")
         selected = next(
             item
             for item in tactic.last_decision_trace["tasks"]

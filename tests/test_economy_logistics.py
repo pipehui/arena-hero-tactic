@@ -27,7 +27,7 @@ from arena_tactic import (
     WorkerScoutState,
 )
 from arena_tactic.models import MissionState
-from arena_tactic.geometry import manhattan
+from arena_tactic.geometry import add_direction, manhattan
 from arena_tactic.planning import weighted_route_to
 from arena_tactic.resource_allocator import minimum_cost_matching
 from arena_tactic.world import build_world_model
@@ -142,6 +142,197 @@ class EconomyAndLogisticsTests(unittest.TestCase):
 
         action = turn.plan.unit_actions[worker.id]
         self.assertNotEqual(getattr(action, "direction", None), Direction.DOWN)
+
+    def test_escape_history_never_forces_worker_toward_visible_vanguard(self) -> None:
+        core = friendly_core(position=(10, 10))
+        worker = unit(1, UnitType.WORKER, (0, 0))
+        enemy = unit(100, UnitType.VANGUARD, (2, 1), controlled=False)
+        memory = TacticMemory(
+            core_id=core.id,
+            core_position=core.position,
+            # Both cells that increase the enemy distance are recent.  The
+            # live Tick 97332/97333 bug deleted them before scoring and forced
+            # the novel RIGHT step toward the Vanguard.
+            position_history={worker.id: ((0, -1), (-1, 0))},
+        )
+        turn = make_turn(
+            tick=10,
+            core=core,
+            units=(worker,),
+            enemies=(enemy,),
+            resources=0,
+        )
+
+        tactic = BalancedTactic(memory=memory)
+        tactic.choose_actions(turn)
+
+        action = turn.plan.unit_actions[worker.id]
+        self.assertIsInstance(action, MoveAction)
+        before = manhattan(worker.position, enemy.position)
+        after = manhattan(add_direction(worker.position, action.direction), enemy.position)
+        self.assertGreater(after, before)
+        task = next(
+            row
+            for row in tactic.last_decision_trace["tasks"]
+            if row["actor_id"] == str(worker.id)
+        )
+        self.assertEqual(task["mission"], "ESCAPE")
+        self.assertGreater(task["metadata"]["survival_terminals"], 0)
+        self.assertFalse(task["metadata"]["nonfatal_budget_used"])
+
+    def test_safe_escape_step_precedes_full_health_nonfatal_budget(self) -> None:
+        core = friendly_core(position=(10, 10))
+        worker = unit(1, UnitType.WORKER, (0, 0))
+        enemy = unit(100, UnitType.VANGUARD, (1, 1), controlled=False)
+        memory = TacticMemory(
+            core_id=core.id,
+            core_position=core.position,
+            position_history={worker.id: ((0, -1), (-1, 0))},
+        )
+        turn = make_turn(
+            tick=10,
+            core=core,
+            units=(worker,),
+            enemies=(enemy,),
+            resources=0,
+        )
+
+        tactic = BalancedTactic(memory=memory)
+        tactic.choose_actions(turn)
+
+        action = turn.plan.unit_actions[worker.id]
+        self.assertIsInstance(action, MoveAction)
+        destination = add_direction(worker.position, action.direction)
+        tactical_map = tactic.last_tactical_map
+        assert tactical_map is not None
+        self.assertEqual(tactical_map.immediate_attackers(destination), 0)
+        task = next(
+            row
+            for row in tactic.last_decision_trace["tasks"]
+            if row["actor_id"] == str(worker.id)
+        )
+        self.assertFalse(task["metadata"]["nonfatal_budget_used"])
+
+    def test_visible_shared_threat_at_six_cells_is_local_fleeing(self) -> None:
+        core = friendly_core(position=(10, 10))
+        worker = unit(1, UnitType.WORKER, (0, 0))
+        observer = unit(2, UnitType.RANGER, (0, 1))
+        enemy = unit(100, UnitType.VANGUARD, (0, 6), controlled=False)
+        turn = make_turn(
+            tick=10,
+            core=core,
+            units=(worker, observer),
+            enemies=(enemy,),
+            resources=0,
+        )
+
+        tactic = BalancedTactic()
+        tactic.choose_actions(turn)
+
+        state = tactic.memory.worker_escape_states[worker.id]
+        self.assertEqual(state.phase, "FLEEING")
+
+    def test_escape_maximizes_minimum_distance_from_multiple_vanguards(self) -> None:
+        core = friendly_core(position=(10, 10))
+        worker = unit(1, UnitType.WORKER, (0, 0))
+        enemies = (
+            unit(100, UnitType.VANGUARD, (2, 0), controlled=False),
+            unit(101, UnitType.VANGUARD, (0, 2), controlled=False),
+        )
+        turn = make_turn(
+            tick=10,
+            core=core,
+            units=(worker,),
+            enemies=enemies,
+            resources=0,
+        )
+
+        BalancedTactic().choose_actions(turn)
+
+        action = turn.plan.unit_actions[worker.id]
+        self.assertIsInstance(action, MoveAction)
+        destination = add_direction(worker.position, action.direction)
+        self.assertGreater(
+            min(manhattan(destination, enemy.position) for enemy in enemies),
+            min(manhattan(worker.position, enemy.position) for enemy in enemies),
+        )
+
+    def test_full_health_worker_uses_nonfatal_budget_only_when_required(self) -> None:
+        core = friendly_core(position=(-5, 0))
+        worker = unit(1, UnitType.WORKER, (0, 0))
+        enemy = unit(100, UnitType.VANGUARD, (1, 1), controlled=False)
+        turn = make_turn(
+            tick=10,
+            core=core,
+            units=(worker,),
+            enemies=(enemy,),
+            obstacle_cells=((0, -1), (-1, 0)),
+            resources=0,
+        )
+
+        tactic = BalancedTactic()
+        tactic.choose_actions(turn)
+
+        action = turn.plan.unit_actions[worker.id]
+        self.assertIsInstance(action, MoveAction)
+        task = next(
+            row
+            for row in tactic.last_decision_trace["tasks"]
+            if row["actor_id"] == str(worker.id)
+        )
+        self.assertTrue(task["metadata"]["nonfatal_budget_used"])
+
+    def test_one_hp_worker_never_spends_nonfatal_escape_budget(self) -> None:
+        core = friendly_core(position=(-5, 0))
+        worker = unit(1, UnitType.WORKER, (0, 0), hp=1)
+        enemy = unit(100, UnitType.VANGUARD, (1, 1), controlled=False)
+        turn = make_turn(
+            tick=10,
+            core=core,
+            units=(worker,),
+            enemies=(enemy,),
+            obstacle_cells=((0, -1), (-1, 0)),
+            resources=2,
+        )
+
+        BalancedTactic().choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.unit_actions[worker.id], WaitAction)
+
+    def test_escape_loop_creates_a_new_bounded_egress_waypoint(self) -> None:
+        core = friendly_core(position=(10, 10))
+        worker = unit(1, UnitType.WORKER, (0, 1))
+        enemy = unit(100, UnitType.VANGUARD, (2, 1), controlled=False)
+        memory = TacticMemory(
+            core_id=core.id,
+            core_position=core.position,
+            position_history={
+                worker.id: (
+                    (0, 0),
+                    (1, 0),
+                    (1, 1),
+                    (0, 1),
+                    (0, 0),
+                    (1, 0),
+                    (1, 1),
+                )
+            },
+        )
+        turn = make_turn(
+            tick=10,
+            core=core,
+            units=(worker,),
+            enemies=(enemy,),
+            resources=0,
+        )
+
+        tactic = BalancedTactic(memory=memory)
+        tactic.choose_actions(turn)
+
+        state = tactic.memory.worker_escape_states[worker.id]
+        self.assertEqual(state.loop_period, 4)
+        self.assertIsNotNone(state.waypoint)
+        self.assertEqual(state.route_version, 1)
 
 
     def test_emergency_patient_can_enter_core_through_safe_service_exit(self) -> None:

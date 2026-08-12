@@ -82,6 +82,10 @@ class TacticConfig:
     worker_escape_safe_ticks: int = 2
     worker_escape_nonfatal_hit_budget: int = 1
     worker_escape_lookahead_nodes: int = 32
+    worker_escape_plan_depth: int = 4
+    worker_escape_plan_node_limit: int = 64
+    worker_escape_replan_ticks: int = 2
+    worker_escape_max_loop_period: int = 4
     # Once Core storage is saturated, Workers still return home, but spread
     # across dedicated non-combat rings instead of joining the deposit lane.
     # A small hysteresis prevents one point of healing/repair from summoning
@@ -206,6 +210,10 @@ class TacticConfig:
             self.worker_escape_clearance_radius,
             self.worker_escape_safe_ticks,
             self.worker_escape_lookahead_nodes,
+            self.worker_escape_plan_depth,
+            self.worker_escape_plan_node_limit,
+            self.worker_escape_replan_ticks,
+            self.worker_escape_max_loop_period,
             self.worker_full_storage_release_space,
             self.worker_full_storage_replenishers,
             self.home_warning_radius,
@@ -290,6 +298,10 @@ class TacticConfig:
             raise ValueError("recovery threshold must be within 1..100")
         if self.worker_escape_clearance_radius <= self.worker_escape_trigger_radius:
             raise ValueError("escape clearance must exceed its trigger radius")
+        if self.worker_escape_plan_node_limit < self.worker_escape_plan_depth:
+            raise ValueError("escape planning nodes must cover its depth")
+        if self.worker_escape_max_loop_period * 2 > self.loop_history_length:
+            raise ValueError("escape loop period must fit twice in position history")
         if (
             not self.worker_full_storage_guard_radii
             or tuple(sorted(set(self.worker_full_storage_guard_radii)))

@@ -661,6 +661,13 @@ class DecisionTraceBuilder:
                     "threat_ids": [str(item) for item in state.threat_ids],
                     "last_threat_tick": state.last_threat_tick,
                     "safe_ticks": state.safe_ticks,
+                    "waypoint": (
+                        None if state.waypoint is None else list(state.waypoint)
+                    ),
+                    "last_min_enemy_distance": state.last_min_enemy_distance,
+                    "stalled_ticks": state.stalled_ticks,
+                    "loop_period": state.loop_period,
+                    "route_version": state.route_version,
                 }
                 for worker_id, state in sorted(
                     self.memory.worker_escape_states.items(),

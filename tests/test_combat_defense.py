@@ -55,7 +55,7 @@ class CombatDefenseTests(unittest.TestCase):
             if squad.support_target is not None
         ]
         self.assertEqual(len(supports), len(set(supports)))
-        self.assertEqual(tactic.last_decision_trace["schema_version"], 36)
+        self.assertEqual(tactic.last_decision_trace["schema_version"], 37)
         formation = tactic.last_decision_trace["combat"]["formation"]
         assigned_supports = [
             tuple(bundle["support"])

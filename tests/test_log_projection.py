@@ -17,10 +17,36 @@ from arena_hero import (
 from arena_tactic import BalancedTactic
 from arena_tactic.log_projection import compact_logged_state, compact_strategy_trace
 from replay_log import ReplayLogger
-from tests.helpers import make_turn, uid, unit
+from tests.helpers import friendly_core, make_turn, uid, unit
 
 
 class LogProjectionTests(unittest.TestCase):
+    def test_escape_projection_keeps_safety_and_loop_evidence(self) -> None:
+        worker = unit(1, UnitType.WORKER, (0, 0))
+        enemy = unit(100, UnitType.VANGUARD, (2, 1), controlled=False)
+        turn = make_turn(
+            tick=10,
+            core=friendly_core(position=(10, 10)),
+            units=(worker,),
+            enemies=(enemy,),
+            resources=0,
+        )
+        tactic = BalancedTactic()
+        tactic.choose_actions(turn)
+
+        compact = compact_strategy_trace(tactic.last_decision_trace)
+
+        assert compact is not None
+        decision = next(
+            row for row in compact["decisions"] if row["actor_id"] == str(worker.id)
+        )
+        metadata = decision["final"]["metadata"]
+        self.assertGreater(metadata["survival_terminals"], 0)
+        self.assertIn("visible_enemy_distance_before", metadata)
+        self.assertIn("visible_enemy_distance_after", metadata)
+        self.assertIn("nonfatal_budget_used", metadata)
+        self.assertIn("escape_filter_rejections", metadata)
+
     def test_strategy_projection_is_detached_and_keeps_final_reason(self) -> None:
         trace = self._representative_trace(actor_count=4, cargo_count=2)
         original = copy.deepcopy(trace)
@@ -28,7 +54,7 @@ class LogProjectionTests(unittest.TestCase):
         compact = compact_strategy_trace(trace)
 
         self.assertEqual(trace, original)
-        self.assertEqual(compact["schema_version"], 37)
+        self.assertEqual(compact["schema_version"], 38)
         self.assertEqual(compact["source_trace_schema"], 36)
         self.assertNotIn("tasks", compact)
         decision = compact["decisions"][0]

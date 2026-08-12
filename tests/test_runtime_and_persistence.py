@@ -58,7 +58,7 @@ class _EventGame:
 
 class RuntimeAndPersistenceTests(unittest.TestCase):
     def test_schema_versions_are_upgraded(self) -> None:
-        self.assertEqual(LOG_SCHEMA_VERSION, 37)
+        self.assertEqual(LOG_SCHEMA_VERSION, 38)
         self.assertEqual(EXPLORATION_MEMORY_SCHEMA_VERSION, 12)
 
     def test_main_translates_sigterm_into_a_graceful_service_stop(self) -> None:
@@ -397,7 +397,7 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
             text = logger.path.read_text(encoding="utf-8")
             first = json.loads(text.splitlines()[0])
 
-        self.assertEqual(first["schema_version"], 37)
+        self.assertEqual(first["schema_version"], 38)
         self.assertNotIn("hidden-token", text)
 
     def test_turn_log_contains_detached_schema_37_strategy(self) -> None:
@@ -422,10 +422,10 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
             logger.close(status="completed", last_tick=9)
             records = [json.loads(line) for line in logger.path.read_text(encoding="utf-8").splitlines()]
 
-        self.assertEqual(records[0]["schema_version"], 37)
+        self.assertEqual(records[0]["schema_version"], 38)
         record = next(item for item in records if item["record_type"] == "turn")
-        self.assertEqual(record["strategy"]["schema_version"], 37)
-        self.assertEqual(record["strategy"]["source_trace_schema"], 36)
+        self.assertEqual(record["strategy"]["schema_version"], 38)
+        self.assertEqual(record["strategy"]["source_trace_schema"], 37)
         self.assertNotIn("tasks", record["strategy"])
         self.assertIn("resolution", record["strategy"])
         decisions = record["strategy"]["decisions"]

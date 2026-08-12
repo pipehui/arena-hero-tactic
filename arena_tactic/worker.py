@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from uuid import UUID
 
 from arena_hero import CoreState, Direction, Position, UnitType
@@ -37,6 +37,54 @@ from .resource_allocator import ResourceAllocator
 from .rules import UNIT_MAX_HP
 from .state import TacticMemory
 from .worker_safety import WorkerSafetyEvaluator
+
+
+@dataclass(frozen=True, slots=True)
+class _EscapeCandidate:
+    direction: Direction
+    destination: Position
+    viability: MoveViability
+    immediate_attackers: int
+    future_attackers: int
+    recent_threat: int
+    heat: int
+    minimum_enemy_distance: int
+    total_enemy_distance: int
+    visible_minimum_distance: int
+    visible_total_distance: int
+    visible_vanguard_minimum_distance: int
+    survival_terminals: int
+    forward_exits: int
+    waypoint: Position
+    waypoint_minimum_distance: int
+    waypoint_total_distance: int
+    waypoint_heat: int
+    direction_index: int
+    recently_visited: bool
+    backtracking: bool
+    lease_distance: int
+
+    @property
+    def score(self) -> tuple[int, ...]:
+        return (
+            self.immediate_attackers,
+            self.future_attackers,
+            -self.visible_minimum_distance,
+            -self.visible_total_distance,
+            -self.minimum_enemy_distance,
+            -self.total_enemy_distance,
+            -self.waypoint_minimum_distance,
+            -self.waypoint_total_distance,
+            -self.survival_terminals,
+            0 if self.forward_exits >= 2 else 1,
+            self.heat,
+            self.waypoint_heat,
+            self.recent_threat,
+            self.lease_distance,
+            int(self.recently_visited),
+            int(self.backtracking),
+            self.direction_index,
+        )
 
 
 class WorkerPlanner:
@@ -1117,7 +1165,7 @@ class WorkerPlanner:
             if enemy.visible_now
             and (
                 manhattan(enemy.observed_position, worker.position)
-                <= self.config.worker_escape_trigger_radius
+                <= self.config.global_worker_threat_awareness_radius
                 or worker.position in enemy.immediate_attack_cells
             )
         )
@@ -1145,6 +1193,55 @@ class WorkerPlanner:
             sorted(set(direct_threats) | set(shared_threats), key=lambda item: item.bytes)
         )
         previous = self.memory.worker_escape_states.get(worker.id)
+
+        def progressed_state(
+            phase: str,
+            threat_ids: tuple[UUID, ...],
+            last_threat_tick: int,
+            safe_ticks: int,
+        ) -> WorkerEscapeState:
+            minimum, _ = self._enemy_distances(
+                projection,
+                worker.position,
+                threat_ids,
+            )
+            same_threats = (
+                previous is not None
+                and previous.threat_ids == threat_ids
+            )
+            improved = (
+                previous is None
+                or previous.last_min_enemy_distance is None
+                or minimum > previous.last_min_enemy_distance
+            )
+            stalled = (
+                previous.stalled_ticks + 1
+                if same_threats and not improved
+                else 0
+            )
+            history = self.memory.position_history.get(worker.id, ())
+            loop_period = self._escape_loop_period(history)
+            waypoint = None if previous is None else previous.waypoint
+            route_version = 0 if previous is None else previous.route_version
+            if (
+                waypoint == worker.position
+                or not same_threats
+                or loop_period is not None
+                or stalled >= self.config.worker_escape_replan_ticks
+            ):
+                waypoint = None
+            return WorkerEscapeState(
+                phase=phase,
+                threat_ids=threat_ids,
+                last_threat_tick=last_threat_tick,
+                safe_ticks=safe_ticks,
+                waypoint=waypoint,
+                last_min_enemy_distance=minimum,
+                stalled_ticks=stalled,
+                loop_period=loop_period,
+                route_version=route_version,
+            )
+
         if threats:
             retained = {
                 threat_id
@@ -1153,7 +1250,7 @@ class WorkerPlanner:
                 and enemy.age <= self.config.enemy_track_ttl
             }
             retained.update(threats)
-            state = WorkerEscapeState(
+            state = progressed_state(
                 "FLEEING" if direct_threats else "GLOBAL_ALERT_RETREAT",
                 tuple(sorted(retained, key=lambda item: item.bytes)),
                 world.tick,
@@ -1186,7 +1283,7 @@ class WorkerPlanner:
                 self.memory.worker_escape_states.pop(worker.id, None)
                 return None
         if fresh:
-            state = WorkerEscapeState(
+            state = progressed_state(
                 "FOG_RETREAT",
                 fresh,
                 previous.last_threat_tick,
@@ -1199,7 +1296,7 @@ class WorkerPlanner:
         if safe_ticks >= self.config.worker_escape_safe_ticks:
             self.memory.worker_escape_states.pop(worker.id, None)
             return None
-        state = WorkerEscapeState(
+        state = progressed_state(
             "CLEARING",
             previous.threat_ids,
             previous.last_threat_tick,
@@ -1210,7 +1307,7 @@ class WorkerPlanner:
 
     def _escape_intents(self, world, projection, worker, state):
         assert world.core is not None
-        rows: list[tuple[tuple[int, ...], Direction, Position]] = []
+        rows: list[_EscapeCandidate] = []
         history = self.memory.position_history.get(worker.id, ())
         previous = (
             history[-2]
@@ -1218,6 +1315,16 @@ class WorkerPlanner:
             else None
         )
         recent_positions = frozenset(history[-4:-1])
+        current_visible_minimum, _ = self._visible_enemy_distances(
+            projection,
+            worker.position,
+            state.threat_ids,
+        )
+        current_visible_vanguard_minimum = self._visible_vanguard_distance(
+            projection,
+            worker.position,
+            state.threat_ids,
+        )
         for index, (direction, destination) in enumerate(cardinal_neighbors(worker.position)):
             if destination in world.known_obstacles or destination in projection.hostile_occupied:
                 continue
@@ -1263,40 +1370,98 @@ class WorkerPlanner:
             minimum, total = self._enemy_distances(
                 projection, destination, state.threat_ids
             )
-            score = (
-                int(horizon == 0),
-                int(exits == 0),
-                immediate,
-                projection.future_attackers(destination),
-                recent,
-                heat,
-                -minimum,
-                -total,
-                manhattan(destination, world.core.destination or world.core.position),
-                int(destination == previous),
-                index,
+            visible_minimum, visible_total = self._visible_enemy_distances(
+                projection,
+                destination,
+                state.threat_ids,
             )
-            rows.append((score, direction, destination, viability))
-        # A fresh threat lease must produce spatial progress.  Merely making
-        # the previous cell look slightly cooler caused the live A-B-A-B
-        # oscillation: every fogged Tick undid the preceding escape step.  A
-        # recent cell remains available only when every novel option has no
-        # survivable two-step continuation.
-        novel_survivable = [
-            row
-            for row in rows
-            if row[2] not in recent_positions and row[0][0] == 0
-        ]
-        if novel_survivable:
-            rows = [row for row in rows if row[2] not in recent_positions]
-        elif previous is not None:
-            non_backtracking_survivable = [
-                row
-                for row in rows
-                if row[2] != previous and row[0][0] == 0
-            ]
-            if non_backtracking_survivable:
-                rows = [row for row in rows if row[2] != previous]
+            visible_vanguard_minimum = self._visible_vanguard_distance(
+                projection,
+                destination,
+                state.threat_ids,
+            )
+            waypoint, waypoint_minimum, waypoint_total, waypoint_heat = (
+                self._escape_outlook(
+                    world,
+                    projection,
+                    destination,
+                    worker.position,
+                    worker.hp,
+                    state.threat_ids,
+                )
+            )
+            rows.append(
+                _EscapeCandidate(
+                    direction=direction,
+                    destination=destination,
+                    viability=viability,
+                    immediate_attackers=immediate,
+                    future_attackers=projection.future_attackers(destination),
+                    recent_threat=recent,
+                    heat=heat,
+                    minimum_enemy_distance=minimum,
+                    total_enemy_distance=total,
+                    visible_minimum_distance=visible_minimum,
+                    visible_total_distance=visible_total,
+                    visible_vanguard_minimum_distance=visible_vanguard_minimum,
+                    survival_terminals=horizon,
+                    forward_exits=exits,
+                    waypoint=waypoint,
+                    waypoint_minimum_distance=waypoint_minimum,
+                    waypoint_total_distance=waypoint_total,
+                    waypoint_heat=waypoint_heat,
+                    direction_index=index,
+                    recently_visited=destination in recent_positions,
+                    backtracking=destination == previous,
+                    lease_distance=(
+                        0
+                        if state.waypoint is None
+                        else manhattan(destination, state.waypoint)
+                    ),
+                )
+            )
+
+        filter_rejections: dict[str, int] = {}
+
+        def retain(candidates, predicate, reason):
+            kept = [candidate for candidate in candidates if predicate(candidate)]
+            if kept:
+                rejected = len(candidates) - len(kept)
+                if rejected:
+                    filter_rejections[reason] = (
+                        filter_rejections.get(reason, 0) + rejected
+                    )
+                return kept
+            return candidates
+
+        # The non-fatal hit budget is a last resort, not a licence to ignore a
+        # zero-exposure exit.  Apply the safety frontier before distance,
+        # novelty or deterministic direction tie-breaks.
+        rows = retain(
+            rows,
+            lambda row: row.immediate_attackers == 0,
+            "NONZERO_CURRENT_EXPOSURE",
+        )
+        rows = retain(
+            rows,
+            lambda row: row.future_attackers == 0,
+            "NONZERO_FUTURE_EXPOSURE",
+        )
+
+        # Recent history may break a tie, but it may never force a Worker
+        # closer to an authoritative visible Vanguard threat.  When a
+        # non-approaching option exists on the same safety frontier, discard
+        # all approaching candidates.
+        if current_visible_vanguard_minimum < 99:
+            rows = retain(
+                rows,
+                lambda row: (
+                    row.visible_vanguard_minimum_distance
+                    >= current_visible_vanguard_minimum
+                ),
+                "APPROACHES_VISIBLE_VANGUARD",
+            )
+
         if state.phase != "FLEEING":
             current_home_distance = manhattan(
                 worker.position,
@@ -1305,37 +1470,94 @@ class WorkerPlanner:
             homeward_survivable = [
                 row
                 for row in rows
-                if row[0][0] == 0
-                and row[0][1] == 0
-                and row[0][2] == 0
-                and row[0][3] == 0
+                if row.immediate_attackers == 0
+                and row.future_attackers == 0
+                and row.survival_terminals > 0
+                and row.forward_exits > 0
                 and manhattan(
-                    row[2],
+                    row.destination,
                     world.core.destination or world.core.position,
                 )
                 <= current_home_distance
             ]
             if homeward_survivable:
+                filter_rejections["NOT_SAFE_HOMEWARD_PROGRESS"] = (
+                    filter_rejections.get("NOT_SAFE_HOMEWARD_PROGRESS", 0)
+                    + len(rows)
+                    - len(homeward_survivable)
+                )
                 rows = homeward_survivable
+
+        ordered = sorted(rows, key=lambda row: row.score)
+        if ordered:
+            first = ordered[0]
+            waypoint = state.waypoint
+            should_replan = (
+                waypoint is None
+                or state.loop_period is not None
+                or state.stalled_ticks >= self.config.worker_escape_replan_ticks
+            )
+            if should_replan:
+                waypoint = first.waypoint
+            route_version = state.route_version + int(waypoint != state.waypoint)
+            state = replace(
+                state,
+                waypoint=waypoint,
+                route_version=route_version,
+            )
+            self.memory.worker_escape_states[worker.id] = state
+
         intents = [
             ActionIntent.move(
                 worker.id,
                 UnitMission.ESCAPE,
                 20,
-                direction,
-                destination,
-                risk=score[2] * 100 + score[3] * 10 + score[4] + score[5],
-                tie_break=score,
+                row.direction,
+                row.destination,
+                risk=(
+                    row.immediate_attackers * 100
+                    + row.future_attackers * 10
+                    + row.recent_threat
+                    + row.heat
+                ),
+                tie_break=row.score,
                 reason=state.phase,
                 metadata=(
                     ("escape_phase", state.phase),
-                    ("safe_horizon", -score[0]),
-                    ("first_step_heat", score[5]),
-                ) + viability.metadata,
+                    (
+                        "safe_horizon",
+                        self.config.worker_escape_plan_depth
+                        if row.survival_terminals > 0
+                        else 0,
+                    ),
+                    ("survival_terminals", row.survival_terminals),
+                    ("first_step_heat", row.heat),
+                    ("enemy_distance_before", state.last_min_enemy_distance),
+                    ("enemy_distance_after", row.minimum_enemy_distance),
+                    ("visible_enemy_distance_before", current_visible_minimum),
+                    ("visible_enemy_distance_after", row.visible_minimum_distance),
+                    (
+                        "visible_vanguard_distance_before",
+                        current_visible_vanguard_minimum,
+                    ),
+                    (
+                        "visible_vanguard_distance_after",
+                        row.visible_vanguard_minimum_distance,
+                    ),
+                    (
+                        "nonfatal_budget_used",
+                        row.immediate_attackers > 0,
+                    ),
+                    ("escape_loop_period", state.loop_period),
+                    ("escape_waypoint", row.waypoint),
+                    ("escape_route_version", state.route_version),
+                    (
+                        "escape_filter_rejections",
+                        tuple(sorted(filter_rejections.items())),
+                    ),
+                ) + row.viability.metadata,
             )
-            for score, direction, destination, viability in sorted(
-                rows, key=lambda row: row[0]
-            )
+            for row in ordered
         ]
         intents.append(
             ActionIntent.simple(
@@ -1368,8 +1590,92 @@ class WorkerPlanner:
             start,
             hp,
             origin=origin,
-            node_limit=self.config.worker_escape_lookahead_nodes,
+            depth_limit=self.config.worker_escape_plan_depth,
+            node_limit=self.config.worker_escape_plan_node_limit,
         )
+
+    def _escape_outlook(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        start: Position,
+        origin: Position,
+        hp: int,
+        threat_ids: tuple[UUID, ...],
+    ) -> tuple[Position, int, int, int]:
+        """Choose a bounded, zero-controller egress waypoint for one first step."""
+
+        frontier: list[tuple[Position, int, int, int, int]] = [
+            (
+                start,
+                1,
+                projection.immediate_attackers(start),
+                projection.future_attackers(start),
+                projection.worker_exposure(start)[2],
+            )
+        ]
+        visited = {origin, start}
+        terminals: list[tuple[tuple[object, ...], Position, int, int, int]] = []
+        while frontier and len(visited) <= self.config.worker_escape_plan_node_limit:
+            cell, depth, max_immediate, max_future, accumulated_heat = frontier.pop(0)
+            minimum, total = self._enemy_distances(projection, cell, threat_ids)
+            visible_minimum, visible_total = self._visible_enemy_distances(
+                projection,
+                cell,
+                threat_ids,
+            )
+            if depth >= self.config.worker_escape_plan_depth:
+                terminals.append(
+                    (
+                        (
+                            max_immediate,
+                            max_future,
+                            -visible_minimum,
+                            -visible_total,
+                            -minimum,
+                            -total,
+                            accumulated_heat,
+                            manhattan(
+                                cell,
+                                world.core.destination or world.core.position,
+                            ),
+                            cell,
+                        ),
+                        cell,
+                        minimum,
+                        total,
+                        accumulated_heat,
+                    )
+                )
+                continue
+            onward = []
+            for _, neighbor in cardinal_neighbors(cell):
+                if (
+                    neighbor in visited
+                    or neighbor in world.known_obstacles
+                    or neighbor in projection.hostile_occupied
+                    or neighbor not in world.known_passable
+                    or projection.immediate_attackers(neighbor) >= hp
+                    or projection.future_attackers(neighbor) >= hp
+                ):
+                    continue
+                onward.append(neighbor)
+            for neighbor in onward:
+                visited.add(neighbor)
+                frontier.append(
+                    (
+                        neighbor,
+                        depth + 1,
+                        max(max_immediate, projection.immediate_attackers(neighbor)),
+                        max(max_future, projection.future_attackers(neighbor)),
+                        accumulated_heat + projection.worker_exposure(neighbor)[2],
+                    )
+                )
+        if not terminals:
+            minimum, total = self._enemy_distances(projection, start, threat_ids)
+            return start, minimum, total, projection.worker_exposure(start)[2]
+        _, waypoint, minimum, total, heat = min(terminals, key=lambda row: row[0])
+        return waypoint, minimum, total, heat
 
     def _recent_threat(self, projection, position, ids):
         score = 0
@@ -1395,6 +1701,39 @@ class WorkerPlanner:
                     max(0, manhattan(position, enemy.observed_position) - enemy.age)
                 )
         return min(distances, default=99), sum(distances)
+
+    @staticmethod
+    def _visible_enemy_distances(projection, position, ids):
+        distances: list[int] = []
+        for threat_id in ids:
+            enemy = projection.enemy(threat_id)
+            if enemy is not None and enemy.visible_now:
+                distances.append(manhattan(position, enemy.observed_position))
+        return min(distances, default=99), sum(distances)
+
+    @staticmethod
+    def _visible_vanguard_distance(projection, position, ids):
+        distances: list[int] = []
+        for threat_id in ids:
+            enemy = projection.enemy(threat_id)
+            if (
+                enemy is not None
+                and enemy.visible_now
+                and enemy.unit_type is UnitType.VANGUARD
+            ):
+                distances.append(manhattan(position, enemy.observed_position))
+        return min(distances, default=99)
+
+    def _escape_loop_period(self, history: tuple[Position, ...]) -> int | None:
+        for period in range(1, self.config.worker_escape_max_loop_period + 1):
+            required = period * 2
+            if len(history) < required:
+                continue
+            previous = history[-required:-period]
+            current = history[-period:]
+            if previous == current and len(set(current)) > 1:
+                return period
+        return None
 
     def _cargo(self, world, projection, worker, service):
         assert world.core is not None

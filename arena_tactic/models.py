@@ -845,6 +845,11 @@ class WorkerEscapeState:
     threat_ids: tuple[UUID, ...]
     last_threat_tick: int
     safe_ticks: int = 0
+    waypoint: Position | None = None
+    last_min_enemy_distance: int | None = None
+    stalled_ticks: int = 0
+    loop_period: int | None = None
+    route_version: int = 0
 
 
 @dataclass(frozen=True, slots=True)
