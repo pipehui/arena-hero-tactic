@@ -30,6 +30,7 @@ class UnitMission(str, Enum):
     RECOVER = "RECOVER"
     RETURN_CARGO = "RETURN_CARGO"
     CLEAR_CORE = "CLEAR_CORE"
+    CLEAR_SERVICE_CELL = "CLEAR_SERVICE_CELL"
     HARVEST = "HARVEST"
     HOME_GUARD = "HOME_GUARD"
     HOME_DEFENSE = "HOME_DEFENSE"
@@ -419,6 +420,11 @@ class CoreServiceQueue:
     core_slot_reserved: bool = False
     timeline: "CoreOperationTimeline | None" = None
     patient_progress: "PatientAdmissionProgress | None" = None
+    service_windows: tuple["CoreServiceWindow", ...] = ()
+    patient_queue: tuple["PatientQueueEntry", ...] = ()
+    service_cell_leases: tuple["ServiceCellLease", ...] = ()
+    blocking_units: tuple[tuple[UUID, Position, str], ...] = ()
+    reschedule_reasons: tuple[str, ...] = ()
     reserved_resources: int = 0
     paused_reason: str | None = None
     previous_admission_id: UUID | None = None
@@ -461,6 +467,39 @@ class CoreOperationTimeline:
     production_allowed: bool = True
     spawn_egress_cell: Position | None = None
     reason: str = "NO_CURRENT_SERVICE"
+
+
+@dataclass(frozen=True, slots=True)
+class CoreServiceWindow:
+    actor_id: UUID
+    operation: str
+    enter_tick: int
+    service_tick: int
+    exit_tick: int
+    gateway: Position | None = None
+    status: str = "FUTURE"
+
+
+@dataclass(frozen=True, slots=True)
+class PatientQueueEntry:
+    patient_id: UUID
+    urgent: bool
+    hp_percent: int
+    eta: int | None
+    gateway: Position | None
+    stalled_ticks: int
+    resource_cost: int
+    status: str
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceCellLease:
+    cell: Position
+    purpose: str
+    owner_id: UUID | None
+    start_tick: int
+    end_tick: int
+    active: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -515,6 +554,16 @@ class HomeCombatAssignment:
     @property
     def assigned_vanguard_ids(self) -> frozenset[UUID]:
         return frozenset(task.vanguard_id for task in self.tasks)
+
+
+@dataclass(frozen=True, slots=True)
+class HostileApproachEstimate:
+    target_id: UUID
+    candidate_cells: tuple[Position, ...]
+    path_next_cells: tuple[Position, ...]
+    path_costs: tuple[tuple[Position, int], ...]
+    protected_targets: tuple[Position, ...]
+    evidence: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

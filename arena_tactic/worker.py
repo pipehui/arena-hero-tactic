@@ -539,6 +539,13 @@ class WorkerPlanner:
                 service,
                 exploration,
             )
+        if worker.id in {row[0] for row in service.blocking_units}:
+            return self._clear_service_cell(
+                world,
+                projection,
+                worker,
+                service,
+            )
         if worker.id in self.memory.service_egress_worker_ids and worker.position in {
             *(cell for cell in (service.entrance, service.exit_cell) if cell is not None),
             *service.queue_cells,
@@ -1158,6 +1165,13 @@ class WorkerPlanner:
 
     def _cargo(self, world, projection, worker, service):
         assert world.core is not None
+        if worker.id in {row[0] for row in service.blocking_units}:
+            return self._clear_service_cell(
+                world,
+                projection,
+                worker,
+                service,
+            )
         if service.paused_reason == "LANE_THREATENED":
             return [
                 ActionIntent.simple(
@@ -1213,6 +1227,18 @@ class WorkerPlanner:
                 )
             ]
         if reservation.status == "WAIT_FOR_DEPARTURE":
+            active_cells = {
+                lease.cell
+                for lease in service.service_cell_leases
+                if lease.active and lease.owner_id != worker.id
+            }
+            if worker.position in active_cells:
+                return self._clear_service_cell(
+                    world,
+                    projection,
+                    worker,
+                    service,
+                )
             return [
                 ActionIntent.simple(
                     worker.id,
@@ -1418,6 +1444,74 @@ class WorkerPlanner:
                     "SERVICE_EGRESS_BLOCKED_THIS_TICK"
                     if rows
                     else "SERVICE_EGRESS_BLOCKED"
+                ),
+            )
+        )
+        return intents
+
+    def _clear_service_cell(self, world, projection, unit, service):
+        """Move a non-owner out of a service lease before its live window."""
+
+        assert world.core is not None
+        occupied = dict(world.occupied_cells)
+        leased = {
+            lease.cell
+            for lease in service.service_cell_leases
+            if lease.active and lease.owner_id != unit.id
+        }
+        infrastructure = {
+            world.core.position,
+            *(cell for cell in (service.entrance, service.exit_cell) if cell is not None),
+            *service.queue_cells,
+        }
+        rows = []
+        for index, (direction, destination) in enumerate(
+            cardinal_neighbors(unit.position)
+        ):
+            if (
+                destination in leased
+                or destination in infrastructure
+                or destination in world.known_obstacles
+                or destination in projection.hostile_occupied
+                or projection.immediate_attackers(destination) >= unit.hp
+            ):
+                continue
+            score = (
+                projection.future_attackers(destination),
+                projection.worker_exposure(destination)[2],
+                occupied.get(destination, 0),
+                -manhattan(destination, world.core.position),
+                index,
+            )
+            rows.append((score, direction, destination))
+        intents = [
+            ActionIntent.move(
+                unit.id,
+                UnitMission.CLEAR_SERVICE_CELL,
+                44,
+                direction,
+                destination,
+                risk=score[0] * 10 + score[1],
+                exclusive_destination=True,
+                tie_break=score,
+                reason="CLEAR_FUTURE_SERVICE_CELL",
+                metadata=(
+                    ("allow_protected", False),
+                    ("allow_head_on_swap", True),
+                ),
+            )
+            for score, direction, destination in sorted(rows)
+        ]
+        intents.append(
+            ActionIntent.simple(
+                unit.id,
+                IntentAction.WAIT,
+                UnitMission.CLEAR_SERVICE_CELL,
+                45,
+                reason=(
+                    "CLEAR_SERVICE_CELL_BLOCKED_THIS_TICK"
+                    if rows
+                    else "NO_SAFE_SERVICE_CELL_EXIT"
                 ),
             )
         )

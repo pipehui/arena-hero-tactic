@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, replace
 from uuid import UUID
 
@@ -22,6 +22,7 @@ from .models import (
     EntitySnapshot,
     FireMission,
     HomeCombatAssignment,
+    HostileApproachEstimate,
     IntentAction,
     ShotPlan,
     ScreeningGroupState,
@@ -58,6 +59,11 @@ class CombatPlanner:
     def __init__(self, config: TacticConfig, memory: TacticMemory) -> None:
         self.config = config
         self.memory = memory
+        self._prediction_tick: int | None = None
+        self._prediction_cache: dict[
+            tuple[UUID, Position],
+            VanguardIntentEstimate | EnemyRangerFireEstimate | EnemyActionEstimate,
+        ] = {}
 
     def sync_engagements(self, world: WorldModel, projection: TacticalMap) -> None:
         if world.core is None:
@@ -667,6 +673,11 @@ class CombatPlanner:
     def _firing_stance_intents(self, world, projection, state):
         assert world.core is not None
         intents: list[ActionIntent] = []
+        reserved_stances: set[Position] = set()
+        reserved_destinations: set[Position] = set()
+        stance_candidates: list[
+            tuple[tuple[int, ...], bytes, EntitySnapshot, Direction, Position, UUID, Position]
+        ] = []
         urgent_missions = tuple(
             mission
             for mission in state.missions
@@ -778,26 +789,58 @@ class CombatPlanner:
                 ),
                 key=lambda row: row[0],
             )
-            for score, direction, destination, target_id, stance in ranked[:6]:
-                intents.append(
-                    ActionIntent.move(
-                        ranger.id,
-                        UnitMission.HOME_DEFENSE,
-                        52,
-                        direction,
-                        destination,
-                        risk=score[3] * 100 + score[4] * 10,
-                        exclusive_destination=True,
-                        tie_break=score,
-                        reason="ADVANCE_TO_DYNAMIC_FIRE_LINE",
-                        metadata=(
-                            ("target_id", str(target_id)),
-                            ("firing_stance", stance),
-                            ("candidate_coverage", -score[2]),
-                            ("route_distance", score[5]),
-                        ),
-                    )
+            stance_candidates.extend(
+                (
+                    score,
+                    ranger.id.bytes,
+                    ranger,
+                    direction,
+                    destination,
+                    target_id,
+                    stance,
                 )
+                for score, direction, destination, target_id, stance in ranked[:6]
+            )
+
+        assigned_rangers: set[UUID] = set()
+        for (
+            score,
+            _,
+            ranger,
+            direction,
+            destination,
+            target_id,
+            stance,
+        ) in sorted(stance_candidates, key=lambda row: (row[0], row[1], row[6])):
+            if (
+                ranger.id in assigned_rangers
+                or stance in reserved_stances
+                or destination in reserved_destinations
+            ):
+                continue
+            assigned_rangers.add(ranger.id)
+            reserved_stances.add(stance)
+            reserved_destinations.add(destination)
+            intents.append(
+                ActionIntent.move(
+                    ranger.id,
+                    UnitMission.HOME_DEFENSE,
+                    52,
+                    direction,
+                    destination,
+                    risk=score[3] * 100 + score[4] * 10,
+                    exclusive_destination=True,
+                    tie_break=score,
+                    reason="ADVANCE_TO_DYNAMIC_FIRE_LINE",
+                    metadata=(
+                        ("target_id", str(target_id)),
+                        ("firing_stance", stance),
+                        ("candidate_coverage", -score[2]),
+                        ("route_distance", score[5]),
+                        ("stance_exclusive", True),
+                    ),
+                )
+            )
         return intents
 
     @staticmethod
@@ -947,20 +990,31 @@ class CombatPlanner:
         projection: TacticalMap,
         enemy: EntitySnapshot,
     ) -> VanguardIntentEstimate | EnemyRangerFireEstimate | EnemyActionEstimate:
+        if self._prediction_tick != world.tick:
+            self._prediction_tick = world.tick
+            self._prediction_cache.clear()
+        cache_key = enemy.id, enemy.position
+        cached = self._prediction_cache.get(cache_key)
+        if cached is not None:
+            return cached
         projected = projection.enemy(enemy.id)
         legal = list(projected.possible_positions if projected is not None else (enemy.position,))
         if enemy.position not in legal:
             legal.insert(0, enemy.position)
         if enemy.unit_type is UnitType.VANGUARD:
-            return self._vanguard_intent_estimate(world, enemy, legal)
+            result = self._vanguard_intent_estimate(world, enemy, legal)
+            self._prediction_cache[cache_key] = result
+            return result
         if enemy.unit_type is UnitType.RANGER:
-            return self._enemy_ranger_fire_estimate(world, enemy, legal)
+            result = self._enemy_ranger_fire_estimate(world, enemy, legal)
+            self._prediction_cache[cache_key] = result
+            return result
         ranked, confidence = self._trajectory_candidates(world, enemy, legal)
         current_attacks = self._enemy_attacks_any_friendly(world, enemy, enemy.position)
         if current_attacks:
             ranked = [enemy.position, *ranked]
         ordered = self._dedupe_legal(ranked, legal)
-        return EnemyActionEstimate(
+        result = EnemyActionEstimate(
             target_id=enemy.id,
             confidence=confidence,
             candidate_cells=tuple(ordered[:5]),
@@ -970,6 +1024,8 @@ class CombatPlanner:
             ),
             evidence=("CURRENT_ATTACK" if current_attacks else "TRAJECTORY_ONLY",),
         )
+        self._prediction_cache[cache_key] = result
+        return result
 
     def _trajectory_candidates(
         self,
@@ -1022,6 +1078,8 @@ class CombatPlanner:
         legal: list[Position],
     ) -> VanguardIntentEstimate:
         track = world.track(enemy.id)
+        approach_estimate = self._hostile_approach_estimate(world, enemy, legal)
+        approach_costs = dict(approach_estimate.path_costs)
         current_attacks = self._enemy_attacks_any_friendly(
             world, enemy, enemy.position
         )
@@ -1048,13 +1106,13 @@ class CombatPlanner:
                     "CURRENT_ATTACK" if cell == enemy.position else "ATTACK_EXIT"
                     for cell in ordered[:5]
                 ),
-                ("CURRENT_ATTACK_AVAILABLE",),
+                ("CURRENT_ATTACK_AVAILABLE", "OBSTACLE_AWARE_APPROACH"),
             )
 
         if track is not None and len(track.samples) >= 3:
             a, b, c = (sample[1] for sample in track.samples[-3:])
             distances = tuple(
-                self._enemy_protected_distance(world, cell) for cell in (a, b, c)
+                approach_costs.get(cell, 1 << 20) for cell in (a, b, c)
             )
             delta = c[0] - b[0], c[1] - b[1]
             continuation = c[0] + delta[0], c[1] + delta[1]
@@ -1076,7 +1134,7 @@ class CombatPlanner:
                         "RETREAT_CONTINUATION" if cell == continuation else "RETREAT_ALTERNATE"
                         for cell in ordered[:5]
                     ),
-                    ("TWO_TICK_OUTWARD_MOTION",),
+                    ("TWO_TICK_OUTWARD_MOTION", "OBSTACLE_AWARE_APPROACH"),
                 )
 
         moved = bool(
@@ -1098,9 +1156,9 @@ class CombatPlanner:
             )
             for ranger in rangers
         )
-        closer = self._enemy_protected_distance(
-            world, enemy.position
-        ) <= self._enemy_protected_distance(world, previous)
+        closer = approach_costs.get(enemy.position, 1 << 20) <= approach_costs.get(
+            previous, 1 << 20
+        )
         next_attack = any(
             self._enemy_action_value(world, enemy, cell) > 0 for cell in legal
         )
@@ -1116,7 +1174,7 @@ class CombatPlanner:
                         )
                         for ranger in rangers
                     ),
-                    self._enemy_protected_distance(world, cell),
+                    approach_costs.get(cell, 1 << 20),
                     int(cell != motion),
                     cell,
                 ),
@@ -1131,14 +1189,18 @@ class CombatPlanner:
                     "BLIND_APPROACH" if cell != enemy.position else "CURRENT_BLIND_CELL"
                     for cell in ordered[:5]
                 ),
-                ("LEFT_RANGER_FIRE_LINE", "PROTECTED_TARGET_CLOSING"),
+                (
+                    "LEFT_RANGER_FIRE_LINE",
+                    "PROTECTED_TARGET_CLOSING",
+                    "OBSTACLE_AWARE_APPROACH",
+                ),
             )
 
         motion = next((cell for cell in trajectory if cell != enemy.position), None)
         approach = min(
             (cell for cell in legal if cell != enemy.position),
             key=lambda cell: (
-                self._enemy_protected_distance(world, cell),
+                approach_costs.get(cell, 1 << 20),
                 -self._enemy_action_value(world, enemy, cell),
                 cell,
             ),
@@ -1147,7 +1209,7 @@ class CombatPlanner:
         lateral = sorted(
             (cell for cell in legal if cell not in {enemy.position, motion, approach}),
             key=lambda cell: (
-                self._enemy_protected_distance(world, cell),
+                approach_costs.get(cell, 1 << 20),
                 cell,
             ),
         )
@@ -1170,7 +1232,64 @@ class CombatPlanner:
                 else "LATERAL_ANGLE"
                 for cell in ordered[:5]
             ),
-            ("INTENT_NOT_RESOLVED",),
+            ("INTENT_NOT_RESOLVED", "OBSTACLE_AWARE_APPROACH"),
+        )
+
+    def _hostile_approach_estimate(
+        self,
+        world: WorldModel,
+        enemy: EntitySnapshot,
+        legal: list[Position],
+    ) -> HostileApproachEstimate:
+        """Rank a Vanguard's legal next cells by real map approach paths."""
+
+        protected = tuple(
+            sorted(
+                {
+                    *(() if world.core is None else (world.core.position,)),
+                    *(
+                        unit.position
+                        for unit in world.friendlies
+                        if unit.unit_type in {UnitType.WORKER, UnitType.RANGER}
+                    ),
+                }
+            )
+        )
+        distances: dict[Position, int] = {}
+        queue: deque[Position] = deque()
+        for cell in protected:
+            if cell in world.known_obstacles or cell in distances:
+                continue
+            distances[cell] = 0
+            queue.append(cell)
+        while queue and len(distances) < self.config.path_node_limit:
+            current = queue.popleft()
+            for _, neighbor in cardinal_neighbors(current):
+                if (
+                    neighbor in distances
+                    or neighbor in world.known_obstacles
+                    or neighbor not in world.known_passable
+                ):
+                    continue
+                distances[neighbor] = distances[current] + 1
+                queue.append(neighbor)
+        path_next = tuple(
+            sorted(
+                legal,
+                key=lambda cell: (
+                    distances.get(cell, 1 << 20),
+                    -self._enemy_action_value(world, enemy, cell),
+                    cell,
+                ),
+            )
+        )
+        return HostileApproachEstimate(
+            target_id=enemy.id,
+            candidate_cells=tuple(legal),
+            path_next_cells=path_next,
+            path_costs=tuple(sorted(distances.items())),
+            protected_targets=protected,
+            evidence=("MULTI_SOURCE_PATH_FIELD",),
         )
 
     def _enemy_ranger_fire_estimate(
@@ -1462,6 +1581,7 @@ class CombatPlanner:
             enemies.sort(key=lambda enemy: self.target_priority(world, projection, enemy))
 
         assigned: set[UUID] = set()
+        reserved_intercepts: set[Position] = set()
         response_counts: defaultdict[UUID, int] = defaultdict(int)
         tasks: list[VanguardInterceptTask] = []
 
@@ -1485,10 +1605,23 @@ class CombatPlanner:
             candidates = predictions[target.id]
             rows = []
             for vanguard in available:
-                intercept, cost = profiles[(vanguard.id, target.id)]
+                intercept, cost = self._vanguard_assignment_cost(
+                    world,
+                    projection,
+                    vanguard,
+                    target,
+                    predictions[target.id],
+                    fields[vanguard.id],
+                    reserved=frozenset(reserved_intercepts),
+                )
+                if intercept in reserved_intercepts:
+                    continue
                 rows.append((cost, vanguard.id.bytes, vanguard, intercept))
+            if not rows:
+                return False
             cost, _, vanguard, intercept = min(rows, key=lambda row: row[:2])
             assigned.add(vanguard.id)
+            reserved_intercepts.add(intercept)
             response_counts[target.id] += 1
             tasks.append(
                 VanguardInterceptTask(
@@ -1564,6 +1697,8 @@ class CombatPlanner:
         target: EntitySnapshot,
         candidates: tuple[Position, ...],
         distances: dict[Position, int],
+        *,
+        reserved: frozenset[Position] = frozenset(),
     ) -> tuple[Position, tuple[int, ...]]:
         assert world.core is not None
         intercepts = {
@@ -1574,13 +1709,27 @@ class CombatPlanner:
             and neighbor not in world.known_obstacles
             and neighbor not in projection.hostile_occupied
             and neighbor not in projection.service_positions
+            and neighbor not in reserved
             and manhattan(neighbor, world.core.position)
             <= self.config.home_pursuit_radius
         }
-        if any(manhattan(vanguard.position, cell) == 1 for cell in candidates):
+        if (
+            vanguard.position not in reserved
+            and any(manhattan(vanguard.position, cell) == 1 for cell in candidates)
+        ):
             intercepts.add(vanguard.position)
         if not intercepts:
-            intercepts.add(vanguard.position)
+            return vanguard.position, (
+                1,
+                1 << 20,
+                0,
+                1,
+                1 << 20,
+                1 << 20,
+                1 << 20,
+                vanguard.position[0],
+                vanguard.position[1],
+            )
         screening = self.memory.screening_groups.get(target.id)
         rows = []
         for cell in intercepts:

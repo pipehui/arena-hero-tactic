@@ -902,6 +902,57 @@ class DecisionTraceBuilder:
                 if service.patient_gateway is None
                 else list(service.patient_gateway)
             ),
+            "service_windows": [
+                {
+                    "actor_id": str(window.actor_id),
+                    "operation": window.operation,
+                    "enter_tick": window.enter_tick,
+                    "service_tick": window.service_tick,
+                    "exit_tick": window.exit_tick,
+                    "gateway": (
+                        None if window.gateway is None else list(window.gateway)
+                    ),
+                    "status": window.status,
+                }
+                for window in service.service_windows
+            ],
+            "patient_queue": [
+                {
+                    "patient_id": str(patient.patient_id),
+                    "urgent": patient.urgent,
+                    "hp_percent": patient.hp_percent,
+                    "eta": patient.eta,
+                    "gateway": (
+                        None if patient.gateway is None else list(patient.gateway)
+                    ),
+                    "stalled_ticks": patient.stalled_ticks,
+                    "resource_cost": patient.resource_cost,
+                    "status": patient.status,
+                }
+                for patient in service.patient_queue
+            ],
+            "service_cell_leases": [
+                {
+                    "cell": list(lease.cell),
+                    "purpose": lease.purpose,
+                    "owner_id": (
+                        None if lease.owner_id is None else str(lease.owner_id)
+                    ),
+                    "start_tick": lease.start_tick,
+                    "end_tick": lease.end_tick,
+                    "active": lease.active,
+                }
+                for lease in service.service_cell_leases
+            ],
+            "blocking_units": [
+                {
+                    "unit_id": str(unit_id),
+                    "cell": list(cell),
+                    "reason": reason,
+                }
+                for unit_id, cell, reason in service.blocking_units
+            ],
+            "reschedule_reasons": list(service.reschedule_reasons),
             "core_slot_reserved": service.core_slot_reserved,
             "timeline": (
                 None

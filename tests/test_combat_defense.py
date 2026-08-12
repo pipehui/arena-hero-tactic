@@ -22,6 +22,36 @@ from tests.helpers import enemy_core, friendly_core, make_turn, uid, unit
 
 
 class CombatDefenseTests(unittest.TestCase):
+    def test_home_vanguards_receive_unique_intercept_cells(self) -> None:
+        vanguards = (
+            unit(1, UnitType.VANGUARD, (-2, -2)),
+            unit(2, UnitType.VANGUARD, (2, -2)),
+            unit(3, UnitType.VANGUARD, (-3, 0)),
+            unit(4, UnitType.VANGUARD, (3, 0)),
+            unit(5, UnitType.VANGUARD, (0, -2)),
+            unit(6, UnitType.VANGUARD, (1, -2)),
+        )
+        enemies = (
+            unit(900, UnitType.VANGUARD, (1, -5), controlled=False),
+            unit(901, UnitType.VANGUARD, (2, -5), controlled=False),
+            unit(902, UnitType.VANGUARD, (0, -6), controlled=False),
+        )
+        memory = TacticMemory(opening_complete=True)
+        memory.known_passable.update(
+            (x, y)
+            for x in range(-8, 9)
+            for y in range(-8, 9)
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(
+            make_turn(units=vanguards, enemies=enemies, resources=0)
+        )
+
+        tasks = tactic.last_decision_trace["combat"]["home_vanguard_assignment"]["tasks"]
+        intercepts = [tuple(row["intercept_cell"]) for row in tasks]
+        self.assertEqual(len(intercepts), len(set(intercepts)))
+
     def test_global_vanguard_assignment_uses_nearest_defender_before_uuid_order(self) -> None:
         vanguards = (
             unit(1, UnitType.VANGUARD, (1, -5)),
@@ -97,6 +127,8 @@ class CombatDefenseTests(unittest.TestCase):
         ]
         self.assertGreaterEqual(len(advancing), 2)
         self.assertTrue(all(task["action"] == "MOVE" for task in advancing))
+        stances = [tuple(task["metadata"]["firing_stance"]) for task in advancing]
+        self.assertEqual(len(stances), len(set(stances)))
 
     def test_ranger_prioritizes_visible_enemy_beacon_carrier(self) -> None:
         ranger = unit(1, UnitType.RANGER, (0, 0))
@@ -584,6 +616,32 @@ class CombatDefenseTests(unittest.TestCase):
         )
         tactic.choose_actions(fourth)
         self.assertEqual(fourth.plan.unit_actions[ranger.id].expected_cell, (2, 0))
+
+    def test_vanguard_prediction_uses_the_opening_in_a_blocking_wall(self) -> None:
+        memory = TacticMemory(opening_complete=True)
+        memory.known_passable.update(
+            (x, y)
+            for x in range(-8, 9)
+            for y in range(-8, 9)
+        )
+        wall = tuple((x, -3) for x in range(-3, 2))
+        memory.known_obstacles.update(wall)
+        ranger = unit(1, UnitType.RANGER, (3, -2))
+        enemy = unit(100, UnitType.VANGUARD, (0, -4), controlled=False)
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(
+            make_turn(
+                units=(ranger,),
+                enemies=(enemy,),
+                obstacle_cells=wall,
+                resources=0,
+            )
+        )
+
+        estimate = tactic.last_decision_trace["combat"]["enemy_action_candidates"][0]
+        self.assertEqual(estimate["ranked_cells"][0], [1, -4])
+        self.assertIn("OBSTACLE_AWARE_APPROACH", estimate["evidence"])
 
     def test_full_health_vanguard_accepts_one_nonfatal_hit_to_improve_intercept(self) -> None:
         vanguard = unit(1, UnitType.VANGUARD, (2, 0))

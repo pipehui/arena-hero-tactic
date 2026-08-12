@@ -11,6 +11,7 @@ from arena_tactic import (
     ActionIntent,
     BalancedTactic,
     CargoReturnReservation,
+    CoreServiceWindow,
     CoreServiceQueue,
     CoreOperationRequest,
     CoreOperationTimeline,
@@ -18,9 +19,12 @@ from arena_tactic import (
     EnemyRangerFireEstimate,
     FireMission,
     HomeCombatAssignment,
+    HostileApproachEstimate,
     HomeCounterSiegeDecision,
     IntentResolution,
     PatientAdmissionProgress,
+    PatientQueueEntry,
+    ServiceCellLease,
     TacticalMap,
     ThreatHeatCell,
     UnitMission,
@@ -39,6 +43,7 @@ class PublicContractTests(unittest.TestCase):
             WorldModel,
             ActionIntent,
             CargoReturnReservation,
+            CoreServiceWindow,
             IntentResolution,
             CoreServiceQueue,
             CoreOperationRequest,
@@ -50,8 +55,11 @@ class PublicContractTests(unittest.TestCase):
             EnemyRangerFireEstimate,
             CrisisForceBaseline,
             HomeCombatAssignment,
+            HostileApproachEstimate,
             HomeCounterSiegeDecision,
             PatientAdmissionProgress,
+            PatientQueueEntry,
+            ServiceCellLease,
             VanguardAssignmentCandidate,
             VanguardInterceptTask,
             WorkerTaskProgress,
@@ -103,14 +111,14 @@ class PublicContractTests(unittest.TestCase):
 
         self.assertIsInstance(turn.plan.unit_actions[worker.id], WaitAction)
 
-    def test_decision_trace_is_detached_schema_29_data(self) -> None:
+    def test_decision_trace_is_detached_schema_30_data(self) -> None:
         turn = make_turn(units=(unit(1, UnitType.WORKER, (1, 0)),))
         tactic = BalancedTactic()
         tactic.choose_actions(turn)
 
         trace = tactic.last_decision_trace
 
-        self.assertEqual(trace["schema_version"], 29)
+        self.assertEqual(trace["schema_version"], 30)
         self.assertIn("resolution", trace)
         self.assertIn("world", trace)
         global_map = trace["world"]["global_map"]

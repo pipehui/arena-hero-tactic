@@ -695,7 +695,7 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         tactic.choose_actions(turn)
 
         queue = tactic.last_decision_trace["economy"]["service_queue"]
-        self.assertEqual(queue["admission_id"], str(ready.id))
+        self.assertIsNone(queue["admission_id"])
         self.assertIsInstance(turn.plan.unit_actions[ready.id], MoveAction)
         self.assertEqual(turn.plan.unit_actions[ready.id].direction, Direction.UP)
 
@@ -919,16 +919,17 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         )
         tactic = BalancedTactic(memory=memory)
 
-        tactic.choose_actions(
-            make_turn(
-                tick=3,
-                units=(unit(1, UnitType.WORKER, (5, 0), cargo=1), second),
-                resources=0,
-            )
+        turn = make_turn(
+            tick=3,
+            units=(unit(1, UnitType.WORKER, (5, 0), cargo=1), second),
+            resources=0,
         )
+        tactic.choose_actions(turn)
 
         queue = tactic.last_decision_trace["economy"]["service_queue"]
-        self.assertEqual(queue["admission_id"], str(second.id))
+        self.assertIsNone(queue["admission_id"])
+        self.assertIsInstance(turn.plan.unit_actions[second.id], MoveAction)
+        self.assertEqual(turn.plan.unit_actions[second.id].direction, Direction.UP)
         self.assertEqual(queue["release_reason"], "LEFT_READY_LINE")
 
     def test_moving_core_clears_ready_fifo(self) -> None:
@@ -1616,21 +1617,61 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         self.assertEqual(task["mission"], UnitMission.RECOVER.value)
         self.assertEqual(task["reason"], "RECOVERY_ROUTE_BLOCKED_THIS_TICK")
 
-    def test_mildly_wounded_unit_is_admitted_from_outside_the_service_line(self) -> None:
+    def test_remote_mild_patient_is_future_work_not_current_admission(self) -> None:
         wounded = unit(2, UnitType.VANGUARD, (3, 0), hp=3)
         turn = make_turn(units=(wounded,), resources=1)
         tactic = BalancedTactic()
 
         tactic.choose_actions(turn)
 
-        self.assertEqual(tactic.memory.service_admission_id, wounded.id)
+        self.assertIsNone(tactic.memory.service_admission_id)
         self.assertIsInstance(turn.plan.unit_actions[wounded.id], MoveAction)
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        self.assertNotEqual(queue["service"], "MAINTENANCE_HEAL")
+        self.assertFalse(queue["core_slot_reserved"])
         task = next(
             item
             for item in tactic.last_decision_trace["tasks"]
             if item["actor_id"] == str(wounded.id)
         )
         self.assertEqual(task["mission"], UnitMission.RECOVER.value)
+
+    def test_wounded_core_occupant_is_healed_before_adjacent_cargo_enters(self) -> None:
+        carrier = unit(1, UnitType.WORKER, (1, 0), cargo=1)
+        patient = unit(2, UnitType.VANGUARD, (0, 0), hp=3)
+        turn = make_turn(units=(carrier, patient), resources=1)
+        tactic = BalancedTactic()
+
+        tactic.choose_actions(turn)
+
+        self.assertEqual(tactic.memory.service_admission_id, patient.id)
+        self.assertIsInstance(turn.plan.unit_actions[patient.id], HealAction)
+        self.assertNotIsInstance(turn.plan.unit_actions[carrier.id], MoveAction)
+
+    def test_future_carrier_clears_active_service_cell_instead_of_waiting(self) -> None:
+        carrier = unit(1, UnitType.WORKER, (-1, 0), cargo=1)
+        patient = unit(2, UnitType.RANGER, (-2, 0), hp=1)
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            service_entrance=(1, 0),
+            service_queue_cells=((1, 0), (2, 0)),
+            service_exit_cell=(-1, 0),
+            service_deposit_ticks={carrier.id: 20},
+        )
+        turn = make_turn(tick=10, units=(carrier, patient), resources=2)
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(turn)
+
+        action = turn.plan.unit_actions[carrier.id]
+        self.assertIsInstance(action, MoveAction)
+        task = next(
+            item
+            for item in tactic.last_decision_trace["tasks"]
+            if item["actor_id"] == str(carrier.id)
+        )
+        self.assertEqual(task["reason"], "CLEAR_FUTURE_SERVICE_CELL")
 
     def test_ready_cargo_precedes_mild_maintenance_treatment(self) -> None:
         carrier = unit(1, UnitType.WORKER, (1, 0), cargo=1)

@@ -13,15 +13,18 @@ from .models import (
     CargoReturnReservation,
     CoreOperationRequest,
     CoreOperationTimeline,
+    CoreServiceWindow,
     CoreServiceQueue,
     EntitySnapshot,
     IntentAction,
+    PatientQueueEntry,
     PatientAdmissionProgress,
+    ServiceCellLease,
     UnitMission,
     WorldModel,
 )
 from .projection import TacticalMap
-from .planning import route_to, weighted_route_to
+from .planning import route_to, weighted_distance_field, weighted_route_to
 from .rules import UNIT_MAX_HP
 from .state import TacticMemory
 
@@ -31,6 +34,7 @@ _SERVICE_MISSIONS = frozenset(
         UnitMission.DEPOSIT,
         UnitMission.RETURN_CARGO,
         UnitMission.CLEAR_CORE,
+        UnitMission.CLEAR_SERVICE_CELL,
         UnitMission.RECOVER,
     }
 )
@@ -155,6 +159,110 @@ def cargo_return_route(
         slack_ticks=None,
         status="RETURNING",
     )
+
+
+def cargo_return_routes(
+    world: WorldModel,
+    projection: TacticalMap,
+    carriers: tuple[EntitySnapshot, ...],
+    core_position: Position,
+    queue_cells: tuple[Position, ...],
+    *,
+    node_limit: int,
+    exit_cell: Position | None = None,
+    direct_core_id: UUID | None = None,
+) -> tuple[CargoReturnReservation, ...]:
+    """Route a cargo wave through one shared danger-weighted return field.
+
+    Workers already on the service line retain its deterministic one-step
+    choreography.  Remote Workers reuse a field rooted at the queue tail;
+    only actors outside the bounded field fall back to a single-target A*.
+    """
+
+    target = queue_cells[-1] if queue_cells else core_position
+    blocked = set(projection.hostile_occupied)
+    blocked.update(projection.immediate_damage)
+    blocked.update({core_position, *queue_cells[:-1]})
+    if exit_cell is not None:
+        blocked.add(exit_cell)
+    blocked.discard(target)
+    distances, parents = weighted_distance_field(
+        world,
+        target,
+        node_limit=node_limit,
+        blocked=frozenset(blocked),
+        cell_costs=projection.route_costs_for(UnitType.WORKER),
+    )
+
+    def shared_route(carrier: EntitySnapshot) -> CargoReturnReservation:
+        if (
+            carrier.position == core_position
+            or carrier.position in queue_cells
+            or (
+                carrier.id == direct_core_id
+                and manhattan(carrier.position, core_position) == 1
+            )
+        ):
+            return cargo_return_route(
+                world,
+                projection,
+                carrier,
+                core_position,
+                queue_cells,
+                node_limit=node_limit,
+                exit_cell=exit_cell,
+                direct_core=carrier.id == direct_core_id,
+            )
+        parent = parents.get(carrier.position)
+        if carrier.position not in distances or parent is None:
+            return cargo_return_route(
+                world,
+                projection,
+                carrier,
+                core_position,
+                queue_cells,
+                node_limit=node_limit,
+                exit_cell=exit_cell,
+                direct_core=carrier.id == direct_core_id,
+            )
+        first_position = parent[0]
+        first_direction = _cardinal_direction(carrier.position, first_position)
+        steps = 0
+        cursor = carrier.position
+        seen: set[Position] = set()
+        while cursor != target and cursor not in seen:
+            seen.add(cursor)
+            predecessor = parents.get(cursor)
+            if predecessor is None:
+                break
+            cursor = predecessor[0]
+            steps += 1
+        if cursor != target or first_direction is None:
+            return cargo_return_route(
+                world,
+                projection,
+                carrier,
+                core_position,
+                queue_cells,
+                node_limit=node_limit,
+                exit_cell=exit_cell,
+                direct_core=carrier.id == direct_core_id,
+            )
+        distance = steps + len(queue_cells)
+        return CargoReturnReservation(
+            worker_id=carrier.id,
+            route_target=target,
+            route_distance=distance,
+            first_direction=first_direction,
+            first_position=first_position,
+            earliest_deposit_tick=world.tick + distance,
+            scheduled_deposit_tick=None,
+            departure_tick=None,
+            slack_ticks=None,
+            status="RETURNING",
+        )
+
+    return tuple(shared_route(carrier) for carrier in carriers)
 
 
 def service_protected_positions(
@@ -286,16 +394,25 @@ class CoreServicePlanner:
                 else 0
             )
             self.memory.service_worker_progress[carrier.id] = carrier.position, stalled
-        if self.memory.patient_admission_progress is not None and urgent:
+        if self.memory.patient_admission_progress is not None and wounded:
             sticky_id = self.memory.patient_admission_progress.patient_id
-            if self.memory.patient_admission_progress.stalled_ticks >= 2 and len(urgent) > 1:
-                urgent = tuple(unit for unit in urgent if unit.id != sticky_id) + tuple(
-                    unit for unit in urgent if unit.id == sticky_id
+            if (
+                self.memory.patient_admission_progress.stalled_ticks >= 2
+                and len(wounded) > 1
+            ):
+                wounded = tuple(unit for unit in wounded if unit.id != sticky_id) + tuple(
+                    unit for unit in wounded if unit.id == sticky_id
                 )
             else:
-                urgent = tuple(unit for unit in urgent if unit.id == sticky_id) + tuple(
-                    unit for unit in urgent if unit.id != sticky_id
+                wounded = tuple(unit for unit in wounded if unit.id == sticky_id) + tuple(
+                    unit for unit in wounded if unit.id != sticky_id
                 )
+            urgent = tuple(
+                unit
+                for unit in wounded
+                if unit.hp * 100
+                <= UNIT_MAX_HP[unit.unit_type] * self.config.recovery_urgent_percent
+            )
 
         previous_lane = self.memory.service_entrance, self.memory.service_queue_cells
         service_core_position = (
@@ -321,10 +438,23 @@ class CoreServicePlanner:
         )
         if previous_lane != (entrance, queue_cells):
             self.memory.cargo_arrival_ticks.clear()
+        core_wounded = next(
+            (
+                unit
+                for unit in wounded
+                if unit.position == service_core_position
+            ),
+            None,
+        )
+        selected_patient = (
+            core_wounded
+            or (urgent[0] if urgent else None)
+            or (wounded[0] if wounded else None)
+        )
         patient_gateway = self._choose_patient_gateway(
             world,
             projection,
-            urgent[0] if urgent else wounded[0] if wounded else None,
+            selected_patient,
             entrance,
             exit_cell,
             service_core_position,
@@ -500,14 +630,17 @@ class CoreServicePlanner:
         patient_progress = self._patient_progress(
             world,
             projection,
-            (
-                urgent[0]
-                if urgent
-                else admitted_unit
-                if treatment_service
-                else None
-            ),
+            selected_patient,
             patient_gateway,
+        )
+        patient_queue = self._patient_queue_entries(
+            world,
+            projection,
+            wounded,
+            entrance,
+            exit_cell,
+            service_core_position,
+            patient_progress,
         )
         return_reservations = self._shift_reservations_for_patient(
             world,
@@ -544,6 +677,18 @@ class CoreServicePlanner:
             carriers,
             return_reservations,
         )
+        service_windows = self._service_windows(timeline)
+        service_cell_leases = self._service_cell_leases(
+            world,
+            service_windows,
+            entrance,
+            queue_cells,
+            exit_cell,
+        )
+        blocking_units = self._service_blockers(
+            world,
+            service_cell_leases,
+        )
         core_slot_reserved = timeline.current_slot_reserved
 
         release_reason = self._release_reason(
@@ -564,11 +709,9 @@ class CoreServicePlanner:
             ready,
             head,
         )
-        allow_advance = not lane_threatened and service in {
-            "DEPOSIT",
-            "DEPOSIT_BEFORE_PATIENT",
-            "HEAL_FUNDING",
-            "WOUNDED_CARGO_DEPOSIT",
+        allow_advance = not lane_threatened and service not in {
+            "EMERGENCY_HEAL",
+            "MAINTENANCE_HEAL",
         }
         return CoreServiceQueue(
             service="PAUSED" if paused_reason is not None else service,
@@ -614,6 +757,19 @@ class CoreServicePlanner:
             patient_gateway=patient_gateway,
             core_slot_reserved=core_slot_reserved,
             patient_progress=patient_progress,
+            service_windows=service_windows,
+            patient_queue=patient_queue,
+            service_cell_leases=service_cell_leases,
+            blocking_units=blocking_units,
+            reschedule_reasons=tuple(
+                sorted(
+                    {
+                        row.delay_reason
+                        for row in return_reservations
+                        if row.delay_reason is not None
+                    }
+                )
+            ),
             timeline=timeline,
             reserved_resources=reserved,
             paused_reason=paused_reason,
@@ -699,18 +855,15 @@ class CoreServicePlanner:
     ) -> tuple[CargoReturnReservation, ...]:
         """Build executable routes and a stable, feasibility-correct calendar."""
 
-        drafts = tuple(
-            cargo_return_route(
-                world,
-                projection,
-                carrier,
-                core_position,
-                queue_cells,
-                node_limit=self.config.path_node_limit,
-                exit_cell=exit_cell,
-                direct_core=carrier.id == emergency_ready_id,
-            )
-            for carrier in carriers
+        drafts = cargo_return_routes(
+            world,
+            projection,
+            carriers,
+            core_position,
+            queue_cells,
+            node_limit=self.config.path_node_limit,
+            exit_cell=exit_cell,
+            direct_core_id=emergency_ready_id,
         )
         reachable = tuple(
             row
@@ -736,46 +889,20 @@ class CoreServicePlanner:
                 assigned += 1
             return assigned
 
-        assigned_rows: dict[UUID, CargoReturnReservation] = {}
-        stable = sorted(
-            (
-                row
-                for row in reachable
-                if row.worker_id in self.memory.service_deposit_ticks
-                and self.memory.service_deposit_ticks[row.worker_id]
-                >= row.earliest_deposit_tick
-            ),
-            key=lambda row: (
-                self.memory.service_deposit_ticks[row.worker_id],
-                self.memory.service_cargo_first_seen_ticks.get(row.worker_id, world.tick),
-                row.worker_id.bytes,
-            ),
-        )
-        for row in stable:
-            requested = self.memory.service_deposit_ticks[row.worker_id]
-            assigned = next_available(requested)
-            used_ticks.add(assigned)
-            departure = assigned - row.route_distance
-            assigned_rows[row.worker_id] = replace(
-                row,
-                scheduled_deposit_tick=assigned,
-                departure_tick=departure,
-                slack_ticks=max(0, departure - world.tick),
-                status=reservation_status(row, departure),
-                delay_reason=(
-                    None if assigned == requested else "SERVICE_CONFLICT"
-                ),
-            )
-
-        pending = sorted(
-            (row for row in reachable if row.worker_id not in assigned_rows),
+        # Rebuild a compressed rolling calendar from current physical ETAs.
+        # Previous ticks only stabilize equal-ETA ordering; they never pin an
+        # unreachable absolute appointment or leave a stale hole at the head.
+        ordered = sorted(
+            reachable,
             key=lambda row: (
                 row.earliest_deposit_tick,
                 self.memory.service_cargo_first_seen_ticks.get(row.worker_id, world.tick),
+                self.memory.service_deposit_ticks.get(row.worker_id, 1 << 60),
                 row.worker_id.bytes,
             ),
         )
-        for row in pending:
+        assigned_rows: dict[UUID, CargoReturnReservation] = {}
+        for row in ordered:
             assert row.earliest_deposit_tick is not None
             requested = self.memory.service_deposit_ticks.get(row.worker_id)
             assigned = next_available(row.earliest_deposit_tick)
@@ -790,6 +917,8 @@ class CoreServicePlanner:
                 delay_reason=(
                     "MISSED_APPOINTMENT"
                     if requested is not None and requested < row.earliest_deposit_tick
+                    else "ROLLING_COMPRESSION"
+                    if requested is not None and assigned < requested
                     else "SERVICE_CONFLICT"
                     if assigned > row.earliest_deposit_tick
                     else None
@@ -827,6 +956,7 @@ class CoreServicePlanner:
         if (
             patient_progress is None
             or patient_progress.entry_distance is None
+            or patient_progress.entry_distance > 2
         ):
             return reservations
         patient_tick = world.tick + patient_progress.entry_distance
@@ -992,6 +1122,212 @@ class CoreServicePlanner:
         )
         self.memory.patient_admission_progress = progress
         return progress
+
+    def _patient_queue_entries(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        wounded: tuple[EntitySnapshot, ...],
+        entrance: Position | None,
+        exit_cell: Position | None,
+        core_position: Position,
+        selected_progress: PatientAdmissionProgress | None,
+    ) -> tuple[PatientQueueEntry, ...]:
+        rows: list[PatientQueueEntry] = []
+        for patient in wounded:
+            gateway = self._choose_patient_gateway(
+                world,
+                projection,
+                patient,
+                entrance,
+                exit_cell,
+                core_position,
+            )
+            if patient.position == core_position:
+                eta = 0
+            elif gateway is None:
+                eta = None
+            else:
+                route = route_to(
+                    world,
+                    patient.position,
+                    gateway,
+                    node_limit=self.config.path_node_limit,
+                    blocked=frozenset(
+                        projection.hostile_occupied - {patient.position, gateway}
+                    ),
+                )
+                eta = None if route is None else route.distance + 1
+            progress = (
+                selected_progress
+                if selected_progress is not None
+                and selected_progress.patient_id == patient.id
+                else None
+            )
+            urgent = patient.hp * 2 <= UNIT_MAX_HP[patient.unit_type]
+            rows.append(
+                PatientQueueEntry(
+                    patient_id=patient.id,
+                    urgent=urgent,
+                    hp_percent=patient.hp * 100 // UNIT_MAX_HP[patient.unit_type],
+                    eta=eta,
+                    gateway=gateway,
+                    stalled_ticks=0 if progress is None else progress.stalled_ticks,
+                    resource_cost=UNIT_MAX_HP[patient.unit_type] - patient.hp,
+                    status=(
+                        "ON_CORE"
+                        if eta == 0
+                        else "ENTRY_READY"
+                        if eta == 1
+                        else "APPROACHING"
+                        if eta is not None
+                        else "NO_SAFE_ENTRY"
+                    ),
+                )
+            )
+        return tuple(
+            sorted(
+                rows,
+                key=lambda row: (
+                    row.eta != 0,
+                    not row.urgent,
+                    row.hp_percent,
+                    1 << 30 if row.eta is None else row.eta,
+                    row.patient_id.bytes,
+                ),
+            )
+        )
+
+    @staticmethod
+    def _service_windows(
+        timeline: CoreOperationTimeline,
+    ) -> tuple[CoreServiceWindow, ...]:
+        rows = []
+        for request in timeline.requests:
+            if request.actor_id is None:
+                continue
+            service_tick = (
+                request.release_tick - 1
+                if request.operation == "DEPOSIT"
+                else request.occupy_tick
+            )
+            enter_tick = (
+                request.occupy_tick
+                if request.operation == "DEPOSIT"
+                else max(timeline.tick, request.occupy_tick - 1)
+            )
+            rows.append(
+                CoreServiceWindow(
+                    actor_id=request.actor_id,
+                    operation=request.operation,
+                    enter_tick=enter_tick,
+                    service_tick=service_tick,
+                    exit_tick=request.release_tick,
+                    gateway=request.gateway,
+                    status=(
+                        "CURRENT"
+                        if service_tick <= timeline.tick
+                        else "ENTRY_DUE"
+                        if enter_tick <= timeline.tick + 1
+                        else "FUTURE"
+                    ),
+                )
+            )
+        return tuple(
+            sorted(
+                rows,
+                key=lambda row: (
+                    row.enter_tick,
+                    row.service_tick,
+                    row.actor_id.bytes,
+                ),
+            )
+        )
+
+    @staticmethod
+    def _service_cell_leases(
+        world: WorldModel,
+        windows: tuple[CoreServiceWindow, ...],
+        entrance: Position | None,
+        queue_cells: tuple[Position, ...],
+        exit_cell: Position | None,
+    ) -> tuple[ServiceCellLease, ...]:
+        if world.core is None:
+            return ()
+        positions = {unit.id: unit.position for unit in world.friendlies}
+        leases: dict[Position, ServiceCellLease] = {}
+        for window in windows:
+            if window.enter_tick > world.tick + 2:
+                continue
+            cells = [(world.core.position, "CORE_SLOT")]
+            if window.operation == "HEAL" and window.gateway is not None:
+                cells.append((window.gateway, "PATIENT_GATEWAY"))
+            elif (
+                window.operation == "DEPOSIT"
+                and positions.get(window.actor_id) != world.core.position
+            ):
+                actor_position = positions.get(window.actor_id)
+                if actor_position in queue_cells:
+                    cells.append(
+                        (
+                            actor_position,
+                            "CARGO_ENTRANCE"
+                            if actor_position == entrance
+                            else "QUEUE_NEXT",
+                        )
+                    )
+                elif entrance is not None:
+                    cells.append((entrance, "CARGO_ENTRANCE"))
+            if exit_cell is not None and window.service_tick <= world.tick:
+                cells.append((exit_cell, "SERVICE_EXIT"))
+            for cell, purpose in cells:
+                start_tick = max(world.tick, window.enter_tick - 1)
+                lease = ServiceCellLease(
+                    cell=cell,
+                    purpose=purpose,
+                    owner_id=window.actor_id,
+                    start_tick=start_tick,
+                    end_tick=window.exit_tick,
+                    active=start_tick <= world.tick,
+                )
+                previous = leases.get(cell)
+                purpose_priority = {
+                    "PATIENT_GATEWAY": 0,
+                    "SERVICE_EXIT": 1,
+                    "CARGO_ENTRANCE": 2,
+                    "QUEUE_NEXT": 3,
+                    "CORE_SLOT": 4,
+                }
+                if previous is None or (
+                    lease.start_tick,
+                    purpose_priority[lease.purpose],
+                    lease.owner_id.bytes,
+                ) < (
+                    previous.start_tick,
+                    purpose_priority[previous.purpose],
+                    b"" if previous.owner_id is None else previous.owner_id.bytes,
+                ):
+                    leases[cell] = lease
+        return tuple(sorted(leases.values(), key=lambda row: (row.cell, row.purpose)))
+
+    @staticmethod
+    def _service_blockers(
+        world: WorldModel,
+        leases: tuple[ServiceCellLease, ...],
+    ) -> tuple[tuple[UUID, Position, str], ...]:
+        lease_by_cell = {lease.cell: lease for lease in leases if lease.active}
+        return tuple(
+            sorted(
+                (
+                    (unit.id, unit.position, f"BLOCKS_{lease_by_cell[unit.position].purpose}")
+                    for unit in world.friendlies
+                    if unit.position in lease_by_cell
+                    and unit.id != lease_by_cell[unit.position].owner_id
+                    and (world.core is None or unit.position != world.core.position)
+                ),
+                key=lambda row: (row[1], row[0].bytes),
+            )
+        )
 
     def _service_actors(
         self,
@@ -1210,6 +1546,14 @@ class CoreServicePlanner:
         service = "IDLE"
         reserved = 0
         patient = urgent[0] if urgent else None
+        core_occupant = next(
+            (
+                unit
+                for unit in units_by_id.values()
+                if unit.position == service_core_position
+            ),
+            None,
+        )
         core_carrier = next(
             (
                 carrier
@@ -1219,9 +1563,31 @@ class CoreServicePlanner:
             ),
             None,
         )
+        executable_head = (
+            head
+            if head is not None
+            and manhattan(head.position, service_core_position) <= 1
+            else None
+        )
         if core_carrier is not None:
             admission = core_carrier.id
             service = "DEPOSIT"
+        elif (
+            core_occupant is not None
+            and core_occupant.hp < UNIT_MAX_HP[core_occupant.unit_type]
+            and world.resources
+            >= UNIT_MAX_HP[core_occupant.unit_type] - core_occupant.hp
+        ):
+            # The physical occupant is authoritative.  A future patient or
+            # adjacent carrier cannot displace a heal that is executable now.
+            admission = core_occupant.id
+            missing = UNIT_MAX_HP[core_occupant.unit_type] - core_occupant.hp
+            reserved = missing
+            service = (
+                "EMERGENCY_HEAL"
+                if core_occupant.hp * 2 <= UNIT_MAX_HP[core_occupant.unit_type]
+                else "MAINTENANCE_HEAL"
+            )
         elif patient is not None:
             missing = UNIT_MAX_HP[patient.unit_type] - patient.hp
             reserved = missing
@@ -1230,14 +1596,18 @@ class CoreServicePlanner:
                 and patient.cargo > 0
                 and world.resources < world.resource_capacity
             ):
-                if patient.id in ready_ids:
+                if (
+                    patient.id in ready_ids
+                    and manhattan(patient.position, service_core_position) <= 1
+                ):
                     admission = (
-                        head.id
-                        if head is not None and head.id != patient.id
+                        executable_head.id
+                        if executable_head is not None
+                        and executable_head.id != patient.id
                         else patient.id
                     )
                     service = "WOUNDED_CARGO_DEPOSIT"
-                elif head is not None:
+                elif executable_head is not None:
                     admission = (
                         previous_admission
                         if self._existing_is_front(
@@ -1246,7 +1616,7 @@ class CoreServicePlanner:
                             ready_ids,
                             lane_index,
                         )
-                        else head.id
+                        else executable_head.id
                     )
                     service = "HEAL_FUNDING"
                 else:
@@ -1264,7 +1634,7 @@ class CoreServicePlanner:
                 if patient_can_enter:
                     admission = patient.id
                     service = "EMERGENCY_HEAL"
-                elif head is not None:
+                elif executable_head is not None:
                     admission = (
                         previous_admission
                         if self._existing_is_front(
@@ -1273,12 +1643,12 @@ class CoreServicePlanner:
                             ready_ids,
                             lane_index,
                         )
-                        else head.id
+                        else executable_head.id
                     )
                     service = "DEPOSIT_BEFORE_PATIENT"
                 else:
                     service = "EMERGENCY_APPROACH"
-            elif head is not None:
+            elif executable_head is not None:
                 admission = (
                     previous_admission
                     if self._existing_is_front(
@@ -1287,7 +1657,7 @@ class CoreServicePlanner:
                         ready_ids,
                         lane_index,
                     )
-                    else head.id
+                    else executable_head.id
                 )
                 service = "HEAL_FUNDING"
             else:
@@ -1295,24 +1665,37 @@ class CoreServicePlanner:
 
         if admission is None and previous_admission is not None:
             previous_unit = units_by_id.get(previous_admission)
-            if previous_unit is not None and self._existing_is_front(
-                previous_admission,
-                ready,
-                ready_ids,
-                lane_index,
+            if (
+                previous_unit is not None
+                and manhattan(previous_unit.position, service_core_position) <= 1
+                and self._existing_is_front(
+                    previous_admission,
+                    ready,
+                    ready_ids,
+                    lane_index,
+                )
             ):
                 admission = previous_admission
                 service = "DEPOSIT"
-        if admission is None and head is not None:
+        if (
+            admission is None
+            and head is not None
+            and manhattan(head.position, service_core_position) <= 1
+        ):
             admission = head.id
             service = "DEPOSIT"
         elif admission is None and wounded and patient is None:
             maintenance = wounded[0]
             missing = UNIT_MAX_HP[maintenance.unit_type] - maintenance.hp
             reserved = max(reserved, missing)
-            if world.resources >= missing:
+            if (
+                world.resources >= missing
+                and manhattan(maintenance.position, service_core_position) <= 1
+            ):
                 admission = maintenance.id
                 service = "MAINTENANCE_HEAL"
+            else:
+                service = "MAINTENANCE_APPROACH"
         if admission is None and carriers and service == "IDLE":
             service = "DEPOSIT_APPROACH"
         return admission, service, reserved
