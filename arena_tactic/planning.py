@@ -469,6 +469,106 @@ def weighted_route_to(
     return Route(steps[target], parent[1], add_direction(start, parent[1]))
 
 
+def weighted_progress_route(
+    world: WorldModel,
+    start: Position,
+    target: Position,
+    *,
+    node_limit: int,
+    blocked: frozenset[Position] = frozenset(),
+    cell_costs: Mapping[Position, int] | None = None,
+) -> tuple[Route, Position] | None:
+    """Return a safe bounded-search segment toward a currently distant goal.
+
+    Unlike ``weighted_route_to`` this routine does not claim that the final
+    target was reached.  It returns the best explored waypoint and the exact
+    first step to that waypoint, so a remote cargo Worker can keep making
+    progress without a second small-budget proof of the entire route.
+    """
+
+    if start == target or node_limit <= 1:
+        return None
+    passable = world.known_passable
+    obstacles = world.known_obstacles
+    costs = cell_costs or {}
+    best = {start: 0}
+    steps = {start: 0}
+    parents: dict[Position, tuple[Position, Direction]] = {}
+    queue: list[tuple[int, int, int, int, int, Position]] = []
+    start_h = manhattan(start, target)
+    heappush(queue, (start_h, start_h, 0, start[0], start[1], start))
+    while queue and len(best) < node_limit:
+        _, _, queued_cost, _, _, current = heappop(queue)
+        if queued_cost != best[current]:
+            continue
+        for direction, neighbor in cardinal_neighbors(current):
+            if neighbor in obstacles or (neighbor in blocked and neighbor != start):
+                continue
+            if neighbor not in passable:
+                continue
+            next_cost = best[current] + 1 + max(0, costs.get(neighbor, 0))
+            if next_cost >= best.get(neighbor, 1 << 60):
+                continue
+            best[neighbor] = next_cost
+            steps[neighbor] = steps[current] + 1
+            parents[neighbor] = current, direction
+            heuristic = manhattan(neighbor, target)
+            heappush(
+                queue,
+                (
+                    next_cost + heuristic,
+                    heuristic,
+                    next_cost,
+                    neighbor[0],
+                    neighbor[1],
+                    neighbor,
+                ),
+            )
+
+    candidates = []
+    for cell in best:
+        if cell == start:
+            continue
+        parent = parents.get(cell)
+        onward = sum(
+            neighbor != (None if parent is None else parent[0])
+            and neighbor in passable
+            and neighbor not in obstacles
+            and neighbor not in blocked
+            for _, neighbor in cardinal_neighbors(cell)
+        )
+        unknown_frontier = any(
+            neighbor not in passable
+            and neighbor not in obstacles
+            and neighbor not in world.visible_cells
+            for _, neighbor in cardinal_neighbors(cell)
+        )
+        if onward == 0 and not unknown_frontier:
+            continue
+        candidates.append(
+            (
+                manhattan(cell, target),
+                best[cell],
+                -steps[cell],
+                cell[0],
+                cell[1],
+                cell,
+            )
+        )
+    if not candidates:
+        return None
+    *_, waypoint = min(candidates)
+    current = waypoint
+    parent = parents.get(current)
+    while parent is not None and parent[0] != start:
+        current = parent[0]
+        parent = parents.get(current)
+    if parent is None:
+        return None
+    route = Route(steps[waypoint], parent[1], add_direction(start, parent[1]))
+    return route, waypoint
+
+
 def route_from_field(
     start: Position,
     target: Position,

@@ -1476,7 +1476,12 @@ class WorkerPlanner:
                     IntentAction.WAIT,
                     UnitMission.RETURN_CARGO,
                     51,
-                    reason="NO_RETURN_ROUTE",
+                    reason=(
+                        "SEGMENT_ROUTE_EXHAUSTED"
+                        if reservation is not None
+                        and reservation.delay_reason == "SEGMENT_ROUTE_EXHAUSTED"
+                        else "FULL_ROUTE_EXHAUSTED"
+                    ),
                 )
             ]
         if reservation.status == "WAIT_FOR_DEPARTURE":
@@ -1610,28 +1615,39 @@ class WorkerPlanner:
                 routes.append(alternate)
 
         intents: list[ActionIntent] = []
+        rejected_first_steps = 0
         for rank, route in enumerate(routes):
             if route.first_direction is None or route.first_position is None:
+                continue
+            if (
+                route.first_position in world.known_obstacles
+                or route.first_position in projection.hostile_occupied
+                or route.first_position in projection.immediate_damage
+            ):
+                rejected_first_steps += 1
                 continue
             terminal_exception = (
                 "CORE_SERVICE"
                 if route.first_position == world.core.position
                 else None
             )
+            # ``primary_route`` is the authoritative route produced by the
+            # same danger/obstacle model that scheduled this service.  Only
+            # prove the executable first step locally here.  Re-running a
+            # 512-node proof all the way to a remote entrance rejected valid
+            # 100+ cell routes and froze their Workers indefinitely.
             viability = move_viability(
                 world,
                 worker.position,
                 route.first_position,
-                target=route_target,
-                node_limit=min(self.config.path_node_limit, 512),
-                require_continuation=(
-                    terminal_exception is None
-                    and route.first_position != route_target
-                ),
-                require_open_area=terminal_exception is None,
+                target=None,
+                node_limit=min(self.config.path_node_limit, 64),
+                require_continuation=False,
+                require_open_area=False,
                 terminal_exception=terminal_exception,
             )
             if not viability.viable:
+                rejected_first_steps += 1
                 continue
             intents.append(
                 ActionIntent.move(
@@ -1660,6 +1676,9 @@ class WorkerPlanner:
                         ("scheduled_deposit_tick", reservation.scheduled_deposit_tick),
                         ("departure_tick", reservation.departure_tick),
                         ("remaining_distance", reservation.route_distance),
+                        ("route_mode", reservation.route_mode),
+                        ("lane_version", reservation.lane_version),
+                        ("waypoint", reservation.waypoint),
                     ) + viability.metadata,
                 )
             )
@@ -1673,7 +1692,18 @@ class WorkerPlanner:
                     "WAITING_FOR_CORE_SLOT"
                     if service.admission_id == worker.id
                     else "WAITING_FOR_SERVICE_SLOT"
-                ) if intents else "NO_RETURN_ROUTE",
+                ) if intents else (
+                    "NO_SAFE_FIRST_STEP"
+                    if rejected_first_steps
+                    else "SEGMENT_ROUTE_EXHAUSTED"
+                    if reservation.route_mode == "SEGMENTED"
+                    else "FULL_ROUTE_EXHAUSTED"
+                ),
+                metadata=(
+                    ("route_mode", reservation.route_mode),
+                    ("lane_version", reservation.lane_version),
+                    ("waypoint", reservation.waypoint),
+                ),
             )
         )
         return intents

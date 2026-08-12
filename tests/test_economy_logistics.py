@@ -300,7 +300,7 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         self.assertEqual(queue["admission_id"], str(carrier.id))
         self.assertEqual(queue["timeline"]["next_service_eta"], 0)
 
-    def test_future_carriers_approach_unique_transit_holds(self) -> None:
+    def test_remote_future_carriers_keep_returning_before_transit_holds(self) -> None:
         carriers = tuple(
             unit(index, UnitType.WORKER, (8 + index, 0), cargo=1)
             for index in range(1, 5)
@@ -316,11 +316,7 @@ class EconomyAndLogisticsTests(unittest.TestCase):
 
         queue = tactic.last_decision_trace["economy"]["service_queue"]
         overflow = queue["overflow_slots"]
-        self.assertGreaterEqual(len(overflow), 1)
-        self.assertEqual(
-            len({tuple(row["cell"]) for row in overflow}),
-            len(overflow),
-        )
+        self.assertEqual(overflow, [])
         reservations = queue["return_reservations"]
         self.assertEqual(len(reservations), len(carriers))
         waiting = {
@@ -328,13 +324,19 @@ class EconomyAndLogisticsTests(unittest.TestCase):
             for row in reservations
             if row["status"] == "WAIT_FOR_DEPARTURE"
         }
+        self.assertEqual(waiting, set())
         self.assertEqual(queue["holding_depositors"], [])
         for carrier in carriers:
-            if str(carrier.id) in waiting:
-                self.assertIsInstance(
-                    turn.plan.unit_actions[carrier.id],
-                    MoveAction,
-                )
+            action = turn.plan.unit_actions[carrier.id]
+            self.assertIsInstance(action, MoveAction)
+            destination = (
+                carrier.position[0] + action.direction.delta[0],
+                carrier.position[1] + action.direction.delta[1],
+            )
+            self.assertLess(
+                manhattan(destination, (0, 0)),
+                manhattan(carrier.position, (0, 0)),
+            )
 
     def test_local_emergency_patient_reserves_core_slot_and_blocks_spawn(self) -> None:
         memory = TacticMemory(opening_complete=True)
@@ -1125,6 +1127,7 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         action = turn.plan.unit_actions[carrier.id]
         self.assertIsInstance(action, MoveAction)
         self.assertEqual(action.direction, Direction.LEFT)
+
         destination = (carrier.position[0] - 1, carrier.position[1])
         projection = tactic.last_tactical_map
         assert projection is not None
@@ -1340,6 +1343,107 @@ class EconomyAndLogisticsTests(unittest.TestCase):
             "scheduled_deposits"
         ]
         self.assertEqual(next_schedule, schedule)
+
+    def test_remote_worker_stall_does_not_replace_a_valid_service_lane(self) -> None:
+        lane = ((0, 1), (0, 2))
+        queued = (
+            unit(1, UnitType.WORKER, lane[-1], cargo=1),
+            unit(2, UnitType.WORKER, lane[-1], cargo=1),
+        )
+        remote = unit(3, UnitType.WORKER, (18, 0), cargo=1)
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            opening_complete=True,
+            service_entrance=lane[0],
+            service_queue_cells=lane,
+            service_exit_cell=(0, -1),
+            service_return_progress={remote.id: (20, 4)},
+        )
+        memory.known_passable.update(
+            (x, y) for x in range(-20, 21) for y in range(-6, 7)
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(
+            make_turn(tick=50, units=(*queued, remote), resources=0)
+        )
+
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        self.assertEqual(queue["queue_cells"], [list(cell) for cell in lane])
+        self.assertEqual(tactic.memory.service_queue_cells, lane)
+        self.assertEqual(queue["lane_lease"]["version"], 1)
+        self.assertIsNone(queue["lane_replan_reason"])
+
+    def test_long_authoritative_return_route_is_not_rejected_by_short_recheck(self) -> None:
+        lane = ((1, 0), (2, 0))
+        carrier = unit(1, UnitType.WORKER, (600, 0), cargo=1)
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            opening_complete=True,
+            service_entrance=lane[0],
+            service_queue_cells=lane,
+            service_exit_cell=(0, -1),
+        )
+        memory.known_passable.update((x, 0) for x in range(0, 601))
+        memory.known_passable.update({(0, -1), (0, 1), (1, -1), (1, 1)})
+        tactic = BalancedTactic(memory=memory)
+
+        turn = make_turn(tick=70, units=(carrier,), resources=0)
+        tactic.choose_actions(turn)
+
+        queue = tactic.last_decision_trace["economy"]["service_queue"]
+        reservation = next(
+            row
+            for row in queue["return_reservations"]
+            if row["worker_id"] == str(carrier.id)
+        )
+        self.assertGreater(reservation["route_distance"], 512)
+        action = turn.plan.unit_actions[carrier.id]
+        self.assertIsInstance(action, MoveAction)
+        self.assertEqual(action.direction, Direction.LEFT)
+
+    def test_segmented_return_keeps_moving_when_full_route_exceeds_budget(self) -> None:
+        lane = ((1, 0), (2, 0))
+        carrier = unit(1, UnitType.WORKER, (100, 0), cargo=1)
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            opening_complete=True,
+            service_entrance=lane[0],
+            service_queue_cells=lane,
+            service_exit_cell=(0, -1),
+        )
+        memory.known_passable.update((x, 0) for x in range(0, 101))
+        memory.known_passable.update({(0, -1), (0, 1), (1, -1), (1, 1)})
+        tactic = BalancedTactic(
+            config=TacticConfig(path_node_limit=32),
+            memory=memory,
+        )
+
+        turn = make_turn(tick=80, units=(carrier,), resources=0)
+        tactic.choose_actions(turn)
+
+        reservation = tactic.last_decision_trace["economy"]["service_queue"][
+            "return_reservations"
+        ][0]
+        self.assertEqual(reservation["route_mode"], "SEGMENTED")
+        self.assertEqual(reservation["status"], "SEGMENTED_RETURN")
+        self.assertIsNotNone(reservation["waypoint"])
+        action = turn.plan.unit_actions[carrier.id]
+        self.assertIsInstance(action, MoveAction)
+        self.assertEqual(action.direction, Direction.LEFT)
+
+        first_waypoint = tuple(reservation["waypoint"])
+        moved = unit(1, UnitType.WORKER, (99, 0), cargo=1)
+        next_turn = make_turn(tick=81, units=(moved,), resources=0)
+        tactic.choose_actions(next_turn)
+        next_reservation = tactic.last_decision_trace["economy"]["service_queue"][
+            "return_reservations"
+        ][0]
+        self.assertEqual(tuple(next_reservation["waypoint"]), first_waypoint)
+        self.assertIsInstance(next_turn.plan.unit_actions[moved.id], MoveAction)
 
     def test_new_nearby_cargo_fills_free_tick_without_delaying_old_appointment(self) -> None:
         far = unit(1, UnitType.WORKER, (8, 0), cargo=1)

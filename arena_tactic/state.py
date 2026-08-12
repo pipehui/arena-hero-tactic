@@ -31,6 +31,9 @@ from .models import (
     ShotPlan,
     ScreeningGroupState,
     ServiceMoveFeedback,
+    ServiceLaneLease,
+    CargoRouteProgress,
+    SegmentedReturnLease,
     ThreatHeatCell,
 )
 
@@ -107,6 +110,15 @@ class TacticMemory:
     service_move_feedback: dict[UUID, ServiceMoveFeedback] = field(default_factory=dict)
     service_cargo_first_seen_ticks: dict[UUID, int] = field(default_factory=dict)
     service_deposit_ticks: dict[UUID, int] = field(default_factory=dict)
+    service_lane_lease: ServiceLaneLease | None = None
+    service_lane_change_ticks: tuple[int, ...] = ()
+    service_all_unreachable_ticks: int = 0
+    service_cargo_route_progress: dict[UUID, CargoRouteProgress] = field(
+        default_factory=dict
+    )
+    service_segmented_returns: dict[UUID, SegmentedReturnLease] = field(
+        default_factory=dict
+    )
     # Session-only fairness age for actors that can physically enter the Core.
     # The unified service calendar is rebuilt from the authoritative Turn, but
     # this small value prevents maintenance patients from starving forever.
@@ -219,6 +231,11 @@ class TacticMemory:
         self.service_move_feedback.clear()
         self.service_cargo_first_seen_ticks.clear()
         self.service_deposit_ticks.clear()
+        self.service_lane_lease = None
+        self.service_lane_change_ticks = ()
+        self.service_all_unreachable_ticks = 0
+        self.service_cargo_route_progress.clear()
+        self.service_segmented_returns.clear()
         self.service_ready_since_ticks.clear()
         self.service_patient_gateways.clear()
         self.patient_admission_progress = None

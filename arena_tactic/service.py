@@ -10,6 +10,7 @@ from .config import TacticConfig
 from .geometry import DIRECTION_ORDER, add_direction, cardinal_neighbors, manhattan, manhattan_ring
 from .models import (
     ActionIntent,
+    CargoRouteProgress,
     CargoReturnReservation,
     CoreOperationRequest,
     CoreOperationTimeline,
@@ -23,11 +24,18 @@ from .models import (
     PatientQueueEntry,
     PatientAdmissionProgress,
     ServiceCellLease,
+    ServiceLaneLease,
+    SegmentedReturnLease,
     UnitMission,
     WorldModel,
 )
 from .projection import TacticalMap
-from .planning import route_to, weighted_distance_field, weighted_route_to
+from .planning import (
+    route_to,
+    weighted_distance_field,
+    weighted_progress_route,
+    weighted_route_to,
+)
 from .rules import UNIT_MAX_HP
 from .state import TacticMemory
 
@@ -136,6 +144,31 @@ def cargo_return_route(
         cell_costs=projection.route_costs_for(UnitType.WORKER),
     )
     if route is None:
+        segment = weighted_progress_route(
+            world,
+            carrier.position,
+            target,
+            node_limit=node_limit,
+            blocked=frozenset(blocked),
+            cell_costs=projection.route_costs_for(UnitType.WORKER),
+        )
+        if segment is not None:
+            segment_route, waypoint = segment
+            return CargoReturnReservation(
+                worker_id=carrier.id,
+                route_target=waypoint,
+                route_distance=segment_route.distance,
+                first_direction=segment_route.first_direction,
+                first_position=segment_route.first_position,
+                earliest_deposit_tick=None,
+                scheduled_deposit_tick=None,
+                departure_tick=world.tick,
+                slack_ticks=0,
+                status="SEGMENTED_RETURN",
+                delay_reason="FULL_ROUTE_EXHAUSTED",
+                route_mode="SEGMENTED",
+                waypoint=waypoint,
+            )
         return CargoReturnReservation(
             worker_id=carrier.id,
             route_target=target,
@@ -147,7 +180,7 @@ def cargo_return_route(
             departure_tick=None,
             slack_ticks=None,
             status="UNROUTABLE",
-            delay_reason="NO_RETURN_ROUTE",
+            delay_reason="SEGMENT_ROUTE_EXHAUSTED",
         )
     distance = route.distance + len(queue_cells)
     return CargoReturnReservation(
@@ -379,6 +412,12 @@ class CoreServicePlanner:
         for worker_id in tuple(self.memory.service_return_progress):
             if worker_id not in living_carrier_ids:
                 self.memory.service_return_progress.pop(worker_id, None)
+        for worker_id in tuple(self.memory.service_cargo_route_progress):
+            if worker_id not in living_carrier_ids:
+                self.memory.service_cargo_route_progress.pop(worker_id, None)
+        for worker_id in tuple(self.memory.service_segmented_returns):
+            if worker_id not in living_carrier_ids:
+                self.memory.service_segmented_returns.pop(worker_id, None)
         for worker_id in tuple(self.memory.service_cargo_first_seen_ticks):
             if worker_id not in living_carrier_ids:
                 self.memory.service_cargo_first_seen_ticks.pop(worker_id, None)
@@ -417,34 +456,48 @@ class CoreServicePlanner:
                 <= UNIT_MAX_HP[unit.unit_type] * self.config.recovery_urgent_percent
             )
 
-        previous_lane = self.memory.service_entrance, self.memory.service_queue_cells
         service_core_position = (
             projected_core_destination
             or core.destination
             or core.position
+        )
+        previous_lane = self.memory.service_entrance, self.memory.service_queue_cells
+        lane_replan_reason = self._lane_replan_reason(
+            world,
+            projection,
+            service_core_position,
         )
         entrance, queue_cells, exit_cell = self._choose_lane(
             world,
             projection,
             carriers,
             core_position=service_core_position,
-            force_replan=bool(
-                any(
-                    stalled >= 2
-                    for _, stalled in self.memory.service_return_progress.values()
-                )
-                or any(
-                    feedback.stalled_ticks >= 2
-                    for feedback in self.memory.service_move_feedback.values()
-                )
-                or any(
-                    carrier.id in self.memory.failed_unit_moves
-                    for carrier in carriers
-                )
-            ),
+            force_replan=lane_replan_reason is not None,
         )
-        if previous_lane != (entrance, queue_cells):
-            self.memory.cargo_arrival_ticks.clear()
+        lane_changed = previous_lane != (entrance, queue_cells)
+        if lane_changed and lane_replan_reason is None:
+            lane_replan_reason = "ALL_CARRIERS_UNREACHABLE"
+        if lane_changed:
+            self._retain_compatible_fifo(
+                world,
+                previous_lane[1],
+                queue_cells,
+                service_core_position,
+            )
+            self.memory.service_lane_change_ticks = tuple(
+                tick
+                for tick in (*self.memory.service_lane_change_ticks, world.tick)
+                if world.tick - tick <= 4
+            )
+        lane_lease = self._sync_lane_lease(
+            world,
+            service_core_position,
+            entrance,
+            queue_cells,
+            exit_cell,
+            lane_changed=lane_changed,
+            replan_reason=lane_replan_reason,
+        )
         core_wounded = next(
             (
                 unit
@@ -479,28 +532,89 @@ class CoreServicePlanner:
             queue_cells,
             exit_cell,
             emergency_ready_id=emergency_ready_id,
+            lane_version=lane_lease.version,
+            lane_changed=lane_changed and bool(previous_lane[1]),
         )
+        if carriers and all(
+            row.status == "UNROUTABLE" for row in return_reservations
+        ):
+            self.memory.service_all_unreachable_ticks += 1
+        else:
+            self.memory.service_all_unreachable_ticks = 0
         deposit_schedule = tuple(
             (row.worker_id, row.scheduled_deposit_tick)
             for row in return_reservations
             if row.scheduled_deposit_tick is not None
         )
         reservation_by_id = {row.worker_id: row for row in return_reservations}
+        carriers_by_id = {unit.id: unit for unit in carriers}
         for row in return_reservations:
+            carrier = carriers_by_id[row.worker_id]
+            progress_distance = (
+                manhattan(carrier.position, service_core_position) + len(queue_cells)
+                if row.route_mode == "SEGMENTED"
+                else row.route_distance
+            )
             previous = self.memory.service_return_progress.get(row.worker_id)
             stalled = 0
-            if row.status == "RETURNING" and row.route_distance is not None:
+            if row.status in {"RETURNING", "SEGMENTED_RETURN"} and progress_distance is not None:
                 stalled = (
                     previous[1] + 1
                     if previous is not None
                     and previous[0] is not None
-                    and row.route_distance >= previous[0]
+                    and progress_distance >= previous[0]
                     else 0
                 )
             self.memory.service_return_progress[row.worker_id] = (
-                row.route_distance,
+                progress_distance,
                 stalled,
             )
+            feedback = self.memory.service_move_feedback.get(row.worker_id)
+            previous_progress = self.memory.service_cargo_route_progress.get(
+                row.worker_id
+            )
+            ping_pong_ticks = (
+                previous_progress.ping_pong_ticks + 1
+                if previous_progress is not None
+                and previous_progress.previous_position == carrier.position
+                and previous_progress.last_position != carrier.position
+                else 0
+            )
+            self.memory.service_cargo_route_progress[row.worker_id] = CargoRouteProgress(
+                worker_id=row.worker_id,
+                lane_version=lane_lease.version,
+                last_position=carrier.position,
+                remaining_distance=progress_distance,
+                previous_position=(
+                    None
+                    if previous_progress is None
+                    else previous_progress.last_position
+                ),
+                stalled_ticks=stalled,
+                ping_pong_ticks=ping_pong_ticks,
+                last_rejection_reason=(
+                    None if feedback is None else feedback.rejection_reason
+                ),
+                scheduled_deposit_tick=row.scheduled_deposit_tick,
+            )
+            if row.route_mode == "SEGMENTED" and row.waypoint is not None:
+                previous_segment = self.memory.service_segmented_returns.get(row.worker_id)
+                self.memory.service_segmented_returns[row.worker_id] = SegmentedReturnLease(
+                    worker_id=row.worker_id,
+                    lane_version=lane_lease.version,
+                    waypoint=row.waypoint,
+                    established_tick=(
+                        previous_segment.established_tick
+                        if previous_segment is not None
+                        and previous_segment.waypoint == row.waypoint
+                        else world.tick
+                    ),
+                    last_position=carrier.position,
+                    remaining_distance=progress_distance or row.route_distance,
+                    stalled_ticks=stalled,
+                )
+            else:
+                self.memory.service_segmented_returns.pop(row.worker_id, None)
 
         ready, outside_line, lane_index, head = self._sync_ready_line(
             world,
@@ -586,6 +700,8 @@ class CoreServicePlanner:
                     if previous_admission is not None
                     else None
                 ),
+                lane_lease=lane_lease,
+                lane_replan_reason=lane_replan_reason,
             )
 
         lane_cells = (core.position, *queue_cells)
@@ -723,6 +839,29 @@ class CoreServicePlanner:
             "EMERGENCY_HEAL",
             "MAINTENANCE_HEAL",
         }
+        core_occupied = any(
+            unit.position == service_core_position for unit in world.friendlies
+        )
+        executable_cargo = any(
+            row.first_position == service_core_position
+            and row.first_direction is not None
+            for row in return_reservations
+        )
+        liveness: list[str] = []
+        if not core_occupied and admission is None and executable_cargo and not paused_reason:
+            liveness.append("CORE_IDLE_WITH_EXECUTABLE_CARGO")
+        recent_lane_changes = tuple(
+            tick
+            for tick in self.memory.service_lane_change_ticks
+            if world.tick - tick <= 2
+        )
+        if len(recent_lane_changes) >= 2:
+            liveness.append("SERVICE_LANE_OSCILLATION")
+        if any(
+            progress.stalled_ticks >= 2 or progress.ping_pong_ticks >= 2
+            for progress in self.memory.service_cargo_route_progress.values()
+        ):
+            liveness.append("CARGO_ROUTE_STALLED")
         return CoreServiceQueue(
             service="PAUSED" if paused_reason is not None else service,
             admission_id=admission,
@@ -788,6 +927,9 @@ class CoreServicePlanner:
             previous_admission_id=previous_admission,
             admission_reason=admission_reason,
             release_reason=release_reason,
+            lane_lease=lane_lease,
+            lane_replan_reason=lane_replan_reason,
+            liveness_indicators=tuple(liveness),
         )
 
     def _overflow_slots(
@@ -866,6 +1008,8 @@ class CoreServicePlanner:
         exit_cell: Position | None,
         *,
         emergency_ready_id: UUID | None = None,
+        lane_version: int = 0,
+        lane_changed: bool = False,
     ) -> tuple[CargoReturnReservation, ...]:
         """Build executable routes and a stable, feasibility-correct calendar."""
 
@@ -878,6 +1022,16 @@ class CoreServicePlanner:
             node_limit=self.config.path_node_limit,
             exit_cell=exit_cell,
             direct_core_id=emergency_ready_id,
+        )
+        drafts = self._reuse_segmented_return_leases(
+            world,
+            projection,
+            carriers,
+            drafts,
+            core_position,
+            queue_cells,
+            exit_cell,
+            lane_version,
         )
         reachable = tuple(
             row
@@ -893,7 +1047,11 @@ class CoreServicePlanner:
         ) -> str:
             if row.route_distance == 0:
                 return "ON_CORE"
-            if world.tick >= departure:
+            if (
+                world.tick >= departure
+                or row.route_distance is None
+                or row.route_distance > self.config.service_lane_depth + 2
+            ):
                 return "RETURNING"
             return "WAIT_FOR_DEPARTURE"
 
@@ -919,30 +1077,44 @@ class CoreServicePlanner:
         for row in ordered:
             assert row.earliest_deposit_tick is not None
             requested = self.memory.service_deposit_ticks.get(row.worker_id)
-            assigned = next_available(row.earliest_deposit_tick)
+            preferred = (
+                requested
+                if requested is not None and requested >= row.earliest_deposit_tick
+                else row.earliest_deposit_tick
+            )
+            assigned = next_available(preferred)
             used_ticks.add(assigned)
             departure = assigned - row.route_distance
+            change_reason = (
+                "SERVICE_LANE_CHANGED"
+                if requested is not None and lane_changed
+                else "MISSED_APPOINTMENT"
+                if requested is not None and world.tick > requested
+                else "ROUTE_DISTANCE_INCREASED"
+                if requested is not None and requested < row.earliest_deposit_tick
+                else "SERVICE_CONFLICT"
+                if assigned > preferred
+                else None
+            )
             assigned_rows[row.worker_id] = replace(
                 row,
                 scheduled_deposit_tick=assigned,
                 departure_tick=departure,
                 slack_ticks=max(0, departure - world.tick),
                 status=reservation_status(row, departure),
-                delay_reason=(
-                    "MISSED_APPOINTMENT"
-                    if requested is not None and requested < row.earliest_deposit_tick
-                    else "ROLLING_COMPRESSION"
-                    if requested is not None and assigned < requested
-                    else "SERVICE_CONFLICT"
-                    if assigned > row.earliest_deposit_tick
-                    else None
-                ),
+                delay_reason=change_reason,
+                lane_version=lane_version,
+                previous_scheduled_tick=requested,
+                schedule_change_reason=change_reason,
             )
 
         result = tuple(
             sorted(
                 (
-                    assigned_rows.get(row.worker_id, row)
+                    assigned_rows.get(
+                        row.worker_id,
+                        replace(row, lane_version=lane_version),
+                    )
                     for row in drafts
                 ),
                 key=lambda row: (
@@ -959,6 +1131,69 @@ class CoreServicePlanner:
             if row.scheduled_deposit_tick is not None
         }
         return result
+
+    def _reuse_segmented_return_leases(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        carriers: tuple[EntitySnapshot, ...],
+        drafts: tuple[CargoReturnReservation, ...],
+        core_position: Position,
+        queue_cells: tuple[Position, ...],
+        exit_cell: Position | None,
+        lane_version: int,
+    ) -> tuple[CargoReturnReservation, ...]:
+        """Keep a bounded-search waypoint until reached or genuinely stalled."""
+
+        carriers_by_id = {unit.id: unit for unit in carriers}
+        blocked = set(projection.hostile_occupied)
+        blocked.update(projection.immediate_damage)
+        blocked.update({core_position, *queue_cells[:-1]})
+        if exit_cell is not None:
+            blocked.add(exit_cell)
+        rows: list[CargoReturnReservation] = []
+        for row in drafts:
+            lease = self.memory.service_segmented_returns.get(row.worker_id)
+            carrier = carriers_by_id.get(row.worker_id)
+            progress = self.memory.service_cargo_route_progress.get(row.worker_id)
+            if (
+                row.route_mode != "SEGMENTED"
+                or lease is None
+                or carrier is None
+                or lease.lane_version != lane_version
+                or carrier.position == lease.waypoint
+                or (progress is not None and progress.stalled_ticks >= 2)
+                or lease.waypoint in world.known_obstacles
+                or lease.waypoint in projection.hostile_occupied
+            ):
+                rows.append(row)
+                continue
+            local_blocked = set(blocked)
+            local_blocked.discard(carrier.position)
+            local_blocked.discard(lease.waypoint)
+            route = weighted_route_to(
+                world,
+                carrier.position,
+                lease.waypoint,
+                node_limit=self.config.path_node_limit,
+                blocked=frozenset(local_blocked),
+                cell_costs=projection.route_costs_for(UnitType.WORKER),
+            )
+            if route is None or route.first_direction is None:
+                rows.append(row)
+                continue
+            rows.append(
+                replace(
+                    row,
+                    route_target=lease.waypoint,
+                    route_distance=route.distance,
+                    first_direction=route.first_direction,
+                    first_position=route.first_position,
+                    waypoint=lease.waypoint,
+                    delay_reason="SEGMENT_LEASE_RETAINED",
+                )
+            )
+        return tuple(rows)
 
     def _unified_service_schedule(
         self,
@@ -1050,7 +1285,13 @@ class CoreServicePlanner:
                 route_distance = 0
             elif cargo is not None and can_deposit:
                 gateway = cargo.route_target
-                route_distance = cargo.route_distance
+                # A segmented waypoint is only a bounded-search navigation
+                # lease; it is not proof that the Core can be serviced at the
+                # end of that segment.  Keep it off the slot calendar until a
+                # complete route is available.
+                route_distance = (
+                    None if cargo.route_mode == "SEGMENTED" else cargo.route_distance
+                )
                 first_direction = cargo.first_direction
                 first_position = cargo.first_position
             elif patient is not None:
@@ -1274,11 +1515,21 @@ class CoreServicePlanner:
                 if distance is None
                 else "ON_CORE"
                 if distance == 0
+                else "SEGMENTED_RETURN"
+                if row.route_mode == "SEGMENTED"
                 else "RETURNING"
-                if "HEAL" in job.operations or departure is None or world.tick >= departure
+                if (
+                    "HEAL" in job.operations
+                    or departure is None
+                    or world.tick >= departure
+                    or distance > self.config.service_lane_depth + 2
+                )
                 else "WAIT_FOR_DEPARTURE"
             )
             updated_reservations.append(
+                # The unified Core slot calendar may legitimately delay cargo
+                # behind an actual treatment/service window.  Record that
+                # concrete cause rather than a generic reschedule label.
                 replace(
                     row,
                     scheduled_deposit_tick=deposit_tick,
@@ -1288,9 +1539,22 @@ class CoreServicePlanner:
                     ),
                     status=status,
                     delay_reason=(
-                        "UNIFIED_SERVICE_CALENDAR"
-                        if row.scheduled_deposit_tick != deposit_tick
+                        "CORE_SERVICE_PREEMPTED"
+                        if row.scheduled_deposit_tick is not None
+                        and deposit_tick > row.scheduled_deposit_tick
+                        else "ROLLING_COMPRESSION"
+                        if row.scheduled_deposit_tick is not None
+                        and deposit_tick < row.scheduled_deposit_tick
                         else row.delay_reason
+                    ),
+                    schedule_change_reason=(
+                        "CORE_SERVICE_PREEMPTED"
+                        if row.scheduled_deposit_tick is not None
+                        and deposit_tick > row.scheduled_deposit_tick
+                        else "ROLLING_COMPRESSION"
+                        if row.scheduled_deposit_tick is not None
+                        and deposit_tick < row.scheduled_deposit_tick
+                        else row.schedule_change_reason
                     ),
                 )
             )
@@ -1530,8 +1794,13 @@ class CoreServicePlanner:
             status = (
                 "ON_CORE"
                 if row.route_distance == 0
+                else "SEGMENTED_RETURN"
+                if row.route_mode == "SEGMENTED"
                 else "RETURNING"
-                if world.tick >= departure
+                if (
+                    world.tick >= departure
+                    or row.route_distance > self.config.service_lane_depth + 2
+                )
                 else "WAIT_FOR_DEPARTURE"
             )
             rows.append(
@@ -2534,6 +2803,107 @@ class CoreServicePlanner:
             )
         return intents
 
+    def _lane_replan_reason(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        core_position: Position,
+    ) -> str | None:
+        """Return a geometry-scoped invalidation reason for the global lane.
+
+        Per-Worker route stalls and Resolver rejections deliberately do not
+        participate here.  They are recovered by that Worker's route state;
+        otherwise one remote actor can oscillate the whole service corridor.
+        """
+
+        lane = self.memory.service_queue_cells
+        lease = self.memory.service_lane_lease
+        if not lane:
+            return "NO_SERVICE_LANE"
+        if lease is not None and (
+            world.core is None
+            or lease.core_id != world.core.id
+            or lease.core_position != core_position
+        ):
+            return "CORE_SERVICE_POSITION_CHANGED"
+        if lease is not None and (
+            lease.entrance != self.memory.service_entrance
+            or lease.queue_cells != lane
+        ):
+            return "LANE_LEASE_STATE_MISMATCH"
+        for cell in lane:
+            if cell in world.known_obstacles:
+                return "LANE_OBSTACLE"
+            if cell in projection.hostile_occupied:
+                return "LANE_ENEMY_OCCUPIED"
+            if projection.immediate_attackers(cell):
+                return "LANE_CURRENTLY_LETHAL"
+        if not self._lane_valid(core_position, lane, world, projection):
+            return "LANE_GEOMETRY_INVALID"
+        if self.memory.service_all_unreachable_ticks >= 1:
+            return "ALL_CARRIERS_UNREACHABLE"
+        return None
+
+    def _retain_compatible_fifo(
+        self,
+        world: WorldModel,
+        old_lane: tuple[Position, ...],
+        new_lane: tuple[Position, ...],
+        core_position: Position,
+    ) -> None:
+        """Keep FIFO age only for actors physically valid on both lanes."""
+
+        shared = ({core_position, *old_lane} & {core_position, *new_lane})
+        positions = {unit.id: unit.position for unit in world.friendlies}
+        self.memory.cargo_arrival_ticks = {
+            worker_id: tick
+            for worker_id, tick in self.memory.cargo_arrival_ticks.items()
+            if positions.get(worker_id) in shared
+        }
+
+    def _sync_lane_lease(
+        self,
+        world: WorldModel,
+        core_position: Position,
+        entrance: Position | None,
+        queue_cells: tuple[Position, ...],
+        exit_cell: Position | None,
+        *,
+        lane_changed: bool,
+        replan_reason: str | None,
+    ) -> ServiceLaneLease:
+        assert world.core is not None
+        previous = self.memory.service_lane_lease
+        same_identity = bool(
+            previous is not None
+            and previous.core_id == world.core.id
+            and previous.core_position == core_position
+        )
+        version = (
+            previous.version + 1
+            if previous is not None and lane_changed and same_identity
+            else previous.version
+            if previous is not None and not lane_changed and same_identity
+            else 1
+        )
+        established_tick = (
+            previous.established_tick
+            if previous is not None and not lane_changed and same_identity
+            else world.tick
+        )
+        lease = ServiceLaneLease(
+            core_id=world.core.id,
+            core_position=core_position,
+            entrance=entrance,
+            queue_cells=queue_cells,
+            exit_cell=exit_cell,
+            established_tick=established_tick,
+            version=version,
+            invalidation_reason=replan_reason if lane_changed else None,
+        )
+        self.memory.service_lane_lease = lease
+        return lease
+
     def _choose_lane(
         self,
         world: WorldModel,
@@ -2547,26 +2917,15 @@ class CoreServicePlanner:
         core = core_position or world.core.destination or world.core.position
         enemy_positions = projection.hostile_occupied
         occupied = dict(world.occupied_cells)
-        existing = self.memory.service_queue_cells
-        existing_reachable = tuple(
-            cargo_return_route(
-                world,
-                projection,
-                carrier,
-                core,
-                existing,
-                node_limit=self.config.path_node_limit,
-                exit_cell=self.memory.service_exit_cell,
+        scheduled_occupancy: dict[Position, int] = {}
+        for carrier in carriers:
+            scheduled_occupancy[carrier.position] = (
+                scheduled_occupancy.get(carrier.position, 0) + 1
             )
-            for carrier in carriers
-        )
+        existing = self.memory.service_queue_cells
         if (
             not force_replan
             and self._lane_valid(core, existing, world, projection)
-            and (
-                not carriers
-                or any(row.route_distance is not None for row in existing_reachable)
-            )
         ):
             entrance = existing[0]
             exit_cell = self.memory.service_exit_cell
@@ -2641,7 +3000,19 @@ class CoreServicePlanner:
                 sum(projection.immediate_attackers(cell) for cell in path),
                 sum(projection.future_attackers(cell) for cell in path),
                 sum(projection.remembered_danger.get(cell, 0) for cell in path),
-                sum(max(0, occupied.get(cell, 0) - 1) for cell in path),
+                # Cargo actors already on a candidate lane are controlled by
+                # its choreography.  Counting them as generic congestion made
+                # the score punish whichever lane was currently working and
+                # caused left/right oscillation every Tick.
+                sum(
+                    max(
+                        0,
+                        occupied.get(cell, 0)
+                        - scheduled_occupancy.get(cell, 0)
+                        - 1,
+                    )
+                    for cell in path
+                ),
                 sum(reachable),
                 bends,
                 path,

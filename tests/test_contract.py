@@ -11,6 +11,7 @@ from arena_tactic import (
     ActionIntent,
     BalancedTactic,
     CargoReturnReservation,
+    CargoRouteProgress,
     CoreServiceWindow,
     CoreServiceJob,
     CoreServicePhase,
@@ -30,6 +31,8 @@ from arena_tactic import (
     RangerStanceOption,
     ScreeningContactDecision,
     ServiceCellLease,
+    ServiceLaneLease,
+    SegmentedReturnLease,
     SquadRendezvousLease,
     TacticalMap,
     ThreatHeatCell,
@@ -49,6 +52,7 @@ class PublicContractTests(unittest.TestCase):
             WorldModel,
             ActionIntent,
             CargoReturnReservation,
+            CargoRouteProgress,
             CoreServiceWindow,
             CoreServiceJob,
             CoreSlotSchedule,
@@ -70,6 +74,8 @@ class PublicContractTests(unittest.TestCase):
             RangerStanceOption,
             ScreeningContactDecision,
             ServiceCellLease,
+            ServiceLaneLease,
+            SegmentedReturnLease,
             SquadRendezvousLease,
             VanguardAssignmentCandidate,
             VanguardInterceptTask,
@@ -129,7 +135,7 @@ class PublicContractTests(unittest.TestCase):
 
         trace = tactic.last_decision_trace
 
-        self.assertEqual(trace["schema_version"], 35)
+        self.assertEqual(trace["schema_version"], 36)
         self.assertIn("resolution", trace)
         self.assertIn("world", trace)
         global_map = trace["world"]["global_map"]

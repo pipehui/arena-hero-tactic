@@ -151,6 +151,7 @@ class DecisionTraceBuilder:
                 reservation = reservations.get(actor.id)
                 position, stalled = progress.get(actor.id, (actor.position, 0))
                 feedback = self.memory.service_move_feedback.get(actor.id)
+                cargo_progress = self.memory.service_cargo_route_progress.get(actor.id)
                 service_state = {
                     "scheduled_deposit_tick": (
                         None
@@ -169,6 +170,17 @@ class DecisionTraceBuilder:
                     "remaining_distance": (
                         None if reservation is None else reservation.route_distance
                     ),
+                    "route_mode": (
+                        None if reservation is None else reservation.route_mode
+                    ),
+                    "waypoint": (
+                        None
+                        if reservation is None or reservation.waypoint is None
+                        else list(reservation.waypoint)
+                    ),
+                    "lane_version": (
+                        None if reservation is None else reservation.lane_version
+                    ),
                     "transit_hold": (
                         None
                         if actor.id not in dict(service.overflow_slots)
@@ -176,6 +188,14 @@ class DecisionTraceBuilder:
                     ),
                     "progress_position": list(position),
                     "stalled_ticks": stalled,
+                    "ping_pong_ticks": (
+                        0 if cargo_progress is None else cargo_progress.ping_pong_ticks
+                    ),
+                    "last_route_rejection": (
+                        None
+                        if cargo_progress is None
+                        else cargo_progress.last_rejection_reason
+                    ),
                     "resolver_feedback": (
                         None
                         if feedback is None
@@ -1289,6 +1309,20 @@ class DecisionTraceBuilder:
                     "slack_ticks": row.slack_ticks,
                     "status": row.status,
                     "delay_reason": row.delay_reason,
+                    "route_mode": row.route_mode,
+                    "waypoint": (
+                        None if row.waypoint is None else list(row.waypoint)
+                    ),
+                    "lane_version": row.lane_version,
+                    "previous_scheduled_tick": row.previous_scheduled_tick,
+                    "schedule_change_reason": row.schedule_change_reason,
+                    "schedule_drift": (
+                        None
+                        if row.previous_scheduled_tick is None
+                        or row.scheduled_deposit_tick is None
+                        else row.scheduled_deposit_tick
+                        - row.previous_scheduled_tick
+                    ),
                 }
                 for row in service.return_reservations
             ],
@@ -1478,6 +1512,32 @@ class DecisionTraceBuilder:
             ),
             "reserved_resources": service.reserved_resources,
             "paused_reason": service.paused_reason,
+            "lane_lease": (
+                None
+                if service.lane_lease is None
+                else {
+                    "core_id": str(service.lane_lease.core_id),
+                    "core_position": list(service.lane_lease.core_position),
+                    "entrance": (
+                        None
+                        if service.lane_lease.entrance is None
+                        else list(service.lane_lease.entrance)
+                    ),
+                    "queue_cells": [
+                        list(cell) for cell in service.lane_lease.queue_cells
+                    ],
+                    "exit": (
+                        None
+                        if service.lane_lease.exit_cell is None
+                        else list(service.lane_lease.exit_cell)
+                    ),
+                    "established_tick": service.lane_lease.established_tick,
+                    "version": service.lane_lease.version,
+                    "invalidation_reason": service.lane_lease.invalidation_reason,
+                }
+            ),
+            "lane_replan_reason": service.lane_replan_reason,
+            "liveness_indicators": list(service.liveness_indicators),
         }
 
     @staticmethod

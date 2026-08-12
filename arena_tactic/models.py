@@ -440,6 +440,53 @@ class CargoReturnReservation:
     slack_ticks: int | None
     status: str
     delay_reason: str | None = None
+    route_mode: str = "FULL"
+    waypoint: Position | None = None
+    lane_version: int = 0
+    previous_scheduled_tick: int | None = None
+    schedule_change_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceLaneLease:
+    """Stable Core logistics geometry for one Core lifecycle."""
+
+    core_id: UUID
+    core_position: Position
+    entrance: Position | None
+    queue_cells: tuple[Position, ...]
+    exit_cell: Position | None
+    established_tick: int
+    version: int = 1
+    invalidation_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CargoRouteProgress:
+    """Per-Worker return progress; it may never invalidate a global lane."""
+
+    worker_id: UUID
+    lane_version: int
+    last_position: Position
+    remaining_distance: int | None
+    previous_position: Position | None = None
+    stalled_ticks: int = 0
+    ping_pong_ticks: int = 0
+    last_rejection_reason: str | None = None
+    scheduled_deposit_tick: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SegmentedReturnLease:
+    """Sticky bounded-search waypoint used when a full route exceeds budget."""
+
+    worker_id: UUID
+    lane_version: int
+    waypoint: Position
+    established_tick: int
+    last_position: Position
+    remaining_distance: int
+    stalled_ticks: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -519,6 +566,9 @@ class CoreServiceQueue:
     previous_admission_id: UUID | None = None
     admission_reason: str | None = None
     release_reason: str | None = None
+    lane_lease: ServiceLaneLease | None = None
+    lane_replan_reason: str | None = None
+    liveness_indicators: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
