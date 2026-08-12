@@ -3,20 +3,29 @@ from __future__ import annotations
 import json
 import re
 import warnings
-from collections import Counter
+from collections import Counter, OrderedDict
 from datetime import datetime
+from hashlib import sha256
 from pathlib import Path
 from time import perf_counter
 from typing import Any
 from uuid import uuid4
 
-from arena_hero import Accepted, Received, Turn, __version__ as arena_hero_version
-from arena_tactic.schema import STRATEGY_LOG_SCHEMA_VERSION
+from arena_hero import (
+    Accepted,
+    CommandSource,
+    Received,
+    Turn,
+    __version__ as arena_hero_version,
+)
+from arena_tactic.log_projection import compact_logged_state, compact_strategy_trace
+from arena_tactic.schema import REPLAY_LOG_SCHEMA_VERSION
 
 
-LOG_SCHEMA_VERSION = STRATEGY_LOG_SCHEMA_VERSION
+LOG_SCHEMA_VERSION = REPLAY_LOG_SCHEMA_VERSION
 DEFAULT_ENDPOINT = "https://api.arenahero.io"
 _BEARER_TOKEN = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
+_PLAN_REFERENCE_LIMIT = 256
 
 
 def _now() -> datetime:
@@ -59,6 +68,7 @@ class ReplayLogger:
         self._started_clock = perf_counter()
         self._closed = False
         self._io_error: OSError | None = None
+        self._agent_plan_fingerprints: OrderedDict[int, bytes] = OrderedDict()
 
         log_directory = Path(directory)
         log_directory.mkdir(parents=True, exist_ok=True)
@@ -103,6 +113,9 @@ class ReplayLogger:
             raise ValueError("Provide exactly one of accepted or error")
 
         plan = turn.plan
+        plan_data = _model_dump(plan)
+        state_data = compact_logged_state(_model_dump(turn.state))
+        strategy_data = compact_strategy_trace(strategy)
         action_counts = Counter(
             _action_type(action) for action in plan.unit_actions.values()
         )
@@ -137,7 +150,7 @@ class ReplayLogger:
                 "error": _safe_error(error, secret),
             }
 
-        return self._write(
+        written = self._write(
             {
                 "record_type": "turn",
                 "recorded_at": _now().isoformat(timespec="milliseconds"),
@@ -162,12 +175,19 @@ class ReplayLogger:
                     "planned_action_counts": dict(sorted(action_counts.items())),
                     "planned_core_action": core_action_type,
                 },
-                "strategy": strategy,
-                "state": _model_dump(turn.state),
-                "plan": _model_dump(plan),
+                "strategy": strategy_data,
+                "state": state_data,
+                "plan": plan_data,
                 "submission": submission,
             }
         )
+        if (
+            written
+            and accepted is not None
+            and accepted.source == CommandSource.AGENT
+        ):
+            self._remember_agent_plan(turn.tick, plan_data)
+        return written
 
     def record_turn_skip(self, *, tick: int, reason: str) -> bool:
         """Record a Turn deliberately ignored before planning or submission."""
@@ -202,16 +222,31 @@ class ReplayLogger:
     def record_receipt(self, receipt: Received) -> bool:
         """Record the canonical Agent or Manual plan broadcast by the server."""
 
-        return self._write(
-            {
-                "record_type": "canonical_receipt",
-                "recorded_at": _now().isoformat(timespec="milliseconds"),
-                "tick": receipt.tick,
-                "source": receipt.source.value,
-                "received_at": receipt.received_at.isoformat(timespec="milliseconds"),
-                "plan": _model_dump(receipt.plan),
-            }
+        plan_data = _model_dump(receipt.plan)
+        matches_turn_plan = (
+            receipt.source == CommandSource.AGENT
+            and self._agent_plan_fingerprints.get(receipt.tick)
+            == _plan_fingerprint(plan_data)
         )
+        record: dict[str, Any] = {
+            "record_type": "canonical_receipt",
+            "recorded_at": _now().isoformat(timespec="milliseconds"),
+            "tick": receipt.tick,
+            "source": receipt.source.value,
+            "received_at": receipt.received_at.isoformat(timespec="milliseconds"),
+            "matches_turn_plan": matches_turn_plan,
+        }
+        if matches_turn_plan:
+            record["plan_ref"] = {"record_type": "turn", "tick": receipt.tick}
+        else:
+            record["plan"] = plan_data
+        return self._write(record)
+
+    def _remember_agent_plan(self, tick: int, plan: dict[str, Any]) -> None:
+        self._agent_plan_fingerprints[tick] = _plan_fingerprint(plan)
+        self._agent_plan_fingerprints.move_to_end(tick)
+        while len(self._agent_plan_fingerprints) > _PLAN_REFERENCE_LIMIT:
+            self._agent_plan_fingerprints.popitem(last=False)
 
     def close(self, *, status: str, last_tick: int | None) -> bool:
         if self._closed:
@@ -268,3 +303,13 @@ class ReplayLogger:
             self._stream.close()
         except OSError:
             pass
+
+
+def _plan_fingerprint(plan: dict[str, Any]) -> bytes:
+    payload = json.dumps(
+        plan,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return sha256(payload).digest()

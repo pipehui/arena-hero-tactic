@@ -1,10 +1,12 @@
-"""Version identifiers shared by runtime logs and durable checkpoints."""
+"""Version identifiers shared by runtime traces, logs, and checkpoints."""
 
 STRATEGY_LOG_SCHEMA_VERSION = 36
+REPLAY_LOG_SCHEMA_VERSION = 37
 EXPLORATION_MEMORY_SCHEMA_VERSION = 12
 
 
 __all__ = (
     "EXPLORATION_MEMORY_SCHEMA_VERSION",
+    "REPLAY_LOG_SCHEMA_VERSION",
     "STRATEGY_LOG_SCHEMA_VERSION",
 )
