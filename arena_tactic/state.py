@@ -15,10 +15,14 @@ from .models import (
     MoveAttempt,
     MoveFailure,
     PatientAdmissionProgress,
+    PairingCooldown,
+    PeacefulFormationAssignment,
     RangerStanceLease,
     ScreeningContactDecision,
     WorkerTaskProgress,
     SquadRendezvousLease,
+    SquadFormationLease,
+    FormationMoveFeedback,
     SquadState,
     WorkerEscapeState,
     WorkerPatrolMode,
@@ -134,6 +138,19 @@ class TacticMemory:
     squad_rendezvous_leases: dict[tuple[UUID, UUID], SquadRendezvousLease] = field(
         default_factory=dict
     )
+    squad_formation_leases: dict[tuple[UUID, UUID], SquadFormationLease] = field(
+        default_factory=dict
+    )
+    formation_move_feedback: dict[UUID, FormationMoveFeedback] = field(
+        default_factory=dict
+    )
+    squad_pairing_cooldowns: dict[tuple[UUID, UUID], PairingCooldown] = field(
+        default_factory=dict
+    )
+    squad_target_backoffs: dict[
+        tuple[UUID, UUID, Position, Position], int
+    ] = field(default_factory=dict)
+    peaceful_formation_assignment: PeacefulFormationAssignment | None = None
     screening_groups: dict[UUID, ScreeningGroupState] = field(default_factory=dict)
     screening_contact_decisions: dict[UUID, ScreeningContactDecision] = field(
         default_factory=dict
@@ -142,6 +159,9 @@ class TacticMemory:
         default_factory=dict
     )
     defense_sector_anchors: dict[str, tuple[Position, int]] = field(
+        default_factory=dict
+    )
+    defense_reserve_leases: dict[UUID, tuple[Position, int, str]] = field(
         default_factory=dict
     )
     raid_target_id: UUID | None = None
@@ -221,10 +241,16 @@ class TacticMemory:
         self.recent_home_threat_position = None
         self.squad_states.clear()
         self.squad_rendezvous_leases.clear()
+        self.squad_formation_leases.clear()
+        self.formation_move_feedback.clear()
+        self.squad_pairing_cooldowns.clear()
+        self.squad_target_backoffs.clear()
+        self.peaceful_formation_assignment = None
         self.screening_groups.clear()
         self.screening_contact_decisions.clear()
         self.ranger_stance_leases.clear()
         self.defense_sector_anchors.clear()
+        self.defense_reserve_leases.clear()
         self.raid_target_id = None
         self.raid_last_seen_tick = None
         self.raid_last_position = None

@@ -756,6 +756,7 @@ class DecisionTraceBuilder:
             "home_defense_alert_active": (
                 self.memory.home_defense_alert_until >= world.tick
             ),
+            "formation": self._formation_dict(world, resolution),
             "squads": [
                 {
                     "vanguard_id": str(squad.vanguard_id),
@@ -784,6 +785,7 @@ class DecisionTraceBuilder:
                             "cell": list(lease.rendezvous),
                             "assigned_tick": lease.assigned_tick,
                             "best_separation": lease.best_separation,
+                            "best_route_distance": lease.best_route_distance,
                             "stalled_ticks": lease.stalled_ticks,
                         }
                     ),
@@ -859,6 +861,175 @@ class DecisionTraceBuilder:
                     for intel in self.memory.enemy_core_intel.values()
                 ),
             },
+        }
+
+    def _formation_dict(
+        self,
+        world: WorldModel,
+        resolution: IntentResolution,
+    ) -> dict[str, object]:
+        assignment = self.memory.peaceful_formation_assignment
+        if assignment is not None and assignment.tick != world.tick:
+            assignment = None
+        combat_ids = {
+            unit.id
+            for unit in world.friendlies
+            if unit.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+        }
+        waits = [
+            intent
+            for intent in resolution.selected
+            if intent.actor_id in combat_ids and intent.action is IntentAction.WAIT
+        ]
+        valid_classes = {"TACTICAL_HOLD", "PARTNER_PROGRESS_HOLD"}
+        valid_holds = [
+            intent
+            for intent in waits
+            if dict(intent.metadata).get("hold_class") in valid_classes
+        ]
+        blocked_holds = [
+            intent
+            for intent in waits
+            if dict(intent.metadata).get("hold_class")
+            in {"BLOCKED_WAIT", "NO_VIABLE_MOVE"}
+            or "ROUTE_BLOCKED" in intent.reason
+            or intent.reason == "NO_LEGAL_TASK"
+        ]
+        denominator = max(1, len(combat_ids))
+        return {
+            "assignment": (
+                None
+                if assignment is None
+                else {
+                    "tick": assignment.tick,
+                    "reserved_positions": [
+                        list(cell) for cell in assignment.reserved_positions
+                    ],
+                    "unassigned_squads": [
+                        [str(vanguard_id), str(ranger_id)]
+                        for vanguard_id, ranger_id in assignment.unassigned_squads
+                    ],
+                    "bundles": [
+                        {
+                            "vanguard_id": str(bundle.vanguard_id),
+                            "ranger_id": str(bundle.ranger_id),
+                            "vanguard_origin": list(bundle.vanguard_origin),
+                            "ranger_origin": list(bundle.ranger_origin),
+                            "anchor": list(bundle.anchor),
+                            "support": list(bundle.support),
+                            "vanguard_route_distance": bundle.vanguard_route_distance,
+                            "ranger_route_distance": bundle.ranger_route_distance,
+                            "vanguard_first_position": (
+                                None
+                                if bundle.vanguard_first_position is None
+                                else list(bundle.vanguard_first_position)
+                            ),
+                            "ranger_first_position": (
+                                None
+                                if bundle.ranger_first_position is None
+                                else list(bundle.ranger_first_position)
+                            ),
+                            "score": list(bundle.score),
+                        }
+                        for bundle in assignment.bundles
+                    ],
+                    "rejected": [
+                        {
+                            "vanguard_id": str(vanguard_id),
+                            "ranger_id": str(ranger_id),
+                            "anchor": list(anchor),
+                            "support": list(support),
+                            "reason": reason,
+                        }
+                        for vanguard_id, ranger_id, anchor, support, reason
+                        in assignment.rejected
+                    ],
+                }
+            ),
+            "leases": [
+                {
+                    "vanguard_id": str(lease.vanguard_id),
+                    "ranger_id": str(lease.ranger_id),
+                    "anchor": list(lease.anchor),
+                    "support": list(lease.support),
+                    "assigned_tick": lease.assigned_tick,
+                    "last_evaluated_tick": lease.last_evaluated_tick,
+                    "vanguard_best_distance": lease.vanguard_best_distance,
+                    "ranger_best_distance": lease.ranger_best_distance,
+                    "vanguard_arrived": lease.vanguard_arrived,
+                    "ranger_arrived": lease.ranger_arrived,
+                    "stalled_ticks": lease.stalled_ticks,
+                    "blocked_ticks": lease.blocked_ticks,
+                    "partner_hold_ticks": lease.partner_hold_ticks,
+                    "last_rejection_reason": lease.last_rejection_reason,
+                }
+                for lease in sorted(
+                    self.memory.squad_formation_leases.values(),
+                    key=lambda item: (
+                        item.vanguard_id.bytes,
+                        item.ranger_id.bytes,
+                    ),
+                )
+            ],
+            "move_feedback": [
+                {
+                    "actor_id": str(feedback.actor_id),
+                    "tick": feedback.tick,
+                    "action": feedback.action,
+                    "reason": feedback.reason,
+                    "target": (
+                        None
+                        if feedback.target_position is None
+                        else list(feedback.target_position)
+                    ),
+                    "rejection_reason": feedback.rejection_reason,
+                    "consecutive_blocked_ticks": feedback.consecutive_blocked_ticks,
+                }
+                for feedback in sorted(
+                    self.memory.formation_move_feedback.values(),
+                    key=lambda item: item.actor_id.bytes,
+                )
+            ],
+            "pairing_cooldowns": [
+                {
+                    "vanguard_id": str(cooldown.vanguard_id),
+                    "ranger_id": str(cooldown.ranger_id),
+                    "expires_tick": cooldown.expires_tick,
+                    "reason": cooldown.reason,
+                }
+                for cooldown in sorted(
+                    self.memory.squad_pairing_cooldowns.values(),
+                    key=lambda item: (
+                        item.expires_tick,
+                        item.vanguard_id.bytes,
+                        item.ranger_id.bytes,
+                    ),
+                )
+            ],
+            "waits": {
+                "combat_units": len(combat_ids),
+                "total": len(waits),
+                "valid_tactical": len(valid_holds),
+                "blocked_or_idle": len(blocked_holds),
+                "valid_tactical_percent": round(
+                    100 * len(valid_holds) / denominator, 1
+                ),
+                "blocked_or_idle_percent": round(
+                    100 * len(blocked_holds) / denominator, 1
+                ),
+            },
+            "defense_reserve_leases": [
+                {
+                    "actor_id": str(actor_id),
+                    "position": list(value[0]),
+                    "assigned_tick": value[1],
+                    "role": value[2],
+                }
+                for actor_id, value in sorted(
+                    self.memory.defense_reserve_leases.items(),
+                    key=lambda item: item[0].bytes,
+                )
+            ],
         }
 
     def _core_safety_dict(

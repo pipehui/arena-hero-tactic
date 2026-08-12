@@ -116,6 +116,13 @@ class TacticConfig:
     squad_max_separation: int = 4
     squad_reassembly_no_progress_ticks: int = 2
     squad_reassembly_break_ticks: int = 4
+    formation_candidate_limit: int = 8
+    formation_target_stall_ticks: int = 2
+    formation_target_backoff_ticks: int = 8
+    formation_pair_cooldown_ticks: int = 8
+    formation_partner_hold_ticks: int = 2
+    formation_yield_ticks: int = 2
+    tactical_position_lease_ticks: int = 4
     ranger_repeat_miss_limit: int = 2
     ranger_miss_suppress_ticks: int = 2
 
@@ -223,6 +230,13 @@ class TacticConfig:
             self.squad_max_separation,
             self.squad_reassembly_no_progress_ticks,
             self.squad_reassembly_break_ticks,
+            self.formation_candidate_limit,
+            self.formation_target_stall_ticks,
+            self.formation_target_backoff_ticks,
+            self.formation_pair_cooldown_ticks,
+            self.formation_partner_hold_ticks,
+            self.formation_yield_ticks,
+            self.tactical_position_lease_ticks,
             self.ranger_repeat_miss_limit,
             self.ranger_miss_suppress_ticks,
             self.core_retreat_radius,
@@ -264,6 +278,8 @@ class TacticConfig:
             raise ValueError("outer screen continuation must cover acquisition radius")
         if self.squad_reassembly_break_ticks < self.squad_reassembly_no_progress_ticks:
             raise ValueError("reassembly break must not precede its no-progress limit")
+        if self.formation_pair_cooldown_ticks < self.squad_reassembly_break_ticks:
+            raise ValueError("pair cooldown must cover the reassembly break window")
         if (
             not self.exploration_sector_radii
             or tuple(sorted(set(self.exploration_sector_radii)))

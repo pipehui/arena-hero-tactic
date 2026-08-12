@@ -88,6 +88,7 @@ class DecisionKernel:
         context = self._context(world, projection, core_intents)
         products = self._plan(context, core_intents)
         resolution = self._resolve(context, products)
+        self.defense.observe_resolution(world, resolution)
         self._remember_move_attempts(world, resolution)
         assigned_map = self._map_with_resource_assignments(context.tactical_map)
         resolved_map = self._resolved_tactical_map(assigned_map, resolution)

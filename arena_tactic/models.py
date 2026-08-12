@@ -803,9 +803,83 @@ class SquadRendezvousLease:
     rendezvous: Position
     assigned_tick: int
     best_separation: int
+    best_route_distance: int | None = None
     stalled_ticks: int = 0
     last_vanguard_position: Position | None = None
     last_ranger_position: Position | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SquadFormationBundle:
+    """One globally reservable peaceful formation for a mixed squad."""
+
+    vanguard_id: UUID
+    ranger_id: UUID
+    vanguard_origin: Position
+    ranger_origin: Position
+    anchor: Position
+    support: Position
+    vanguard_route_distance: int
+    ranger_route_distance: int
+    vanguard_first_direction: Direction | None = None
+    vanguard_first_position: Position | None = None
+    ranger_first_direction: Direction | None = None
+    ranger_first_position: Position | None = None
+    score: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PeacefulFormationAssignment:
+    """Per-Tick global formation result, detached from SDK controllers."""
+
+    tick: int
+    bundles: tuple[SquadFormationBundle, ...] = ()
+    reserved_positions: tuple[Position, ...] = ()
+    unassigned_squads: tuple[tuple[UUID, UUID], ...] = ()
+    rejected: tuple[tuple[UUID, UUID, Position, Position, str], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class SquadFormationLease:
+    """Authoritative progress for one patrol bundle across Turns."""
+
+    vanguard_id: UUID
+    ranger_id: UUID
+    anchor: Position
+    support: Position
+    assigned_tick: int
+    last_evaluated_tick: int
+    vanguard_best_distance: int | None
+    ranger_best_distance: int | None
+    vanguard_arrived: bool = False
+    ranger_arrived: bool = False
+    stalled_ticks: int = 0
+    blocked_ticks: int = 0
+    partner_hold_ticks: int = 0
+    last_vanguard_position: Position | None = None
+    last_ranger_position: Position | None = None
+    last_rejection_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FormationMoveFeedback:
+    """Resolver outcome consumed by the next Turn's formation planner."""
+
+    actor_id: UUID
+    tick: int
+    action: str
+    reason: str
+    target_position: Position | None
+    rejection_reason: str | None = None
+    consecutive_blocked_ticks: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class PairingCooldown:
+    vanguard_id: UUID
+    ranger_id: UUID
+    expires_tick: int
+    reason: str = "STALLED_REASSEMBLY"
 
 
 @dataclass(frozen=True, slots=True)

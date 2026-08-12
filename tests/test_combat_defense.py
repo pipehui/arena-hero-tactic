@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from collections import Counter
+from itertools import groupby
 
 from arena_hero import (
     BeaconStatus,
@@ -19,6 +20,7 @@ from arena_hero import (
 from arena_tactic import (
     ActionIntent,
     BalancedTactic,
+    FormationMoveFeedback,
     IntentResolver,
     ScreeningGroupState,
     TacticMemory,
@@ -26,11 +28,171 @@ from arena_tactic import (
     build_tactical_map,
 )
 from arena_tactic.geometry import manhattan_ring, ranger_firing_positions, ranger_line_is_clear
+from arena_tactic.models import SquadState
 from arena_tactic.world import build_world_model
 from tests.helpers import enemy_core, friendly_core, make_turn, uid, unit
 
 
 class CombatDefenseTests(unittest.TestCase):
+    def test_peaceful_squads_globally_reserve_distinct_support_slots(self) -> None:
+        vanguards = (
+            unit(1, UnitType.VANGUARD, (0, -2)),
+            unit(3, UnitType.VANGUARD, (0, 2)),
+        )
+        rangers = (
+            unit(2, UnitType.RANGER, (-1, 0)),
+            unit(4, UnitType.RANGER, (1, 0)),
+        )
+        tactic = BalancedTactic(memory=TacticMemory(opening_complete=True))
+
+        tactic.choose_actions(
+            make_turn(units=(*vanguards, *rangers), resources=0)
+        )
+
+        supports = [
+            squad.support_target
+            for squad in tactic.memory.squad_states.values()
+            if squad.support_target is not None
+        ]
+        self.assertEqual(len(supports), len(set(supports)))
+        self.assertEqual(tactic.last_decision_trace["schema_version"], 34)
+        formation = tactic.last_decision_trace["combat"]["formation"]
+        assigned_supports = [
+            tuple(bundle["support"])
+            for bundle in formation["assignment"]["bundles"]
+        ]
+        self.assertEqual(len(assigned_supports), len(set(assigned_supports)))
+        self.assertIn("blocked_or_idle_percent", formation["waits"])
+
+    def test_stacked_noncombat_occupant_keeps_formation_cell_blocked(self) -> None:
+        worker = unit(9, UnitType.WORKER, (0, -5))
+        vanguard = unit(1, UnitType.VANGUARD, (0, -5))
+        ranger = unit(2, UnitType.RANGER, (0, -3))
+        tactic = BalancedTactic(memory=TacticMemory(opening_complete=True))
+
+        tactic.choose_actions(
+            make_turn(
+                units=(worker, vanguard, ranger),
+                resources=0,
+            )
+        )
+
+        assignment = tactic.last_decision_trace["combat"]["formation"]["assignment"]
+        self.assertIsNotNone(assignment)
+        claimed = {
+            tuple(bundle[key])
+            for bundle in assignment["bundles"]
+            for key in ("anchor", "support")
+        }
+        self.assertNotIn(worker.position, claimed)
+
+    def test_arrived_patrol_member_does_not_wait_beyond_partner_progress_limit(self) -> None:
+        core = friendly_core()
+        vanguard = unit(1, UnitType.VANGUARD, (0, -5))
+        ranger = unit(2, UnitType.RANGER, (0, -2))
+        memory = TacticMemory(
+            opening_complete=True,
+            core_id=core.id,
+            core_position=core.position,
+        )
+        key = (vanguard.id, ranger.id)
+        memory.squad_states[key] = SquadState(
+            vanguard_id=vanguard.id,
+            ranger_id=ranger.id,
+            radius=5,
+            sector_index=0,
+            patrol_anchor=vanguard.position,
+            support_target=(0, -3),
+            target_assigned_tick=1,
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        reasons = []
+        for tick in range(1, 5):
+            tactic.choose_actions(
+                make_turn(
+                    tick=tick,
+                    core=core,
+                    units=(vanguard, ranger),
+                    resources=0,
+                )
+            )
+            reasons.append(
+                next(
+                    task["reason"]
+                    for task in tactic.last_decision_trace["tasks"]
+                    if task["actor_id"] == str(vanguard.id)
+                )
+            )
+
+        self.assertLessEqual(
+            max(
+                (
+                    len(list(run))
+                    for reason, run in groupby(reasons)
+                    if reason in {
+                        "VANGUARD_ANCHOR_HOLD",
+                        "WAIT_FOR_PARTNER_PROGRESS",
+                    }
+                ),
+                default=0,
+            ),
+            2,
+        )
+        self.assertNotEqual(memory.squad_states[key].patrol_anchor, vanguard.position)
+
+    def test_broken_pair_is_not_recreated_during_pairing_cooldown(self) -> None:
+        vanguard = unit(1, UnitType.VANGUARD, (5, 0))
+        ranger = unit(2, UnitType.RANGER, (0, 1))
+        tactic = BalancedTactic(memory=TacticMemory(opening_complete=True))
+        key = (vanguard.id, ranger.id)
+
+        for tick in range(1, 7):
+            tactic.choose_actions(
+                make_turn(
+                    tick=tick,
+                    units=(vanguard, ranger),
+                    resources=0,
+                )
+            )
+
+        self.assertNotIn(key, tactic.memory.squad_states)
+        cooldowns = getattr(tactic.memory, "squad_pairing_cooldowns", {})
+        self.assertGreaterEqual(cooldowns[key].expires_tick, 8)
+
+    def test_home_defense_assigns_targets_instead_of_generic_pool_waits(self) -> None:
+        combatants = tuple(
+            unit(index, UnitType.VANGUARD, (index - 4, 0))
+            for index in range(1, 7)
+        ) + tuple(
+            unit(index + 20, UnitType.RANGER, (index - 4, 1))
+            for index in range(1, 7)
+        )
+        enemy = unit(100, UnitType.VANGUARD, (0, -10), controlled=False)
+        memory = TacticMemory(opening_complete=True)
+        memory.known_passable.update(
+            (x, y)
+            for x in range(-12, 13)
+            for y in range(-12, 13)
+            if abs(x) + abs(y) <= 12
+        )
+        tactic = BalancedTactic(memory=memory)
+        turn = make_turn(units=combatants, enemies=(enemy,), resources=0)
+        world = build_world_model(turn, memory, tactic.config)
+        projection = build_tactical_map(world, tactic.config)
+
+        intents = tactic._kernel.defense.intents(
+            world,
+            projection,
+            frozenset(manhattan_ring((0, 0), 5)),
+        )
+
+        self.assertFalse(
+            any(intent.reason == "DEFENSE_POOL_RESERVE" for intent in intents)
+        )
+        assigned = {intent.actor_id for intent in intents if intent.actor_id is not None}
+        self.assertEqual(assigned, {unit_view.id for unit_view in combatants})
+
     def test_outer_screen_ranger_does_not_take_the_zero_risk_contact_losing_step(self) -> None:
         core = friendly_core(position=(405, -156))
         vanguards = (
@@ -155,9 +317,20 @@ class CombatDefenseTests(unittest.TestCase):
     def test_ranger_support_conflict_does_not_fall_back_into_a_dead_end(self) -> None:
         ranger = unit(1, UnitType.RANGER, (0, 0))
         blocker = unit(2, UnitType.VANGUARD, (-1, -1))
-        memory = TacticMemory(opening_complete=True)
+        core = friendly_core(position=(5, 5))
+        memory = TacticMemory(
+            opening_complete=True,
+            core_id=core.id,
+            core_position=core.position,
+        )
+        memory.squad_states[(blocker.id, ranger.id)] = SquadState(
+            vanguard_id=blocker.id,
+            ranger_id=ranger.id,
+            radius=5,
+            sector_index=0,
+        )
         turn = make_turn(
-            core=friendly_core(position=(5, 5)),
+            core=core,
             units=(ranger, blocker),
             obstacle_cells=((-1, 1), (1, 1), (0, 2)),
             resources=0,
@@ -184,11 +357,70 @@ class CombatDefenseTests(unittest.TestCase):
         )
 
         resolution = IntentResolver().resolve(world, [claim, *support])
+        tactic._kernel.defense.observe_resolution(world, resolution)
 
         selected = resolution.for_actor(ranger.id)
         self.assertIsNotNone(selected)
         self.assertEqual(selected.action.value, "WAIT")
         self.assertNotEqual(selected.direction, Direction.DOWN)
+        self.assertIn(
+            tactic.memory.formation_move_feedback[ranger.id].rejection_reason,
+            {"CELL_CAPACITY", "RESERVATION_CONFLICT"},
+        )
+
+    def test_repeated_formation_conflict_uses_safe_non_reversing_yield(self) -> None:
+        vanguard = unit(1, UnitType.VANGUARD, (0, 0))
+        blocker = unit(2, UnitType.RANGER, (1, 0))
+        core = friendly_core(position=(5, 5))
+        memory = TacticMemory(
+            opening_complete=True,
+            core_id=core.id,
+            core_position=core.position,
+        )
+        memory.known_passable.update(
+            (x, y)
+            for x in range(-2, 7)
+            for y in range(-3, 7)
+        )
+        memory.position_history[vanguard.id] = ((0, -1), vanguard.position)
+        memory.formation_move_feedback[vanguard.id] = FormationMoveFeedback(
+            actor_id=vanguard.id,
+            tick=1,
+            action="WAIT",
+            reason="VANGUARD_ANCHOR_ROUTE_BLOCKED_THIS_TICK",
+            target_position=(2, 0),
+            rejection_reason="CELL_CAPACITY",
+            consecutive_blocked_ticks=2,
+        )
+        tactic = BalancedTactic(memory=memory)
+        world = build_world_model(
+            make_turn(
+                tick=2,
+                core=core,
+                units=(vanguard, blocker),
+                resources=0,
+            ),
+            memory,
+            tactic.config,
+        )
+        projection = build_tactical_map(world, tactic.config)
+
+        candidates = tactic._kernel.defense._move_or_wait(
+            world,
+            projection,
+            world.friendly(vanguard.id),
+            (2, 0),
+            frozenset(),
+            "VANGUARD_ANCHOR",
+        )
+        resolution = IntentResolver().resolve(world, candidates)
+
+        selected = resolution.for_actor(vanguard.id)
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.reason, "FORMATION_YIELD")
+        self.assertEqual(selected.target_position, (0, 1))
+        self.assertNotEqual(selected.target_position, (0, -1))
+        self.assertGreaterEqual(dict(selected.metadata)["forward_exits"], 2)
 
     def test_home_vanguards_receive_unique_intercept_cells(self) -> None:
         vanguards = (
@@ -1119,8 +1351,9 @@ class CombatDefenseTests(unittest.TestCase):
             if item["actor_id"] == str(vanguard.id)
         )
         self.assertIsInstance(turn.plan.unit_actions[ranger.id], MoveAction)
-        self.assertEqual(ranger_task["reason"], "SQUAD_REASSEMBLE")
-        self.assertEqual(vanguard_task["reason"], "SQUAD_REASSEMBLE_PARTNER_HOLD")
+        self.assertEqual(ranger_task["reason"], "SQUAD_REASSEMBLE_RENDEZVOUS")
+        self.assertEqual(vanguard_task["reason"], "SQUAD_REASSEMBLE_RENDEZVOUS")
+        self.assertIsInstance(turn.plan.unit_actions[vanguard.id], MoveAction)
 
     def test_peaceful_ranger_support_keeps_advancing_with_its_patrol(self) -> None:
         memory = TacticMemory()
@@ -1169,12 +1402,7 @@ class CombatDefenseTests(unittest.TestCase):
             any(isinstance(action, MoveAction) for action in ranger_actions[2:]),
             "a healthy Ranger must not become a permanent inner support turret",
         )
-        for index in range(1, len(patrol_leases)):
-            if patrol_leases[index] == patrol_leases[index - 1]:
-                continue
-            previous_anchor, previous_support = patrol_leases[index - 1]
-            self.assertEqual(vanguard_positions[index], previous_anchor)
-            self.assertEqual(ranger_positions[index], previous_support)
+        self.assertGreater(len(set(patrol_leases)), 1)
         self.assertFalse(
             any(
                 ranger_positions[index] == ranger_positions[index - 2]

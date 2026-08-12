@@ -20,13 +20,19 @@ from .geometry import (
 from .models import (
     ActionIntent,
     EntitySnapshot,
+    FormationMoveFeedback,
     IntentAction,
+    IntentResolution,
+    PairingCooldown,
+    PeacefulFormationAssignment,
+    SquadFormationBundle,
+    SquadFormationLease,
     SquadRendezvousLease,
     SquadState,
     UnitMission,
     WorldModel,
 )
-from .planning import move_viability, path_to, route_to
+from .planning import Route, move_viability, path_to, route_to
 from .projection import TacticalMap
 from .rules import UNIT_MAX_HP
 from .state import TacticMemory
@@ -102,7 +108,7 @@ class DefensePlanner:
                 and manhattan(enemy.observed_position, world.core.position)
                 <= self.config.home_warning_radius
             )
-        self._sync_squads(living_combatants)
+        self._sync_squads(living_combatants, world.tick)
         screening_intents = self._screening_intents(
             world,
             projection,
@@ -132,6 +138,7 @@ class DefensePlanner:
                     protected,
                 ),
             ]
+        self.memory.defense_reserve_leases.clear()
         if screening_intents:
             screening_ids = {
                 member_id
@@ -155,6 +162,81 @@ class DefensePlanner:
             tuple(unit for unit in healthy if unit.id not in assigned_vanguard_ids),
             protected,
         )
+
+    def observe_resolution(
+        self,
+        world: WorldModel,
+        resolution: IntentResolution,
+    ) -> None:
+        """Persist only the resolver evidence needed to unstick next Turn."""
+
+        formation_actors = {
+            actor_id
+            for key in self.memory.squad_states
+            for actor_id in key
+        }
+        selected_by_actor = {
+            intent.actor_id: intent
+            for intent in resolution.selected
+            if intent.actor_id is not None
+        }
+        conflicts: dict[UUID, str] = {}
+        conflict_priority = {
+            "HEAD_ON_SWAP": 0,
+            "CELL_CAPACITY": 1,
+            "RESERVATION_CONFLICT": 2,
+        }
+        for rejected in resolution.rejected:
+            actor_id = rejected.intent.actor_id
+            if actor_id not in formation_actors:
+                continue
+            if rejected.reason not in conflict_priority:
+                continue
+            previous = conflicts.get(actor_id)
+            if (
+                previous is None
+                or conflict_priority[rejected.reason]
+                < conflict_priority[previous]
+            ):
+                conflicts[actor_id] = rejected.reason
+        for actor_id in tuple(self.memory.formation_move_feedback):
+            if actor_id not in formation_actors:
+                self.memory.formation_move_feedback.pop(actor_id, None)
+        for actor_id in formation_actors:
+            selected = selected_by_actor.get(actor_id)
+            if selected is None or selected.mission not in {
+                UnitMission.PATROL,
+                UnitMission.HOME_DEFENSE,
+            }:
+                self.memory.formation_move_feedback.pop(actor_id, None)
+                continue
+            previous = self.memory.formation_move_feedback.get(actor_id)
+            rejection = conflicts.get(actor_id)
+            blocked_now = (
+                rejection is not None
+                or "ROUTE_BLOCKED" in selected.reason
+                or selected.reason in {
+                    "NO_VIABLE_FORMATION_MOVE",
+                    "NO_VIABLE_RENDEZVOUS",
+                }
+            )
+            consecutive_blocked = (
+                previous.consecutive_blocked_ticks + 1
+                if blocked_now
+                and previous is not None
+                and previous.tick == world.tick - 1
+                and previous.target_position == selected.target_position
+                else int(blocked_now)
+            )
+            self.memory.formation_move_feedback[actor_id] = FormationMoveFeedback(
+                actor_id=actor_id,
+                tick=world.tick,
+                action=selected.action.value,
+                reason=selected.reason,
+                target_position=selected.target_position,
+                rejection_reason=rejection,
+                consecutive_blocked_ticks=consecutive_blocked,
+            )
 
     def _screening_intents(
         self,
@@ -274,7 +356,12 @@ class DefensePlanner:
                         IntentAction.WAIT,
                         UnitMission.HOME_DEFENSE,
                         58,
-                        reason="DEFENSE_POOL_RESERVE",
+                        target_position=unit.position,
+                        reason="NO_VIABLE_FORMATION_MOVE",
+                        metadata=(
+                            ("hold_class", "NO_VIABLE_MOVE"),
+                            ("defense_active", True),
+                        ),
                     )
                 )
                 continue
@@ -286,8 +373,13 @@ class DefensePlanner:
                         IntentAction.WAIT,
                         UnitMission.HOME_DEFENSE,
                         58,
-                        target_position=target,
-                        reason=f"{role}_HOLD",
+                    target_position=target,
+                    reason=f"{role}_HOLD",
+                    metadata=(
+                        ("hold_class", "TACTICAL_HOLD"),
+                        ("formation_role", role),
+                        ("lease_ticks", self.config.tactical_position_lease_ticks),
+                    ),
                     )
                 )
                 continue
@@ -449,26 +541,120 @@ class DefensePlanner:
                 rangers.remove(ranger)
                 reserved.add(cell)
 
+        remaining_ids = {unit.id for unit in (*vanguards, *rangers)}
+        for unit_id in tuple(self.memory.defense_reserve_leases):
+            if unit_id not in remaining_ids:
+                self.memory.defense_reserve_leases.pop(unit_id, None)
+        occupied = {
+            unit.position: unit.id
+            for unit in world.friendlies
+        }
+        threat_cells = {
+            enemy.position
+            for _, _, enemies in front_positions
+            for enemy in enemies
+        }
+        front_cells = {front for _, front, _ in front_positions}
         reserve_targets = [
             cell
-            for cell in manhattan_ring(world.core.position, self.config.peaceful_squad_radii[0])
-            if cell in world.known_passable
+            for cell in world.known_passable
+            if 3 <= manhattan(cell, world.core.position) <= self.config.home_engage_radius
             and cell not in world.known_obstacles
             and cell not in protected
             and cell not in reserved
+            and cell not in projection.hostile_occupied
+            and count_open_neighbors(cell, world.known_obstacles) >= 2
+            and (
+                manhattan(cell, world.core.position) <= 5
+                or min(
+                    (manhattan(cell, front) for front in front_cells),
+                    default=0,
+                ) <= 6
+            )
         ]
         for unit in (*vanguards, *rangers):
-            if reserve_targets:
-                target = min(
-                    reserve_targets,
-                    key=lambda cell: (
-                        projection.future_attackers(cell),
-                        manhattan(unit.position, cell),
-                        cell,
+            available = [
+                cell
+                for cell in reserve_targets
+                if occupied.get(cell, unit.id) == unit.id
+                or cell not in occupied
+            ]
+            previous = self.memory.defense_reserve_leases.get(unit.id)
+            previous_target = None
+            if previous is not None:
+                previous_cell, assigned_tick, _ = previous
+                if (
+                    previous_cell in available
+                    and world.tick - assigned_tick
+                    < self.config.tactical_position_lease_ticks
+                ):
+                    previous_target = previous_cell
+            scored: list[tuple[tuple[int, ...], Position, str]] = []
+            for cell in available:
+                route = route_to(
+                    world,
+                    unit.position,
+                    cell,
+                    node_limit=min(self.config.path_node_limit, 512),
+                    blocked=frozenset(
+                        (protected | projection.hostile_occupied | reserved)
+                        - {unit.position, cell}
                     ),
                 )
-                tasks[unit.id] = target, "SECTOR_RESERVE"
-                reserve_targets.remove(target)
+                if route is None:
+                    continue
+                if unit.unit_type is UnitType.RANGER:
+                    coverage = sum(
+                        ranger_line_is_clear(cell, threat, world.known_obstacles)
+                        and cell in ranger_firing_positions(threat)
+                        for threat in threat_cells
+                    )
+                else:
+                    coverage = sum(
+                        manhattan(cell, threat) <= 2
+                        for threat in threat_cells
+                    )
+                front_distance = min(
+                    (manhattan(cell, front) for front in front_cells),
+                    default=0,
+                )
+                role = (
+                    "SECTOR_RESERVE"
+                    if coverage
+                    else (
+                        "TACTICAL_SECOND_LINE"
+                        if front_distance <= 4
+                        else "TACTICAL_CORE_GUARD"
+                    )
+                )
+                scored.append(
+                    (
+                        (
+                            int(cell != previous_target),
+                            -coverage,
+                            front_distance,
+                            projection.immediate_attackers(cell),
+                            projection.future_attackers(cell),
+                            route.distance,
+                            manhattan(cell, world.core.position),
+                            cell[0],
+                            cell[1],
+                        ),
+                        cell,
+                        role,
+                    )
+                )
+            if not scored:
+                continue
+            _, target, role = min(scored, key=lambda item: item[0])
+            tasks[unit.id] = target, role
+            reserve_targets.remove(target)
+            old = self.memory.defense_reserve_leases.get(unit.id)
+            self.memory.defense_reserve_leases[unit.id] = (
+                target,
+                old[1] if old is not None and old[0] == target else world.tick,
+                role,
+            )
         return tasks
 
     def _peaceful_patrol(
@@ -534,6 +720,15 @@ class DefensePlanner:
     ) -> list[ActionIntent]:
         assert world.core is not None
         intents: list[ActionIntent] = []
+        patrol_entries: list[
+            tuple[
+                SquadState,
+                EntitySnapshot,
+                EntitySnapshot,
+                tuple[Position, ...],
+                tuple[Position, ...],
+            ]
+        ] = []
         for radius, squads in sorted(by_radius.items()):
             ring = manhattan_ring(world.core.position, radius)
             for local_index, squad in enumerate(squads):
@@ -541,170 +736,710 @@ class DefensePlanner:
                 ranger = members.get(squad.ranger_id)
                 if vanguard is None or ranger is None:
                     continue
+                if (
+                    manhattan(vanguard.position, ranger.position)
+                    > self.config.squad_max_separation
+                ):
+                    intents.extend(
+                        self._reassembly_intents(
+                            world,
+                            projection,
+                            vanguard,
+                            ranger,
+                            protected,
+                        )
+                    )
+                    continue
                 start = local_index * len(ring) // len(squads)
                 end = (local_index + 1) * len(ring) // len(squads)
                 sector = ring[start:end] or ring
-                intents.extend(
-                    self._squad_patrol_intents(
-                        world,
-                        projection,
-                        (squad.vanguard_id, squad.ranger_id),
-                        squad,
-                        vanguard,
-                        ranger,
-                        sector,
-                        ring,
-                        radius,
-                        protected,
+                patrol_entries.append((squad, vanguard, ranger, sector, ring))
+
+        route_cache: dict[
+            tuple[Position, Position, frozenset[Position]], Route | None
+        ] = {}
+        occupied_sets: dict[Position, set[UUID]] = defaultdict(set)
+        for unit in world.friendlies:
+            occupied_sets[unit.position].add(unit.id)
+        occupied_by = {
+            position: frozenset(actor_ids)
+            for position, actor_ids in occupied_sets.items()
+        }
+        candidate_map: dict[
+            tuple[UUID, UUID], tuple[SquadFormationBundle, ...]
+        ] = {}
+        entry_by_key = {
+            (squad.vanguard_id, squad.ranger_id): (
+                squad,
+                vanguard,
+                ranger,
+                sector,
+                ring,
+            )
+            for squad, vanguard, ranger, sector, ring in patrol_entries
+        }
+        for squad, vanguard, ranger, sector, ring in patrol_entries:
+            key = squad.vanguard_id, squad.ranger_id
+            self._refresh_formation_lease(
+                world,
+                projection,
+                squad,
+                vanguard,
+                ranger,
+                protected,
+                route_cache,
+            )
+            candidate_map[key] = self._formation_candidates(
+                world,
+                projection,
+                squad,
+                vanguard,
+                ranger,
+                sector,
+                ring,
+                protected,
+                occupied_by,
+                route_cache,
+            )
+
+        order = sorted(
+            entry_by_key,
+            key=lambda key: (
+                len(candidate_map[key]),
+                -(
+                    self.memory.squad_formation_leases.get(key).stalled_ticks
+                    if key in self.memory.squad_formation_leases
+                    else 0
+                ),
+                entry_by_key[key][0].radius,
+                key[0].bytes,
+                key[1].bytes,
+            ),
+        )
+        assigned: dict[tuple[UUID, UUID], SquadFormationBundle] = {}
+        claimed_slots: set[Position] = set()
+        claimed_steps: set[Position] = set()
+        rejected: list[tuple[UUID, UUID, Position, Position, str]] = []
+        for key in order:
+            chosen = None
+            for candidate in candidate_map[key]:
+                slots = {candidate.anchor, candidate.support}
+                steps = {
+                    cell
+                    for cell in (
+                        candidate.vanguard_first_position,
+                        candidate.ranger_first_position,
+                    )
+                    if cell is not None
+                }
+                if slots & claimed_slots:
+                    rejected.append((*key, candidate.anchor, candidate.support, "SLOT_RESERVED"))
+                    continue
+                if steps & claimed_steps or steps & claimed_slots:
+                    rejected.append((*key, candidate.anchor, candidate.support, "FIRST_STEP_RESERVED"))
+                    continue
+                if slots & claimed_steps:
+                    rejected.append((*key, candidate.anchor, candidate.support, "SLOT_BLOCKS_FIRST_STEP"))
+                    continue
+                chosen = candidate
+                break
+            if chosen is None:
+                continue
+            assigned[key] = chosen
+            claimed_slots.update((chosen.anchor, chosen.support))
+            claimed_steps.update(
+                cell
+                for cell in (
+                    chosen.vanguard_first_position,
+                    chosen.ranger_first_position,
+                )
+                if cell is not None
+            )
+
+        vacating_actors = {
+            actor_id
+            for bundle in assigned.values()
+            for actor_id, destination in (
+                (bundle.vanguard_id, bundle.vanguard_first_position),
+                (bundle.ranger_id, bundle.ranger_first_position),
+            )
+            if destination is not None
+        }
+        if vacating_actors:
+            relaxed_occupancy = {
+                position: remaining
+                for position, actor_ids in occupied_by.items()
+                if (remaining := actor_ids - vacating_actors)
+            }
+            for key in tuple(item for item in order if item not in assigned):
+                squad, vanguard, ranger, sector, ring = entry_by_key[key]
+                extra = self._formation_candidates(
+                    world,
+                    projection,
+                    squad,
+                    vanguard,
+                    ranger,
+                    sector,
+                    ring,
+                    protected,
+                    relaxed_occupancy,
+                    route_cache,
+                )
+                merged = tuple(
+                    sorted(
+                        {*(candidate_map[key]), *extra},
+                        key=lambda item: item.score,
+                    )[: self.config.formation_candidate_limit]
+                )
+                candidate_map[key] = merged
+                chosen = next(
+                    (
+                        candidate
+                        for candidate in merged
+                        if not self._formation_bundle_conflicts(
+                            candidate,
+                            tuple(assigned.values()),
+                        )
+                    ),
+                    None,
+                )
+                if chosen is None:
+                    continue
+                assigned[key] = chosen
+                claimed_slots.update((chosen.anchor, chosen.support))
+                claimed_steps.update(
+                    cell
+                    for cell in (
+                        chosen.vanguard_first_position,
+                        chosen.ranger_first_position,
+                    )
+                    if cell is not None
+                )
+
+        # One deterministic augmenting repair avoids UUID-order starvation:
+        # an unassigned squad may take a contested bundle when the current
+        # owner has a different feasible bundle that does not disturb any
+        # other assignment.  Bound the repair to one displaced squad so the
+        # live command window remains predictable.
+        for missing_key in tuple(key for key in order if key not in assigned):
+            repaired = False
+            for candidate in candidate_map[missing_key]:
+                for victim_key in sorted(
+                    assigned,
+                    key=lambda item: (item[0].bytes, item[1].bytes),
+                ):
+                    others = tuple(
+                        bundle
+                        for key, bundle in assigned.items()
+                        if key != victim_key
+                    )
+                    if self._formation_bundle_conflicts(candidate, others):
+                        continue
+                    alternative = next(
+                        (
+                            bundle
+                            for bundle in candidate_map[victim_key]
+                            if bundle != assigned[victim_key]
+                            and not self._formation_bundle_conflicts(
+                                bundle,
+                                (*others, candidate),
+                            )
+                        ),
+                        None,
+                    )
+                    if alternative is None:
+                        continue
+                    assigned[missing_key] = candidate
+                    assigned[victim_key] = alternative
+                    repaired = True
+                    break
+                if repaired:
+                    break
+        claimed_slots = {
+            cell
+            for bundle in assigned.values()
+            for cell in (bundle.anchor, bundle.support)
+        }
+        claimed_steps = {
+            cell
+            for bundle in assigned.values()
+            for cell in (
+                bundle.vanguard_first_position,
+                bundle.ranger_first_position,
+            )
+            if cell is not None
+        }
+
+        all_reserved = frozenset(claimed_slots | claimed_steps)
+        for key, bundle in sorted(
+            assigned.items(),
+            key=lambda item: (item[0][0].bytes, item[0][1].bytes),
+        ):
+            squad, vanguard, ranger, _, _ = entry_by_key[key]
+            self._store_formation_bundle(world, squad, bundle, vanguard, ranger)
+            own = {
+                bundle.anchor,
+                bundle.support,
+                bundle.vanguard_first_position,
+                bundle.ranger_first_position,
+            }
+            bundle_protected = frozenset(
+                (set(protected) | set(all_reserved)) - own - {None}
+            )
+            intents.extend(
+                self._formation_member_intents(
+                    world,
+                    projection,
+                    vanguard,
+                    bundle.anchor,
+                    ranger,
+                    bundle_protected,
+                    "VANGUARD_ANCHOR",
+                )
+            )
+            intents.extend(
+                self._formation_member_intents(
+                    world,
+                    projection,
+                    ranger,
+                    bundle.support,
+                    vanguard,
+                    bundle_protected,
+                    "RANGER_SUPPORT",
+                )
+            )
+
+        unassigned = tuple(key for key in order if key not in assigned)
+        for key in unassigned:
+            _, vanguard, ranger, _, _ = entry_by_key[key]
+            self.memory.squad_formation_leases.pop(key, None)
+            for unit in (vanguard, ranger):
+                intents.append(
+                    ActionIntent.simple(
+                        unit.id,
+                        IntentAction.WAIT,
+                        UnitMission.PATROL,
+                        72,
+                        target_position=unit.position,
+                        reason="NO_VIABLE_FORMATION_MOVE",
+                        metadata=(
+                            ("hold_class", "NO_VIABLE_MOVE"),
+                            ("candidate_count", len(candidate_map[key])),
+                        ),
                     )
                 )
+        self.memory.peaceful_formation_assignment = PeacefulFormationAssignment(
+            tick=world.tick,
+            bundles=tuple(
+                assigned[key]
+                for key in sorted(assigned, key=lambda item: (item[0].bytes, item[1].bytes))
+            ),
+            reserved_positions=tuple(sorted(all_reserved)),
+            unassigned_squads=unassigned,
+            rejected=tuple(rejected[:64]),
+        )
         return intents
 
-    def _squad_patrol_intents(
+    @staticmethod
+    def _formation_bundle_conflicts(
+        candidate: SquadFormationBundle,
+        assigned: tuple[SquadFormationBundle, ...],
+    ) -> bool:
+        candidate_slots = {candidate.anchor, candidate.support}
+        candidate_steps = {
+            cell
+            for cell in (
+                candidate.vanguard_first_position,
+                candidate.ranger_first_position,
+            )
+            if cell is not None
+        }
+        for bundle in assigned:
+            slots = {bundle.anchor, bundle.support}
+            steps = {
+                cell
+                for cell in (
+                    bundle.vanguard_first_position,
+                    bundle.ranger_first_position,
+                )
+                if cell is not None
+            }
+            if (
+                candidate_slots & slots
+                or candidate_steps & steps
+                or candidate_steps & slots
+                or candidate_slots & steps
+            ):
+                return True
+            candidate_moves = {
+                candidate.vanguard_origin: candidate.vanguard_first_position,
+                candidate.ranger_origin: candidate.ranger_first_position,
+            }
+            assigned_moves = {
+                bundle.vanguard_origin: bundle.vanguard_first_position,
+                bundle.ranger_origin: bundle.ranger_first_position,
+            }
+            if any(
+                destination is not None
+                and other_destination is not None
+                and destination == other_origin
+                and other_destination == origin
+                for origin, destination in candidate_moves.items()
+                for other_origin, other_destination in assigned_moves.items()
+            ):
+                return True
+        return False
+
+    def _formation_candidates(
         self,
         world: WorldModel,
         projection: TacticalMap,
-        squad_key: tuple[UUID, UUID],
         squad: SquadState,
         vanguard: EntitySnapshot,
         ranger: EntitySnapshot,
         sector: tuple[Position, ...],
         ring: tuple[Position, ...],
-        radius: int,
         protected: frozenset[Position],
-    ) -> list[ActionIntent]:
-        assert world.core is not None
+        occupied_by: dict[Position, frozenset[UUID]],
+        route_cache: dict[tuple[Position, Position, frozenset[Position]], Route | None],
+    ) -> tuple[SquadFormationBundle, ...]:
+        key = squad.vanguard_id, squad.ranger_id
+        occupied_elsewhere = frozenset(
+            position
+            for position, actor_ids in occupied_by.items()
+            if any(actor_id not in key for actor_id in actor_ids)
+        )
+        blocked = frozenset(
+            protected | projection.hostile_occupied | occupied_elsewhere
+        )
         anchors = self._patrol_anchor_candidates(
             world,
             projection,
             vanguard,
             sector,
             ring,
-            radius,
-            protected,
+            squad.radius,
+            blocked,
         )
-        anchor_set = set(anchors)
-        anchor = (
-            squad.patrol_anchor
-            if squad.patrol_anchor in anchor_set
-            else None
-        )
-        support = squad.support_target if anchor is not None else None
-        completed = bool(
-            anchor is not None
-            and vanguard.position == anchor
-            and (support is None or ranger.position == support)
-        )
-        if completed:
-            anchor = None
-            support = None
-        if anchor is None:
-            recent_anchor_cells = set(
-                self.memory.position_history.get(vanguard.id, ())[-4:]
+        recent_anchor = set(self.memory.position_history.get(vanguard.id, ())[-4:])
+        recent_support = set(self.memory.position_history.get(ranger.id, ())[-4:])
+        anchors = sorted(
+            anchors,
+            key=lambda cell: (
+                int(cell in recent_anchor),
+                self.memory.visit_counts.get(cell, 0),
+                projection.future_attackers(cell),
+                manhattan(vanguard.position, cell),
+                cell,
+            ),
+        )[: self.config.formation_candidate_limit * 2]
+        candidates: list[SquadFormationBundle] = []
+        for anchor in anchors:
+            vanguard_route = self._cached_formation_route(
+                world,
+                vanguard.position,
+                anchor,
+                blocked - {anchor},
+                route_cache,
             )
-            anchor = min(
-                anchors,
-                key=lambda cell: (
-                    int(cell in recent_anchor_cells),
-                    self.memory.visit_counts.get(cell, 0),
-                    projection.future_attackers(cell),
-                    manhattan(vanguard.position, cell),
-                    cell,
+            if vanguard_route is None:
+                continue
+            firing_band = tuple(
+                cell
+                for cell in self._firing_band(
+                    world,
+                    projection,
+                    anchor,
+                    blocked - {anchor},
+                )
+                if 2 <= manhattan(cell, anchor) <= 3
+            )
+            for support in firing_band:
+                if support == anchor:
+                    continue
+                backoff_key = (*key, anchor, support)
+                if self.memory.squad_target_backoffs.get(backoff_key, 0) >= world.tick:
+                    continue
+                ranger_route = self._cached_formation_route(
+                    world,
+                    ranger.position,
+                    support,
+                    blocked - {support},
+                    route_cache,
+                )
+                if ranger_route is None:
+                    continue
+                if (
+                    vanguard_route.first_position == ranger.position
+                    and ranger_route.first_position == vanguard.position
+                ):
+                    continue
+                if vanguard_route.first_position == ranger_route.first_position:
+                    continue
+                stable = int(
+                    squad.patrol_anchor != anchor
+                    or squad.support_target != support
+                )
+                score = (
+                    stable,
+                    int(anchor in recent_anchor) + int(support in recent_support),
+                    self.memory.visit_counts.get(anchor, 0)
+                    + self.memory.visit_counts.get(support, 0),
+                    max(vanguard_route.distance, ranger_route.distance),
+                    vanguard_route.distance + ranger_route.distance,
+                    projection.future_attackers(anchor)
+                    + projection.future_attackers(support),
+                    anchor[0],
+                    anchor[1],
+                    support[0],
+                    support[1],
+                )
+                candidates.append(
+                    SquadFormationBundle(
+                        vanguard_id=vanguard.id,
+                        ranger_id=ranger.id,
+                        vanguard_origin=vanguard.position,
+                        ranger_origin=ranger.position,
+                        anchor=anchor,
+                        support=support,
+                        vanguard_route_distance=vanguard_route.distance,
+                        ranger_route_distance=ranger_route.distance,
+                        vanguard_first_direction=vanguard_route.first_direction,
+                        vanguard_first_position=vanguard_route.first_position,
+                        ranger_first_direction=ranger_route.first_direction,
+                        ranger_first_position=ranger_route.first_position,
+                        score=score,
+                    )
+                )
+        return tuple(
+            sorted(candidates, key=lambda item: item.score)[
+                : self.config.formation_candidate_limit
+            ]
+        )
+
+    def _cached_formation_route(
+        self,
+        world: WorldModel,
+        start: Position,
+        target: Position,
+        blocked: frozenset[Position],
+        cache: dict[tuple[Position, Position, frozenset[Position]], Route | None],
+    ) -> Route | None:
+        key = start, target, blocked
+        if key not in cache:
+            cache[key] = route_to(
+                world,
+                start,
+                target,
+                node_limit=min(self.config.path_node_limit, 512),
+                blocked=blocked - {start, target},
+            )
+        return cache[key]
+
+    def _refresh_formation_lease(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        squad: SquadState,
+        vanguard: EntitySnapshot,
+        ranger: EntitySnapshot,
+        protected: frozenset[Position],
+        route_cache: dict[tuple[Position, Position, frozenset[Position]], Route | None],
+    ) -> None:
+        key = squad.vanguard_id, squad.ranger_id
+        previous = self.memory.squad_formation_leases.get(key)
+        if previous is None or (
+            squad.patrol_anchor != previous.anchor
+            or squad.support_target != previous.support
+        ):
+            return
+        blocked = frozenset(protected | projection.hostile_occupied)
+        v_route = self._cached_formation_route(
+            world,
+            vanguard.position,
+            previous.anchor,
+            blocked - {vanguard.position, previous.anchor},
+            route_cache,
+        )
+        r_route = self._cached_formation_route(
+            world,
+            ranger.position,
+            previous.support,
+            blocked - {ranger.position, previous.support},
+            route_cache,
+        )
+        v_distance = None if v_route is None else v_route.distance
+        r_distance = None if r_route is None else r_route.distance
+        v_arrived = previous.vanguard_arrived or vanguard.position == previous.anchor
+        r_arrived = previous.ranger_arrived or ranger.position == previous.support
+        progressed = (
+            (v_arrived and not previous.vanguard_arrived)
+            or (r_arrived and not previous.ranger_arrived)
+            or (
+                v_distance is not None
+                and previous.vanguard_best_distance is not None
+                and v_distance < previous.vanguard_best_distance
+            )
+            or (
+                r_distance is not None
+                and previous.ranger_best_distance is not None
+                and r_distance < previous.ranger_best_distance
+            )
+        )
+        consecutive = world.tick == previous.last_evaluated_tick + 1
+        stalled = 0 if progressed or not consecutive else previous.stalled_ticks + 1
+        feedback = tuple(
+            item
+            for actor_id in key
+            if (
+                item := self.memory.formation_move_feedback.get(actor_id)
+            ) is not None
+            and item.tick == world.tick - 1
+        )
+        rejection = next(
+            (
+                item.rejection_reason
+                for item in feedback
+                if item.rejection_reason
+                in {"CELL_CAPACITY", "RESERVATION_CONFLICT", "HEAD_ON_SWAP"}
+            ),
+            None,
+        )
+        blocked_ticks = (
+            previous.blocked_ticks + 1
+            if rejection is not None and consecutive
+            else 0
+        )
+        one_arrived = v_arrived != r_arrived
+        hold_ticks = (
+            previous.partner_hold_ticks + 1
+            if one_arrived and consecutive
+            else (1 if one_arrived else 0)
+        )
+        completed = v_arrived and r_arrived
+        invalid = (
+            stalled >= self.config.formation_target_stall_ticks
+            or blocked_ticks >= self.config.formation_target_stall_ticks
+            or hold_ticks > self.config.formation_partner_hold_ticks
+        )
+        if completed or invalid:
+            if invalid:
+                self.memory.squad_target_backoffs[
+                    (*key, previous.anchor, previous.support)
+                ] = world.tick + self.config.formation_target_backoff_ticks
+            self.memory.squad_formation_leases.pop(key, None)
+            self.memory.squad_states[key] = replace(
+                squad,
+                patrol_anchor=None,
+                support_target=None,
+                target_assigned_tick=None,
+            )
+            return
+        self.memory.squad_formation_leases[key] = replace(
+            previous,
+            last_evaluated_tick=world.tick,
+            vanguard_best_distance=self._best_distance(
+                previous.vanguard_best_distance, v_distance
+            ),
+            ranger_best_distance=self._best_distance(
+                previous.ranger_best_distance, r_distance
+            ),
+            vanguard_arrived=v_arrived,
+            ranger_arrived=r_arrived,
+            stalled_ticks=stalled,
+            blocked_ticks=blocked_ticks,
+            partner_hold_ticks=hold_ticks,
+            last_vanguard_position=vanguard.position,
+            last_ranger_position=ranger.position,
+            last_rejection_reason=rejection,
+        )
+
+    @staticmethod
+    def _best_distance(previous: int | None, current: int | None) -> int | None:
+        if previous is None:
+            return current
+        if current is None:
+            return previous
+        return min(previous, current)
+
+    def _store_formation_bundle(
+        self,
+        world: WorldModel,
+        squad: SquadState,
+        bundle: SquadFormationBundle,
+        vanguard: EntitySnapshot,
+        ranger: EntitySnapshot,
+    ) -> None:
+        key = squad.vanguard_id, squad.ranger_id
+        existing = self.memory.squad_formation_leases.get(key)
+        same = (
+            existing is not None
+            and existing.anchor == bundle.anchor
+            and existing.support == bundle.support
+        )
+        if not same:
+            existing = SquadFormationLease(
+                vanguard_id=vanguard.id,
+                ranger_id=ranger.id,
+                anchor=bundle.anchor,
+                support=bundle.support,
+                assigned_tick=world.tick,
+                last_evaluated_tick=world.tick,
+                vanguard_best_distance=bundle.vanguard_route_distance,
+                ranger_best_distance=bundle.ranger_route_distance,
+                vanguard_arrived=vanguard.position == bundle.anchor,
+                ranger_arrived=ranger.position == bundle.support,
+                partner_hold_ticks=int(
+                    (vanguard.position == bundle.anchor)
+                    != (ranger.position == bundle.support)
                 ),
-                default=None,
+                last_vanguard_position=vanguard.position,
+                last_ranger_position=ranger.position,
             )
-        if anchor is None:
+            self.memory.squad_formation_leases[key] = existing
+        self.memory.squad_states[key] = replace(
+            squad,
+            patrol_anchor=bundle.anchor,
+            support_target=bundle.support,
+            target_assigned_tick=(
+                squad.target_assigned_tick if same else world.tick
+            ),
+        )
+
+    def _formation_member_intents(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        unit: EntitySnapshot,
+        target: Position,
+        partner: EntitySnapshot,
+        protected: frozenset[Position],
+        reason: str,
+    ) -> list[ActionIntent]:
+        if unit.position == target:
             return [
                 ActionIntent.simple(
                     unit.id,
                     IntentAction.WAIT,
                     UnitMission.PATROL,
                     72,
-                    target_position=unit.position,
-                    reason="PATROL_SECTOR_UNOBSERVED_HOLD",
+                    target_position=target,
+                    reason="WAIT_FOR_PARTNER_PROGRESS",
+                    metadata=(
+                        ("hold_class", "PARTNER_PROGRESS_HOLD"),
+                        ("partner_id", str(partner.id)),
+                        ("formation_role", reason),
+                    ),
                 )
-                for unit in (vanguard, ranger)
             ]
-        if (
-            manhattan(vanguard.position, ranger.position)
-            > self.config.squad_max_separation
-        ):
-            return self._reassembly_intents(
-                world,
-                projection,
-                vanguard,
-                ranger,
-                protected,
-            )
-        intents = self._move_or_wait(
+        return self._move_or_wait(
             world,
             projection,
-            vanguard,
-            anchor,
+            unit,
+            target,
             protected,
-            "VANGUARD_ANCHOR",
+            reason,
         )
-        firing_band = tuple(
-            cell
-            for cell in self._firing_band(
-                world,
-                projection,
-                anchor,
-                protected,
-            )
-            if manhattan(cell, anchor) <= self.config.squad_max_separation
-        )
-        if support not in firing_band:
-            recent_support_cells = set(
-                self.memory.position_history.get(ranger.id, ())[-4:]
-            )
-            support = min(
-                firing_band,
-                key=lambda cell: (
-                    projection.immediate_attackers(cell),
-                    projection.future_attackers(cell),
-                    int(cell in recent_support_cells),
-                    self.memory.visit_counts.get(cell, 0),
-                    manhattan(ranger.position, cell),
-                    manhattan(cell, world.core.position),
-                    cell,
-                ),
-                default=None,
-            )
-        self.memory.squad_states[squad_key] = replace(
-            squad,
-            patrol_anchor=anchor,
-            support_target=support,
-            target_assigned_tick=(
-                squad.target_assigned_tick
-                if squad.patrol_anchor == anchor
-                and squad.support_target == support
-                else world.tick
-            ),
-        )
-        if support is not None:
-            intents.extend(
-                self._move_or_wait(
-                    world,
-                    projection,
-                    ranger,
-                    support,
-                    protected,
-                    "RANGER_SUPPORT",
-                )
-            )
-        else:
-            intents.append(
-                ActionIntent.simple(
-                    ranger.id,
-                    IntentAction.WAIT,
-                    UnitMission.PATROL,
-                    72,
-                    target_position=ranger.position,
-                    reason="RANGER_SUPPORT_UNAVAILABLE_HOLD",
-                )
-            )
-        return intents
 
     def _reassembly_intents(
         self,
@@ -718,13 +1453,16 @@ class DefensePlanner:
         key = (vanguard.id, ranger.id)
         separation = manhattan(vanguard.position, ranger.position)
         previous = self.memory.squad_rendezvous_leases.get(key)
-        stalled = 0
-        if previous is not None:
-            progressed = separation < previous.best_separation
-            stalled = 0 if progressed else previous.stalled_ticks + 1
-
         blocked = frozenset(
-            (protected | projection.hostile_occupied)
+            (
+                protected
+                | projection.hostile_occupied
+                | {
+                    unit.position
+                    for unit in world.friendlies
+                    if unit.id not in key
+                }
+            )
             - {vanguard.position, ranger.position}
         )
         between = path_to(
@@ -734,17 +1472,109 @@ class DefensePlanner:
             node_limit=self.config.path_node_limit,
             blocked=blocked,
         )
-        rendezvous = (
-            previous.rendezvous
-            if previous is not None
-            and previous.rendezvous in world.known_passable
-            and previous.rendezvous not in blocked
-            else (
-                between[len(between) // 2]
-                if between
-                else ranger.position
+        candidates: set[Position] = set()
+        if between:
+            middle = len(between) // 2
+            candidates.update(between[max(0, middle - 2) : middle + 3])
+            for cell in tuple(candidates):
+                candidates.update(neighbor for _, neighbor in cardinal_neighbors(cell))
+        if previous is not None:
+            candidates.add(previous.rendezvous)
+        candidates.update((vanguard.position, ranger.position))
+        viable: list[tuple[tuple[int, ...], Position, Route, Route]] = []
+        for cell in candidates:
+            if (
+                cell not in world.known_passable
+                or cell in world.known_obstacles
+                or cell in blocked
+                or count_open_neighbors(cell, world.known_obstacles) < 2
+            ):
+                continue
+            v_route = route_to(
+                world,
+                vanguard.position,
+                cell,
+                node_limit=min(self.config.path_node_limit, 512),
+                blocked=blocked - {cell},
+            )
+            r_route = route_to(
+                world,
+                ranger.position,
+                cell,
+                node_limit=min(self.config.path_node_limit, 512),
+                blocked=blocked - {cell},
+            )
+            if v_route is None or r_route is None:
+                continue
+            stable = int(
+                previous is None
+                or previous.rendezvous != cell
+                or previous.stalled_ticks
+                >= self.config.squad_reassembly_no_progress_ticks
+            )
+            viable.append(
+                (
+                    (
+                        stable,
+                        max(v_route.distance, r_route.distance),
+                        v_route.distance + r_route.distance,
+                        projection.future_attackers(cell),
+                        cell[0],
+                        cell[1],
+                    ),
+                    cell,
+                    v_route,
+                    r_route,
+                )
+            )
+        if viable:
+            _, rendezvous, v_route, r_route = min(viable, key=lambda item: item[0])
+            combined_distance = v_route.distance + r_route.distance
+        else:
+            rendezvous = previous.rendezvous if previous is not None else vanguard.position
+            v_route = r_route = None
+            combined_distance = None
+        progressed = bool(
+            previous is not None
+            and (
+                separation < previous.best_separation
+                or (
+                    combined_distance is not None
+                    and previous.best_route_distance is not None
+                    and combined_distance < previous.best_route_distance
+                )
             )
         )
+        stalled = (
+            0
+            if previous is None or progressed
+            else previous.stalled_ticks + 1
+        )
+        if stalled >= self.config.squad_reassembly_break_ticks:
+            cooldown = PairingCooldown(
+                vanguard_id=vanguard.id,
+                ranger_id=ranger.id,
+                expires_tick=world.tick + self.config.formation_pair_cooldown_ticks,
+            )
+            self.memory.squad_pairing_cooldowns[key] = cooldown
+            self.memory.squad_states.pop(key, None)
+            self.memory.squad_formation_leases.pop(key, None)
+            self.memory.squad_rendezvous_leases.pop(key, None)
+            return [
+                ActionIntent.simple(
+                    unit.id,
+                    IntentAction.WAIT,
+                    UnitMission.PATROL,
+                    72,
+                    target_position=unit.position,
+                    reason="PAIRING_COOLDOWN_REASSIGN",
+                    metadata=(
+                        ("hold_class", "BLOCKED_WAIT"),
+                        ("cooldown_until", cooldown.expires_tick),
+                    ),
+                )
+                for unit in (vanguard, ranger)
+            ]
         assigned_tick = (
             previous.assigned_tick
             if previous is not None and previous.rendezvous == rendezvous
@@ -759,75 +1589,60 @@ class DefensePlanner:
                 separation,
                 previous.best_separation if previous is not None else separation,
             ),
+            best_route_distance=(
+                combined_distance
+                if previous is None or previous.best_route_distance is None
+                else (
+                    previous.best_route_distance
+                    if combined_distance is None
+                    else min(previous.best_route_distance, combined_distance)
+                )
+            ),
             stalled_ticks=stalled,
             last_vanguard_position=vanguard.position,
             last_ranger_position=ranger.position,
         )
-
-        # Let the outer Vanguard hold while the Ranger is genuinely closing.
-        # If authoritative positions fail to improve for two Ticks, move the
-        # holder toward the mutually reachable midpoint instead of extending
-        # an unbounded PARTNER_HOLD lease.
-        if stalled >= self.config.squad_reassembly_no_progress_ticks:
-            intents = self._move_or_wait(
-                world,
-                projection,
-                vanguard,
-                rendezvous,
-                protected,
-                "SQUAD_REASSEMBLE_RENDEZVOUS",
-            )
-            intents.append(
+        if v_route is None or r_route is None:
+            return [
                 ActionIntent.simple(
-                    ranger.id,
+                    unit.id,
                     IntentAction.WAIT,
                     UnitMission.PATROL,
                     72,
-                    target_position=rendezvous,
-                    reason="SQUAD_REASSEMBLE_RENDEZVOUS_HOLD",
-                    metadata=(
-                        ("stalled_ticks", stalled),
-                        ("rendezvous", rendezvous),
-                    ),
+                    target_position=unit.position,
+                    reason="NO_VIABLE_RENDEZVOUS",
+                    metadata=(("hold_class", "NO_VIABLE_MOVE"),),
                 )
-            )
-            if stalled >= self.config.squad_reassembly_break_ticks:
-                # The pair identity may be rebuilt on the next Tick.  With
-                # more than one squad this lets nearest healthy partners be
-                # matched again; with one pair the new midpoint still avoids
-                # freezing either member indefinitely.
-                self.memory.squad_states.pop(key, None)
-            return intents
-
-        ranger_route = self._route(
-            world,
-            projection,
-            ranger,
-            vanguard.position,
-            protected,
-        )
-        if ranger_route is not None and ranger_route.first_direction is not None:
-            mover, holder, target = ranger, vanguard, vanguard.position
-        else:
-            mover, holder, target = vanguard, ranger, ranger.position
-        intents = self._move_or_wait(
-            world,
-            projection,
-            mover,
-            target,
-            protected,
-            "SQUAD_REASSEMBLE",
-        )
-        intents.append(
-            ActionIntent.simple(
-                holder.id,
-                IntentAction.WAIT,
-                UnitMission.PATROL,
-                72,
-                target_position=holder.position,
-                reason="SQUAD_REASSEMBLE_PARTNER_HOLD",
-            )
-        )
+                for unit in (vanguard, ranger)
+            ]
+        intents: list[ActionIntent] = []
+        for unit in (vanguard, ranger):
+            if unit.position == rendezvous:
+                intents.append(
+                    ActionIntent.simple(
+                        unit.id,
+                        IntentAction.WAIT,
+                        UnitMission.PATROL,
+                        72,
+                        target_position=rendezvous,
+                        reason="WAIT_FOR_RENDEZVOUS_PROGRESS",
+                        metadata=(
+                            ("hold_class", "PARTNER_PROGRESS_HOLD"),
+                            ("stalled_ticks", stalled),
+                        ),
+                    )
+                )
+            else:
+                intents.extend(
+                    self._move_or_wait(
+                        world,
+                        projection,
+                        unit,
+                        rendezvous,
+                        protected,
+                        "SQUAD_REASSEMBLE_RENDEZVOUS",
+                    )
+                )
         return intents
 
     def _reserve_patrol_intents(
@@ -840,15 +1655,17 @@ class DefensePlanner:
     ) -> list[ActionIntent]:
         assert world.core is not None
         intents: list[ActionIntent] = []
+        occupied = {unit.position for unit in world.friendlies}
         reserve_ring = [
             cell
-            for cell in manhattan_ring(
-                world.core.position,
-                self.config.peaceful_squad_radii[0],
-            )
+            for radius in self.config.peaceful_squad_radii
+            for cell in manhattan_ring(world.core.position, radius)
             if cell in world.known_passable
             and cell not in world.known_obstacles
             and cell not in protected
+            and cell not in projection.hostile_occupied
+            and cell not in occupied
+            and count_open_neighbors(cell, world.known_obstacles) >= 2
         ]
         for unit in sorted(
             (unit for unit in healthy if unit.id not in paired_ids),
@@ -862,7 +1679,8 @@ class DefensePlanner:
                         UnitMission.PATROL,
                         72,
                         target_position=unit.position,
-                        reason="UNPAIRED_RESERVE_UNAVAILABLE_HOLD",
+                        reason="NO_VIABLE_FORMATION_MOVE",
+                        metadata=(("hold_class", "NO_VIABLE_MOVE"),),
                     )
                 )
                 continue
@@ -1040,6 +1858,122 @@ class DefensePlanner:
                     ),
                 )
             )
+        feedback = self.memory.formation_move_feedback.get(unit.id)
+        if (
+            mission in {UnitMission.PATROL, UnitMission.HOME_DEFENSE}
+            and feedback is not None
+            and feedback.tick == world.tick - 1
+            and feedback.target_position == target
+            and feedback.consecutive_blocked_ticks
+            >= self.config.formation_target_stall_ticks
+        ):
+            history = self.memory.position_history.get(unit.id, ())
+            previous_position = next(
+                (
+                    position
+                    for position in reversed(history[:-1])
+                    if position != unit.position
+                ),
+                None,
+            )
+            occupied = {
+                other.position
+                for other in world.friendlies
+                if other.id != unit.id
+            }
+            normal_destinations = {
+                intent.target_position
+                for intent in moves
+                if intent.action is IntentAction.MOVE
+            }
+            for index, direction in enumerate(DIRECTION_ORDER):
+                dx, dy = direction.delta
+                destination = unit.position[0] + dx, unit.position[1] + dy
+                if (
+                    destination == previous_position
+                    or destination == target
+                    or destination in normal_destinations
+                    or destination in occupied
+                    or destination in world.known_obstacles
+                    or destination not in world.known_passable
+                    or destination in projection.hostile_occupied
+                    or destination in protected
+                ):
+                    continue
+                viability = move_viability(
+                    world,
+                    unit.position,
+                    destination,
+                    target=target,
+                    blocked=frozenset(
+                        protected | projection.hostile_occupied | occupied
+                    ),
+                    node_limit=min(self.config.path_node_limit, 512),
+                    require_continuation=True,
+                )
+                if not viability.viable:
+                    continue
+                continuation = route_to(
+                    world,
+                    destination,
+                    target,
+                    node_limit=min(self.config.path_node_limit, 512),
+                    blocked=frozenset(
+                        (
+                            protected
+                            | projection.hostile_occupied
+                            | occupied
+                            | {unit.position}
+                        )
+                        - {destination, target}
+                    ),
+                )
+                if (
+                    continuation is None
+                    or continuation.distance > preferred.distance + 1
+                ):
+                    continue
+                free_exits = sum(
+                    neighbor in world.known_passable
+                    and neighbor not in world.known_obstacles
+                    and neighbor not in protected
+                    and neighbor not in projection.hostile_occupied
+                    and neighbor not in occupied
+                    for _, neighbor in cardinal_neighbors(destination)
+                )
+                if free_exits < 2:
+                    continue
+                moves.append(
+                    ActionIntent.move(
+                        unit.id,
+                        mission,
+                        move_priority + 1,
+                        direction,
+                        destination,
+                        risk=self._risk(projection, destination),
+                        exclusive_destination=True,
+                        tie_break=(
+                            continuation.distance,
+                            -free_exits,
+                            index,
+                        ),
+                        reason="FORMATION_YIELD",
+                        metadata=viability.metadata
+                        + (
+                            ("yield_for", feedback.reason),
+                            (
+                                "blocked_ticks",
+                                feedback.consecutive_blocked_ticks,
+                            ),
+                            ("route_distance_before", preferred.distance),
+                            ("route_distance_after", continuation.distance),
+                            (
+                                "yield_expires_tick",
+                                world.tick + self.config.formation_yield_ticks,
+                            ),
+                        ),
+                    )
+                )
         moves.sort(key=ActionIntent.sort_key)
         moves.append(
             ActionIntent.simple(
@@ -1115,11 +2049,23 @@ class DefensePlanner:
             blocked=frozenset(blocked),
         )
 
-    def _sync_squads(self, combatants: tuple[EntitySnapshot, ...]) -> None:
+    def _sync_squads(
+        self,
+        combatants: tuple[EntitySnapshot, ...],
+        tick: int,
+    ) -> None:
         living = {unit.id for unit in combatants}
+        for key, cooldown in tuple(self.memory.squad_pairing_cooldowns.items()):
+            if cooldown.expires_tick < tick or not set(key) <= living:
+                self.memory.squad_pairing_cooldowns.pop(key, None)
+        for key, expires_tick in tuple(self.memory.squad_target_backoffs.items()):
+            if expires_tick < tick or key[0] not in living or key[1] not in living:
+                self.memory.squad_target_backoffs.pop(key, None)
         for key, squad in tuple(self.memory.squad_states.items()):
             if squad.vanguard_id not in living or squad.ranger_id not in living:
                 self.memory.squad_states.pop(key, None)
+                self.memory.squad_formation_leases.pop(key, None)
+                self.memory.squad_rendezvous_leases.pop(key, None)
         active_pairs = {
             (squad.vanguard_id, squad.ranger_id)
             for squad in self.memory.squad_states.values()
@@ -1127,6 +2073,9 @@ class DefensePlanner:
         for key in tuple(self.memory.squad_rendezvous_leases):
             if key not in active_pairs or not set(key) <= living:
                 self.memory.squad_rendezvous_leases.pop(key, None)
+        for key in tuple(self.memory.squad_formation_leases):
+            if key not in active_pairs or not set(key) <= living:
+                self.memory.squad_formation_leases.pop(key, None)
         paired_v = {squad.vanguard_id for squad in self.memory.squad_states.values()}
         paired_r = {squad.ranger_id for squad in self.memory.squad_states.values()}
         vanguards = sorted(
@@ -1146,12 +2095,27 @@ class DefensePlanner:
             key=lambda unit: unit.id.bytes,
         )
         while vanguards and rangers:
-            _, _, _, vanguard, ranger = min(
+            candidates = tuple(
                 (
-                    (manhattan(v.position, r.position), v.id.bytes, r.id.bytes, v, r)
-                    for v in vanguards
-                    for r in rangers
-                ),
+                    manhattan(v.position, r.position),
+                    v.id.bytes,
+                    r.id.bytes,
+                    v,
+                    r,
+                )
+                for v in vanguards
+                for r in rangers
+                if (
+                    cooldown := self.memory.squad_pairing_cooldowns.get(
+                        (v.id, r.id)
+                    )
+                ) is None
+                or cooldown.expires_tick < tick
+            )
+            if not candidates:
+                break
+            _, _, _, vanguard, ranger = min(
+                candidates,
                 key=lambda item: item[:3],
             )
             key = vanguard.id, ranger.id
