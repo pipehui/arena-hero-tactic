@@ -36,7 +36,7 @@ from arena_tactic.persistence import (
     EXPLORATION_MEMORY_SCHEMA_VERSION,
     ExplorationMemoryStore,
 )
-from arena_tactic.models import EnemyCoreIntel, EnemyTrack
+from arena_tactic.models import EnemyCoreIntel, EnemyTrack, LongRangeRaidCampaign
 from arena_tactic.runtime import InstanceAlreadyRunning, SingleInstanceLock
 from replay_log import LOG_SCHEMA_VERSION, ReplayLogger
 from tests.helpers import friendly_core, make_turn, uid, unit
@@ -57,9 +57,46 @@ class _EventGame:
 
 
 class RuntimeAndPersistenceTests(unittest.TestCase):
+    def test_checkpoint_round_trip_preserves_long_range_raid_campaign(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            memory = TacticMemory(core_id=uid(10_000), core_position=(0, 0))
+            memory.raid_long_range_campaign = LongRangeRaidCampaign(
+                target_id=uid(900),
+                member_ids=(uid(1), uid(2), uid(3), uid(4)),
+                phase="ADVANCING",
+                started_tick=100,
+                route_eta=50,
+                search_deadline_tick=180,
+                last_position=(50, 0),
+                last_group_distance=160,
+                no_progress_ticks=1,
+            )
+            memory.raid_target_id = uid(900)
+            memory.raid_member_ids = (uid(1), uid(2), uid(3), uid(4))
+            memory.raid_phase = "ADVANCING"
+            memory.enemy_core_intel[uid(900)] = EnemyCoreIntel(
+                id=uid(900),
+                position=(50, 0),
+                hp=5,
+                shield=5,
+                state=CoreState.NORMAL,
+                destination=None,
+                last_seen_tick=100,
+                sighting_count=2,
+            )
+            store = ExplorationMemoryStore(directory, save_interval_ticks=1)
+            self.assertTrue(store.save(memory, tick=110, force=True))
+
+            restored = ExplorationMemoryStore(directory).load()
+
+            self.assertEqual(restored.raid_long_range_campaign, memory.raid_long_range_campaign)
+            self.assertEqual(restored.raid_target_id, uid(900))
+            self.assertEqual(restored.raid_phase, "ADVANCING")
+            self.assertIn(uid(900), restored.enemy_core_intel)
+
     def test_schema_versions_are_upgraded(self) -> None:
-        self.assertEqual(LOG_SCHEMA_VERSION, 39)
-        self.assertEqual(EXPLORATION_MEMORY_SCHEMA_VERSION, 12)
+        self.assertEqual(LOG_SCHEMA_VERSION, 40)
+        self.assertEqual(EXPLORATION_MEMORY_SCHEMA_VERSION, 13)
 
     def test_main_translates_sigterm_into_a_graceful_service_stop(self) -> None:
         previous_handler = object()
@@ -397,7 +434,7 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
             text = logger.path.read_text(encoding="utf-8")
             first = json.loads(text.splitlines()[0])
 
-        self.assertEqual(first["schema_version"], 39)
+        self.assertEqual(first["schema_version"], 40)
         self.assertNotIn("hidden-token", text)
 
     def test_turn_log_contains_detached_schema_39_strategy(self) -> None:
@@ -422,10 +459,10 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
             logger.close(status="completed", last_tick=9)
             records = [json.loads(line) for line in logger.path.read_text(encoding="utf-8").splitlines()]
 
-        self.assertEqual(records[0]["schema_version"], 39)
+        self.assertEqual(records[0]["schema_version"], 40)
         record = next(item for item in records if item["record_type"] == "turn")
-        self.assertEqual(record["strategy"]["schema_version"], 39)
-        self.assertEqual(record["strategy"]["source_trace_schema"], 38)
+        self.assertEqual(record["strategy"]["schema_version"], 40)
+        self.assertEqual(record["strategy"]["source_trace_schema"], 39)
         self.assertNotIn("tasks", record["strategy"])
         self.assertIn("resolution", record["strategy"])
         decisions = record["strategy"]["decisions"]

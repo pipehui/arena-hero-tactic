@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from math import ceil
 from arena_hero import Direction, Position, UnitType
 
@@ -20,6 +21,7 @@ from .models import (
     IntentAction,
     UnitMission,
     WorldModel,
+    LongRangeRaidCampaign,
 )
 from .planning import move_viability, route_to
 from .projection import TacticalMap
@@ -59,6 +61,7 @@ class RaidPlanner:
         target = self._active_target(world)
 
         if self.memory.raid_phase != "IDLE":
+            self._update_long_range_progress(world, members)
             interruption = self._interruption_reason(world, members, target, home_threat)
             if interruption is not None:
                 self.memory.raid_phase = "RETURNING"
@@ -84,6 +87,30 @@ class RaidPlanner:
             self.memory.raid_member_ids = tuple(unit.id for unit in selected)
             self.memory.raid_phase = "ASSEMBLING"
             self.memory.raid_containment_mode = containment
+            if self._is_long_range_target(world, target):
+                route_eta = self._known_route_eta(world, target.position)
+                if route_eta is None:
+                    self._clear()
+                    return []
+                duration = min(
+                    self.config.raid_long_range_max_campaign_ticks,
+                    max(
+                        64,
+                        route_eta + self.config.raid_long_range_search_reserve_ticks,
+                    ),
+                )
+                self.memory.raid_long_range_campaign = LongRangeRaidCampaign(
+                    target_id=target.id,
+                    member_ids=tuple(unit.id for unit in selected),
+                    phase="ASSEMBLING",
+                    started_tick=world.tick,
+                    route_eta=route_eta,
+                    search_deadline_tick=world.tick + duration,
+                    last_position=target.position,
+                    last_group_distance=sum(
+                        manhattan(unit.position, target.position) for unit in selected
+                    ),
+                )
             members = selected
 
         assert target is not None
@@ -92,6 +119,11 @@ class RaidPlanner:
             self.memory.raid_last_seen_tick = world.tick
             self.memory.raid_last_position = visible.position
             target = self.memory.enemy_core_intel[target.id]
+            if self.memory.raid_long_range_campaign is not None:
+                self.memory.raid_long_range_campaign = replace(
+                    self.memory.raid_long_range_campaign,
+                    last_position=visible.position,
+                )
 
         if self.memory.raid_phase == "ASSEMBLING":
             if self._assembled(members):
@@ -439,6 +471,13 @@ class RaidPlanner:
                     <= self.config.raid_containment_radius
                     and intel.sighting_count >= self.config.raid_confirmed_sightings
                 )
+                or (
+                    self.config.raid_containment_radius
+                    < manhattan(intel.position, world.core.position)
+                    <= self.config.raid_long_range_start_radius
+                    and intel.sighting_count >= self.config.raid_confirmed_sightings
+                    and self._known_route_eta(world, intel.position) is not None
+                )
             )
             and (
                 self.memory.raid_interrupted_tick is None
@@ -467,11 +506,7 @@ class RaidPlanner:
         if home_threat or world.core is None:
             return []
         containment = self._containment_active(world)
-        confirmation_radius = (
-            self.config.raid_containment_radius
-            if containment
-            else self.config.raid_confirmed_start_radius
-        )
+        confirmation_radius = self.config.raid_long_range_start_radius
         visible_ids = {
             core.enemy_id for core in projection.enemy_cores if core.visible_now
         }
@@ -485,7 +520,16 @@ class RaidPlanner:
                 <= confirmation_radius
                 and intel.sighting_count < self.config.raid_confirmed_sightings
                 and self._visible_guards(world, intel.position) == 0
-                and self._select_members(world, intel, containment=containment)
+                and self._select_members(
+                    world,
+                    intel,
+                    containment=containment,
+                    long_range=self._is_long_range_target(world, intel),
+                )
+                and (
+                    not self._is_long_range_target(world, intel)
+                    or self._known_route_eta(world, intel.position) is not None
+                )
             ),
             key=lambda intel: (
                 manhattan(intel.position, world.core.position),
@@ -532,7 +576,10 @@ class RaidPlanner:
         target: EnemyCoreIntel,
         *,
         containment: bool = False,
+        long_range: bool | None = None,
     ) -> tuple[EntitySnapshot, ...]:
+        if long_range is None:
+            long_range = self._is_long_range_target(world, target)
         healthy = tuple(
             unit
             for unit in world.friendlies
@@ -546,13 +593,19 @@ class RaidPlanner:
         home_target = max(self.config.home_force_floor, self.memory.home_force_high_water)
         home_reserve = (
             min(home_target, self.config.raid_peace_home_reserve)
-            if containment
+            if containment and not long_range
             else home_target
         )
         surplus = max(0, len(healthy) - home_reserve)
         guards = self._visible_guards(world, target.position)
         required = max(
-            self.config.raid_min_siege_members if containment else 2,
+            (
+                self.config.raid_long_range_min_members
+                if long_range
+                else self.config.raid_min_siege_members
+                if containment
+                else 2
+            ),
             guards + self.config.raid_force_margin,
         )
         if surplus < required:
@@ -599,6 +652,21 @@ class RaidPlanner:
                     chosen = rangers.pop(0)
                     selected_rangers += 1
             selected.append(chosen)
+        if long_range:
+            if selected_vanguards < 2 or selected_rangers < 2:
+                return ()
+            remaining_vanguards = sum(
+                unit.unit_type is UnitType.VANGUARD for unit in healthy
+            ) - selected_vanguards
+            remaining_rangers = sum(
+                unit.unit_type is UnitType.RANGER for unit in healthy
+            ) - selected_rangers
+            if (
+                remaining_vanguards < self.config.minimum_vanguards
+                or remaining_rangers < self.config.minimum_rangers
+                or len(healthy) - len(selected) < home_target
+            ):
+                return ()
         return tuple(selected)
 
     def _interruption_reason(self, world, members, target, home_threat):
@@ -606,8 +674,11 @@ class RaidPlanner:
             return "HOME_THREAT"
         if target is None:
             return "TARGET_INTEL_EXPIRED"
+        campaign = self.memory.raid_long_range_campaign
         continue_radius = (
-            self.config.raid_containment_continue_radius
+            self.config.raid_long_range_continue_radius
+            if campaign is not None
+            else self.config.raid_containment_continue_radius
             if self.memory.raid_containment_mode
             else self.config.raid_continue_radius
         )
@@ -617,10 +688,72 @@ class RaidPlanner:
             return "MEMBER_LOST"
         if any(unit.hp * 2 <= UNIT_MAX_HP[unit.unit_type] for unit in members):
             return "MEMBER_LOW_HP"
+        if campaign is not None:
+            if world.tick > campaign.search_deadline_tick:
+                return "LONG_RANGE_CAMPAIGN_EXPIRED"
+            if campaign.no_progress_ticks >= 4:
+                return "LONG_RANGE_NO_PROGRESS"
         visible = any(core.id == target.id for core in world.enemy_cores)
         if visible and self._visible_guards(world, target.position) + self.config.raid_force_margin > len(members):
             return "ENEMY_REINFORCED"
         return None
+
+    def _is_long_range_target(
+        self,
+        world: WorldModel,
+        target: EnemyCoreIntel,
+    ) -> bool:
+        return bool(
+            world.core is not None
+            and self.config.raid_containment_radius
+            < manhattan(target.position, world.core.position)
+            <= self.config.raid_long_range_start_radius
+        )
+
+    def _known_route_eta(
+        self,
+        world: WorldModel,
+        target: Position,
+    ) -> int | None:
+        if world.core is None:
+            return None
+        route = route_to(
+            world,
+            world.core.position,
+            target,
+            node_limit=self.config.path_node_limit,
+            blocked=frozenset(enemy.position for enemy in world.enemies),
+        )
+        if route is None or route.distance > self.config.raid_long_range_max_route:
+            return None
+        return route.distance
+
+    def _update_long_range_progress(
+        self,
+        world: WorldModel,
+        members: tuple[EntitySnapshot, ...],
+    ) -> None:
+        campaign = self.memory.raid_long_range_campaign
+        if campaign is None or not members:
+            return
+        target = self.memory.raid_last_position or campaign.last_position
+        distance = sum(manhattan(unit.position, target) for unit in members)
+        track_progress = self.memory.raid_phase in {"ADVANCING", "SEARCHING"}
+        no_progress = (
+            0
+            if not track_progress
+            or campaign.last_group_distance is None
+            or distance < campaign.last_group_distance
+            else campaign.no_progress_ticks + 1
+        )
+        self.memory.raid_long_range_campaign = replace(
+            campaign,
+            phase=self.memory.raid_phase,
+            member_ids=tuple(unit.id for unit in members),
+            last_position=target,
+            last_group_distance=distance,
+            no_progress_ticks=no_progress,
+        )
 
     def _containment_active(self, world: WorldModel) -> bool:
         if world.core is None:
@@ -671,7 +804,27 @@ class RaidPlanner:
                 and manhattan(unit.position, target) < manhattan(other.position, target)
                 for other in members
             ):
-                intents.append(self._wait(unit, "RAID_FORMATION_HOLD"))
+                campaign = self.memory.raid_long_range_campaign
+                if campaign is not None and campaign.no_progress_ticks >= 2:
+                    laggard = max(
+                        members,
+                        key=lambda other: (
+                            manhattan(other.position, target),
+                            other.id.bytes,
+                        ),
+                    )
+                    intents.extend(
+                        self._move(
+                            world,
+                            projection,
+                            unit,
+                            laggard.position,
+                            protected,
+                            "RAID_FORMATION_REJOIN",
+                        )
+                    )
+                else:
+                    intents.append(self._wait(unit, "RAID_FORMATION_HOLD"))
                 continue
             intents.extend(self._move(world, projection, unit, target, protected, "RAID_ADVANCE"))
         return intents
@@ -857,3 +1010,4 @@ class RaidPlanner:
         self.memory.raid_member_ids = ()
         self.memory.raid_phase = "IDLE"
         self.memory.raid_containment_mode = False
+        self.memory.raid_long_range_campaign = None

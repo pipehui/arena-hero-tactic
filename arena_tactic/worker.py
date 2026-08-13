@@ -6,16 +6,18 @@ from uuid import UUID
 from arena_hero import CoreState, Direction, Position, UnitType
 
 from .config import TacticConfig
-from .geometry import cardinal_neighbors, manhattan, manhattan_ring
+from .geometry import cardinal_neighbors, diamond, manhattan, manhattan_ring
 from .models import (
     ActionIntent,
     CoreServiceQueue,
     DestinationExclusivity,
     EntitySnapshot,
+    EnemyCoreControlZone,
     IntentAction,
     MissionState,
     UnitMission,
     WorkerEscapeState,
+    WorkerDisengageLease,
     WorkerScoutPhase,
     WorkerScoutState,
     WorkerTaskProgress,
@@ -31,6 +33,7 @@ from .planning import (
     sector_scout_candidates,
     weighted_distance_field,
     weighted_route_to,
+    route_to,
 )
 from .projection import TacticalMap
 from .resource_allocator import ResourceAllocator
@@ -112,6 +115,7 @@ class WorkerPlanner:
         workers = tuple(
             unit for unit in world.friendlies if unit.unit_type is UnitType.WORKER
         )
+        self._refresh_enemy_core_control_zones(world)
         self._ensure_scout_states(workers, world.tick)
         intents, escaping = self._survival_intents(world, projection, service, workers)
         deconflicting: set[UUID] = set()
@@ -602,6 +606,18 @@ class WorkerPlanner:
                         self._escape_intents(world, projection, worker, escape)
                     )
                     continue
+            disengage = self._update_core_disengage(world, projection, worker)
+            if disengage is not None:
+                escaping.add(worker.id)
+                intents.extend(
+                    self._core_disengage_intents(
+                        world,
+                        projection,
+                        worker,
+                        disengage,
+                    )
+                )
+                continue
             if (
                 worker.cargo > 0
                 and worker.position == world.core.position
@@ -644,6 +660,372 @@ class WorkerPlanner:
                 escaping.add(worker.id)
                 intents.extend(self._escape_intents(world, projection, worker, escape))
         return intents, escaping
+
+    def _refresh_enemy_core_control_zones(self, world: WorldModel) -> None:
+        visible_ids = {core.id for core in world.enemy_cores}
+        self.memory.enemy_core_control_zones = {
+            intel.id: EnemyCoreControlZone(
+                core_id=intel.id,
+                center=intel.position,
+                exclusion_radius=self.config.enemy_core_worker_exclusion_radius,
+                clear_radius=self.config.enemy_core_worker_clear_radius,
+                last_seen_tick=intel.last_seen_tick,
+                visible_now=intel.id in visible_ids,
+            )
+            for intel in world.remembered_enemy_cores
+            if world.tick - intel.last_seen_tick <= self.config.raid_intel_ttl
+        }
+        valid_workers = {
+            unit.id for unit in world.friendlies if unit.unit_type is UnitType.WORKER
+        }
+        for worker_id, lease in tuple(self.memory.worker_disengage_leases.items()):
+            if worker_id not in valid_workers or lease.core_id not in self.memory.enemy_core_control_zones:
+                self.memory.worker_disengage_leases.pop(worker_id, None)
+
+    def _control_zone_cells(self) -> frozenset[Position]:
+        cells: set[Position] = set()
+        for zone in self.memory.enemy_core_control_zones.values():
+            cells.update(diamond(zone.center, zone.exclusion_radius))
+        return frozenset(cells)
+
+    def _confirmation_observer_allowed(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        worker: EntitySnapshot,
+        zone: EnemyCoreControlZone,
+    ) -> bool:
+        intel = next(
+            (item for item in world.remembered_enemy_cores if item.id == zone.core_id),
+            None,
+        )
+        if (
+            intel is None
+            or not zone.visible_now
+            or intel.sighting_count >= self.config.raid_confirmed_sightings
+            or world.core is None
+            or not (
+                self.config.raid_start_radius
+                < manhattan(zone.center, world.core.position)
+                <= self.config.raid_long_range_start_radius
+            )
+            or worker.cargo > 0
+            or worker.hp < UNIT_MAX_HP[UnitType.WORKER]
+            or manhattan(worker.position, zone.center) > 3
+        ):
+            return False
+        guards = sum(
+            enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+            and manhattan(enemy.position, zone.center) <= 8
+            for enemy in world.enemies
+        )
+        home_threat = self.memory.home_defense_alert_until >= world.tick or any(
+            enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+            and manhattan(enemy.position, world.core.position)
+            <= self.config.home_warning_radius
+            for enemy in world.enemies
+        )
+        healthy = tuple(
+            unit
+            for unit in world.friendlies
+            if unit.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+            and unit.hp * 2 > UNIT_MAX_HP[unit.unit_type]
+            and unit.id != world.beacon.carrier_id
+            and manhattan(unit.position, world.core.position)
+            <= self.config.home_pursuit_radius
+        )
+        vanguards = sum(unit.unit_type is UnitType.VANGUARD for unit in healthy)
+        rangers = sum(unit.unit_type is UnitType.RANGER for unit in healthy)
+        home_target = max(
+            self.config.home_force_floor,
+            self.memory.home_force_high_water,
+        )
+        long_range = (
+            manhattan(zone.center, world.core.position)
+            > self.config.raid_containment_radius
+        )
+        if long_range:
+            route = route_to(
+                world,
+                world.core.position,
+                zone.center,
+                node_limit=self.config.path_node_limit,
+                blocked=frozenset(enemy.position for enemy in world.enemies),
+            )
+            force_ready = (
+                len(healthy) - self.config.raid_long_range_min_members
+                >= home_target
+                and vanguards >= self.config.minimum_vanguards + 2
+                and rangers >= self.config.minimum_rangers + 2
+            )
+            route_ready = bool(
+                route is not None
+                and route.distance <= self.config.raid_long_range_max_route
+            )
+        else:
+            force_ready = (
+                len(healthy) - 2 >= home_target and vanguards >= 1 and rangers >= 1
+            )
+            route_ready = True
+        if (
+            guards
+            or home_threat
+            or not force_ready
+            or not route_ready
+            or projection.immediate_attackers(worker.position) > 0
+        ):
+            return False
+        return any(
+            destination not in world.known_obstacles
+            and destination not in projection.hostile_occupied
+            and projection.immediate_attackers(destination) < worker.hp
+            and manhattan(destination, zone.center)
+            > manhattan(worker.position, zone.center)
+            for _, destination in cardinal_neighbors(worker.position)
+        )
+
+    def _update_core_disengage(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        worker: EntitySnapshot,
+    ) -> WorkerDisengageLease | None:
+        previous = self.memory.worker_disengage_leases.get(worker.id)
+        zones = self.memory.enemy_core_control_zones
+        zone = None if previous is None else zones.get(previous.core_id)
+        if zone is None:
+            zone = min(
+                (
+                    candidate
+                    for candidate in zones.values()
+                    if manhattan(worker.position, candidate.center)
+                    <= candidate.exclusion_radius
+                ),
+                key=lambda item: (manhattan(worker.position, item.center), item.core_id.bytes),
+                default=None,
+            )
+        if zone is None:
+            self.memory.worker_disengage_leases.pop(worker.id, None)
+            return None
+        if previous is None and self._confirmation_observer_allowed(
+            world, projection, worker, zone
+        ):
+            return None
+
+        distance = manhattan(worker.position, zone.center)
+        safe_now = (
+            distance > zone.clear_radius
+            and projection.immediate_attackers(worker.position) == 0
+            and projection.future_attackers(worker.position) < worker.hp
+        )
+        safe_ticks = (
+            (previous.safe_ticks + 1 if previous is not None else 1)
+            if safe_now
+            else 0
+        )
+        if safe_ticks >= self.config.worker_escape_safe_ticks:
+            self.memory.worker_disengage_leases.pop(worker.id, None)
+            return None
+
+        mission = self.memory.unit_missions.get(worker.id)
+        abandoned = None
+        if mission is not None and mission.mission in {
+            UnitMission.HARVEST,
+            UnitMission.EXPLORE,
+        }:
+            abandoned = mission.target
+            if mission.target is not None:
+                self.memory.worker_resource_backoff[(worker.id, mission.target)] = max(
+                    self.memory.worker_resource_backoff.get((worker.id, mission.target), 0),
+                    zone.last_seen_tick + self.config.raid_intel_ttl,
+                )
+                self.memory.target_backoff_until[mission.target] = max(
+                    self.memory.target_backoff_until.get(mission.target, 0),
+                    zone.last_seen_tick + self.config.raid_intel_ttl,
+                )
+            self.memory.unit_missions.pop(worker.id, None)
+            self.memory.worker_task_progress.pop(worker.id, None)
+            scout = self.memory.worker_scout_states.get(worker.id)
+            if scout is not None:
+                self.memory.worker_scout_states[worker.id] = replace(
+                    scout,
+                    target=None,
+                    assigned_tick=world.tick,
+                    best_route_cost=None,
+                    stalled_ticks=0,
+                )
+
+        waypoint = None if previous is None else previous.waypoint
+        stalled = 0
+        if previous is not None:
+            improved = distance > previous.last_distance
+            waypoint_progressed = bool(
+                waypoint is not None
+                and previous.last_position is not None
+                and manhattan(worker.position, waypoint)
+                < manhattan(previous.last_position, waypoint)
+            )
+            stalled = 0 if improved or waypoint_progressed else previous.stalled_ticks + 1
+        if (
+            waypoint is None
+            or waypoint == worker.position
+            or waypoint in world.known_obstacles
+            or stalled >= self.config.worker_escape_replan_ticks
+        ):
+            waypoint = self._core_disengage_waypoint(world, projection, worker, zone)
+            stalled = 0
+        lease = WorkerDisengageLease(
+            worker_id=worker.id,
+            core_id=zone.core_id,
+            center=zone.center,
+            waypoint=waypoint,
+            assigned_tick=(
+                world.tick
+                if previous is None or previous.waypoint != waypoint
+                else previous.assigned_tick
+            ),
+            safe_ticks=safe_ticks,
+            last_distance=distance,
+            last_position=worker.position,
+            stalled_ticks=stalled,
+            abandoned_target=abandoned or (None if previous is None else previous.abandoned_target),
+        )
+        self.memory.worker_disengage_leases[worker.id] = lease
+        return lease
+
+    def _core_disengage_waypoint(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        worker: EntitySnapshot,
+        zone: EnemyCoreControlZone,
+    ) -> Position | None:
+        blocked = projection.hostile_occupied | frozenset(world.known_obstacles)
+        candidates = tuple(
+            cell
+            for radius in (zone.clear_radius + 1, zone.clear_radius + 2)
+            for cell in manhattan_ring(zone.center, radius)
+            if cell in world.known_passable
+            and cell not in blocked
+            and projection.immediate_attackers(cell) < worker.hp
+        )
+        rows = []
+        for cell in candidates:
+            route = route_to(
+                world,
+                worker.position,
+                cell,
+                node_limit=min(self.config.path_node_limit, 768),
+                blocked=blocked - {worker.position, cell},
+            )
+            if route is None:
+                continue
+            rows.append(
+                (
+                    projection.future_attackers(cell),
+                    projection.worker_exposure(cell)[2],
+                    route.distance,
+                    -manhattan(cell, zone.center),
+                    cell,
+                )
+            )
+        return None if not rows else min(rows)[-1]
+
+    def _core_disengage_intents(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        worker: EntitySnapshot,
+        lease: WorkerDisengageLease,
+    ) -> list[ActionIntent]:
+        rows = []
+        occupied = dict(world.occupied_cells)
+        for index, (direction, destination) in enumerate(cardinal_neighbors(worker.position)):
+            if (
+                destination in world.known_obstacles
+                or destination in projection.hostile_occupied
+                or occupied.get(destination, 0) >= 2
+            ):
+                continue
+            immediate = projection.immediate_attackers(destination)
+            future = projection.future_attackers(destination)
+            if immediate >= worker.hp:
+                continue
+            viability = move_viability(
+                world,
+                worker.position,
+                destination,
+                blocked=projection.hostile_occupied,
+                node_limit=min(self.config.path_node_limit, 256),
+                require_open_area=True,
+            )
+            if not viability.viable:
+                continue
+            distance = manhattan(destination, lease.center)
+            rows.append(
+                (
+                    (
+                        immediate,
+                        future,
+                        -distance,
+                        -viability.forward_exits,
+                        projection.worker_exposure(destination)[2],
+                        int(
+                            destination[0] == lease.center[0]
+                            or destination[1] == lease.center[1]
+                        ),
+                        0 if lease.waypoint is None else manhattan(destination, lease.waypoint),
+                        index,
+                    ),
+                    direction,
+                    destination,
+                    viability,
+                )
+            )
+        zero_exposure = [row for row in rows if row[0][0] == 0 and row[0][1] == 0]
+        if zero_exposure:
+            rows = zero_exposure
+        outward = [row for row in rows if manhattan(row[2], lease.center) > lease.last_distance]
+        if outward:
+            rows = outward
+        intents = [
+            ActionIntent.move(
+                worker.id,
+                UnitMission.CORE_DISENGAGE,
+                19,
+                direction,
+                destination,
+                risk=score[0] * 100 + score[1] * 10 + score[4],
+                tie_break=score,
+                reason="ENEMY_CORE_CONTROL_DISENGAGE",
+                metadata=(
+                    ("enemy_core_id", str(lease.core_id)),
+                    ("enemy_core_center", lease.center),
+                    ("control_distance_before", lease.last_distance),
+                    ("control_distance_after", manhattan(destination, lease.center)),
+                    ("clear_radius", self.config.enemy_core_worker_clear_radius),
+                    ("disengage_waypoint", lease.waypoint),
+                    ("abandoned_target", lease.abandoned_target),
+                ) + viability.metadata,
+            )
+            for score, direction, destination, viability in sorted(rows)
+        ]
+        intents.append(
+            ActionIntent.simple(
+                worker.id,
+                IntentAction.WAIT,
+                UnitMission.CORE_DISENGAGE,
+                20,
+                target_id=lease.core_id,
+                target_position=lease.waypoint,
+                reason=(
+                    "CORE_DISENGAGE_BLOCKED_THIS_TICK"
+                    if rows
+                    else "CORE_DISENGAGE_NO_SURVIVABLE_ROUTE"
+                ),
+            )
+        )
+        return intents
 
     def _assign_work(
         self,
@@ -3316,6 +3698,7 @@ class WorkerPlanner:
             if cell is not None
         }
         blocked = set(projection.hostile_occupied)
+        blocked.update(self._control_zone_cells())
         blocked.update(protected)
         blocked.update(projection.immediate_damage)
         blocked.discard(actor.position)
@@ -3352,6 +3735,7 @@ class WorkerPlanner:
             if cell is not None
         }
         blocked = set(projection.hostile_occupied)
+        blocked.update(self._control_zone_cells())
         blocked.update(extra_blocked)
         if not logistics:
             blocked.update(protected - {actor.position, target})

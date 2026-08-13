@@ -7,7 +7,7 @@ from uuid import UUID
 from arena_hero import Position
 
 from .config import TacticConfig
-from .geometry import manhattan
+from .geometry import diamond, manhattan
 from .models import EntitySnapshot, UnitMission, WorldModel
 from .planning import bfs_distances
 from .projection import TacticalMap
@@ -150,7 +150,24 @@ class ResourceAllocator:
         if not workers or not projection.resources or world.core is None:
             return ResourceAllocation(())
 
-        resources = tuple(sorted(resource.position for resource in projection.resources))
+        enemy_core_zone = {
+            cell
+            for intel in world.remembered_enemy_cores
+            if world.tick - intel.last_seen_tick <= self.config.raid_intel_ttl
+            for cell in diamond(
+                intel.position,
+                self.config.enemy_core_worker_exclusion_radius,
+            )
+        }
+        resources = tuple(
+            sorted(
+                resource.position
+                for resource in projection.resources
+                if resource.position not in enemy_core_zone
+            )
+        )
+        if not resources:
+            return ResourceAllocation(())
         seen_ticks = {
             resource.position: resource.last_seen_tick
             for resource in projection.resources

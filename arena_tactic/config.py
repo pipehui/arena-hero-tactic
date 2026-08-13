@@ -87,6 +87,8 @@ class TacticConfig:
     worker_escape_replan_ticks: int = 2
     worker_escape_max_loop_period: int = 4
     worker_escape_waypoint_lease_ticks: int = 4
+    enemy_core_worker_exclusion_radius: int = 6
+    enemy_core_worker_clear_radius: int = 8
     # Once Core storage is saturated, Workers still return home, but spread
     # across dedicated non-combat rings instead of joining the deposit lane.
     # A small hysteresis prevents one point of healing/repair from summoning
@@ -159,6 +161,12 @@ class TacticConfig:
     raid_containment_core_count: int = 2
     raid_peace_home_reserve: int = 8
     raid_min_siege_members: int = 4
+    raid_long_range_start_radius: int = 60
+    raid_long_range_continue_radius: int = 70
+    raid_long_range_min_members: int = 4
+    raid_long_range_max_route: int = 80
+    raid_long_range_search_reserve_ticks: int = 16
+    raid_long_range_max_campaign_ticks: int = 96
     beacon_acquire_radius: int = 12
     beacon_min_workers: int = 4
     beacon_guard_radius: int = 2
@@ -217,6 +225,8 @@ class TacticConfig:
             self.worker_escape_replan_ticks,
             self.worker_escape_max_loop_period,
             self.worker_escape_waypoint_lease_ticks,
+            self.enemy_core_worker_exclusion_radius,
+            self.enemy_core_worker_clear_radius,
             self.worker_full_storage_release_space,
             self.worker_full_storage_replenishers,
             self.home_warning_radius,
@@ -272,6 +282,12 @@ class TacticConfig:
             self.raid_containment_core_count,
             self.raid_peace_home_reserve,
             self.raid_min_siege_members,
+            self.raid_long_range_start_radius,
+            self.raid_long_range_continue_radius,
+            self.raid_long_range_min_members,
+            self.raid_long_range_max_route,
+            self.raid_long_range_search_reserve_ticks,
+            self.raid_long_range_max_campaign_ticks,
             self.beacon_acquire_radius,
             self.beacon_min_workers,
             self.beacon_guard_radius,
@@ -302,6 +318,8 @@ class TacticConfig:
             raise ValueError("recovery threshold must be within 1..100")
         if self.worker_escape_clearance_radius <= self.worker_escape_trigger_radius:
             raise ValueError("escape clearance must exceed its trigger radius")
+        if self.enemy_core_worker_clear_radius <= self.enemy_core_worker_exclusion_radius:
+            raise ValueError("enemy Core clearance must exceed its exclusion radius")
         if self.worker_escape_plan_node_limit < self.worker_escape_plan_depth:
             raise ValueError("escape planning nodes must cover its depth")
         if self.worker_escape_max_loop_period * 2 > self.loop_history_length:
@@ -361,6 +379,16 @@ class TacticConfig:
             raise ValueError("containment raids must leave at least two defenders")
         if self.raid_min_siege_members < 2:
             raise ValueError("a siege requires at least two members")
+        if self.raid_long_range_start_radius <= self.raid_containment_radius:
+            raise ValueError("long-range raids must extend beyond containment range")
+        if self.raid_long_range_continue_radius < self.raid_long_range_start_radius:
+            raise ValueError("long-range continuation must cover its start range")
+        if self.raid_long_range_min_members < 4:
+            raise ValueError("long-range raids require at least a 2V+2R group")
+        if self.raid_long_range_max_route < self.raid_long_range_start_radius:
+            raise ValueError("long-range route budget must cover its start radius")
+        if self.raid_long_range_max_campaign_ticks < 64:
+            raise ValueError("long-range campaign must preserve a useful search window")
         if (
             not self.peaceful_squad_radii
             or tuple(sorted(set(self.peaceful_squad_radii)))

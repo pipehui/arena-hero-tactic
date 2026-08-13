@@ -18,6 +18,7 @@ from .models import (
     CrisisForceBaseline,
     EnemyCoreIntel,
     EnemyTrack,
+    LongRangeRaidCampaign,
     ThreatHeatCell,
     WorkerScoutPhase,
     WorkerScoutState,
@@ -113,7 +114,12 @@ class ExplorationMemoryStore:
                 if latest - track.last_seen_tick > self.config.enemy_track_ttl:
                     memory.enemy_tracks.pop(enemy_id, None)
             for core_id, intel in tuple(memory.enemy_core_intel.items()):
-                if latest - intel.last_seen_tick > self.config.raid_intel_ttl:
+                active_long_range = (
+                    memory.raid_long_range_campaign is not None
+                    and memory.raid_long_range_campaign.target_id == core_id
+                    and latest <= memory.raid_long_range_campaign.search_deadline_tick
+                )
+                if latest - intel.last_seen_tick > self.config.raid_intel_ttl and not active_long_range:
                     memory.enemy_core_intel.pop(core_id, None)
         self.restored_through_tick = latest
         self.restored_visit_count = sum(memory.visit_counts.values())
@@ -187,7 +193,12 @@ class ExplorationMemoryStore:
                     memory.enemy_core_intel.items(),
                     key=lambda item: item[0].bytes,
                 )
-                if tick - intel.last_seen_tick <= self.config.raid_intel_ttl
+                if (
+                    tick - intel.last_seen_tick <= self.config.raid_intel_ttl
+                    or memory.raid_long_range_campaign is not None
+                    and memory.raid_long_range_campaign.target_id == core_id
+                    and tick <= memory.raid_long_range_campaign.search_deadline_tick
+                )
             ],
             "worker_scout_states": [
                 {
@@ -221,6 +232,24 @@ class ExplorationMemoryStore:
                     "started_tick": memory.crisis_force_baseline.started_tick,
                     "phase": memory.crisis_force_baseline.phase,
                     "safe_ticks": memory.crisis_force_baseline.safe_ticks,
+                }
+            ),
+            "long_range_raid_campaign": (
+                None
+                if memory.raid_long_range_campaign is None
+                else {
+                    "target_id": str(memory.raid_long_range_campaign.target_id),
+                    "member_ids": [
+                        str(member_id)
+                        for member_id in memory.raid_long_range_campaign.member_ids
+                    ],
+                    "phase": memory.raid_long_range_campaign.phase,
+                    "started_tick": memory.raid_long_range_campaign.started_tick,
+                    "route_eta": memory.raid_long_range_campaign.route_eta,
+                    "search_deadline_tick": memory.raid_long_range_campaign.search_deadline_tick,
+                    "last_position": list(memory.raid_long_range_campaign.last_position),
+                    "last_group_distance": memory.raid_long_range_campaign.last_group_distance,
+                    "no_progress_ticks": memory.raid_long_range_campaign.no_progress_ticks,
                 }
             ),
             "strategic_relocation_pending": memory.strategic_relocation_pending,
@@ -502,6 +531,60 @@ class ExplorationMemoryStore:
                         phase=phase,
                         safe_ticks=safe_ticks,
                     )
+        if schema >= 13:
+            raw_campaign = payload.get("long_range_raid_campaign")
+            if isinstance(raw_campaign, dict):
+                target_id = _uuid(raw_campaign.get("target_id"))
+                member_ids = tuple(
+                    member_id
+                    for raw in raw_campaign.get("member_ids", [])
+                    if (member_id := _uuid(raw)) is not None
+                )
+                last_position = _position(raw_campaign.get("last_position"))
+                phase = raw_campaign.get("phase")
+                integer_values = {
+                    key: raw_campaign.get(key)
+                    for key in (
+                        "started_tick",
+                        "route_eta",
+                        "search_deadline_tick",
+                        "no_progress_ticks",
+                    )
+                }
+                last_group_distance = raw_campaign.get("last_group_distance")
+                if (
+                    target_id is not None
+                    and member_ids
+                    and last_position is not None
+                    and isinstance(phase, str)
+                    and all(
+                        isinstance(value, int) and not isinstance(value, bool)
+                        for value in integer_values.values()
+                    )
+                    and integer_values["route_eta"] >= 0
+                    and integer_values["no_progress_ticks"] >= 0
+                    and (
+                        last_group_distance is None
+                        or isinstance(last_group_distance, int)
+                        and not isinstance(last_group_distance, bool)
+                        and last_group_distance >= 0
+                    )
+                ):
+                    memory.raid_long_range_campaign = LongRangeRaidCampaign(
+                        target_id=target_id,
+                        member_ids=member_ids,
+                        phase=phase,
+                        started_tick=integer_values["started_tick"],
+                        route_eta=integer_values["route_eta"],
+                        search_deadline_tick=integer_values["search_deadline_tick"],
+                        last_position=last_position,
+                        last_group_distance=last_group_distance,
+                        no_progress_ticks=integer_values["no_progress_ticks"],
+                    )
+                    memory.raid_target_id = target_id
+                    memory.raid_member_ids = member_ids
+                    memory.raid_phase = phase
+                    memory.raid_last_position = last_position
         memory.opening_complete = bool(payload.get("opening_complete", False))
         memory.strategic_relocation_pending = bool(
             payload.get("strategic_relocation_pending", False)
@@ -687,7 +770,15 @@ class ExplorationMemoryStore:
             if tick - track.last_seen_tick > self.config.enemy_track_ttl:
                 memory.enemy_tracks.pop(enemy_id, None)
         for core_id, intel in tuple(memory.enemy_core_intel.items()):
-            if tick - intel.last_seen_tick > self.config.raid_intel_ttl:
+            active_long_range = (
+                memory.raid_long_range_campaign is not None
+                and memory.raid_long_range_campaign.target_id == core_id
+                and tick <= memory.raid_long_range_campaign.search_deadline_tick
+            )
+            if (
+                tick - intel.last_seen_tick > self.config.raid_intel_ttl
+                and not active_long_range
+            ):
                 memory.enemy_core_intel.pop(core_id, None)
         memory.last_tick = tick
 

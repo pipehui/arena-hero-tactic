@@ -34,6 +34,89 @@ from tests.helpers import enemy_core, friendly_core, make_turn, uid, unit
 
 
 class CombatDefenseTests(unittest.TestCase):
+    def test_confirmed_distance_fifty_core_launches_surplus_two_by_two_raid(self) -> None:
+        core = friendly_core(position=(0, 0))
+        vanguards = tuple(
+            unit(100 + index, UnitType.VANGUARD, (-1 - index, 0))
+            for index in range(15)
+        )
+        rangers = tuple(
+            unit(200 + index, UnitType.RANGER, (index % 7, 1 + index // 7))
+            for index in range(14)
+        )
+        memory = TacticMemory(
+            core_id=core.id,
+            core_position=core.position,
+            opening_complete=True,
+            home_force_high_water=22,
+        )
+        memory.known_passable.update(
+            (x, y) for x in range(-18, 51) for y in range(-4, 5)
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        for tick in (1, 2):
+            tactic.choose_actions(
+                make_turn(
+                    tick=tick,
+                    core=core,
+                    units=(*vanguards, *rangers),
+                    enemies=(enemy_core(999, (50, 0)),),
+                    resources=0,
+                )
+            )
+
+        campaign = tactic.memory.raid_long_range_campaign
+        self.assertIsNotNone(campaign)
+        assert campaign is not None
+        self.assertEqual(len(campaign.member_ids), 4)
+        member_types = Counter(
+            next(
+                unit_view.unit_type
+                for unit_view in (*vanguards, *rangers)
+                if unit_view.id == member_id
+            )
+            for member_id in campaign.member_ids
+        )
+        self.assertEqual(member_types[UnitType.VANGUARD], 2)
+        self.assertEqual(member_types[UnitType.RANGER], 2)
+        self.assertGreaterEqual(29 - len(campaign.member_ids), 22)
+        raid_trace = tactic.last_decision_trace["combat"]["raid"]
+        self.assertEqual(raid_trace["long_range"]["route_eta"], 50)
+
+    def test_distance_fifty_core_does_not_launch_without_full_home_reserve(self) -> None:
+        core = friendly_core(position=(0, 0))
+        combatants = tuple(
+            unit(index + 1, unit_type, (-index, 0))
+            for index, unit_type in enumerate(
+                (UnitType.VANGUARD,) * 6 + (UnitType.RANGER,) * 6
+            )
+        )
+        memory = TacticMemory(
+            core_id=core.id,
+            core_position=core.position,
+            opening_complete=True,
+            home_force_high_water=12,
+        )
+        memory.known_passable.update(
+            (x, y) for x in range(-12, 51) for y in range(-2, 3)
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        for tick in (1, 2):
+            tactic.choose_actions(
+                make_turn(
+                    tick=tick,
+                    core=core,
+                    units=combatants,
+                    enemies=(enemy_core(999, (50, 0)),),
+                    resources=0,
+                )
+            )
+
+        self.assertIsNone(tactic.memory.raid_long_range_campaign)
+        self.assertEqual(tactic.memory.raid_phase, "IDLE")
+
     def test_two_cell_reversal_prefers_the_stable_next_turning_point(self) -> None:
         ranger = unit(1, UnitType.RANGER, (3, 0))
         tactic = BalancedTactic()
@@ -187,7 +270,7 @@ class CombatDefenseTests(unittest.TestCase):
             if squad.support_target is not None
         ]
         self.assertEqual(len(supports), len(set(supports)))
-        self.assertEqual(tactic.last_decision_trace["schema_version"], 38)
+        self.assertEqual(tactic.last_decision_trace["schema_version"], 39)
         formation = tactic.last_decision_trace["combat"]["formation"]
         assigned_supports = [
             tuple(bundle["support"])

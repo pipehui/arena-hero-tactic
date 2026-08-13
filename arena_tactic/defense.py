@@ -25,6 +25,7 @@ from .models import (
     IntentAction,
     IntentResolution,
     PairingCooldown,
+    PartnerDependencyFeedback,
     PeacefulFormationAssignment,
     SquadFormationBundle,
     SquadFormationLease,
@@ -33,8 +34,9 @@ from .models import (
     UnitMission,
     WorldModel,
 )
-from .planning import Route, move_viability, path_to, route_to
+from .planning import Route, bfs_distances, move_viability, path_to, route_to
 from .projection import TacticalMap
+from .resource_allocator import minimum_cost_matching
 from .rules import UNIT_MAX_HP
 from .state import TacticMemory
 
@@ -114,7 +116,12 @@ class DefensePlanner:
                 and manhattan(enemy.observed_position, world.core.position)
                 <= self.config.home_warning_radius
             )
-        self._sync_squads(living_combatants, world.tick)
+        self._sync_squads(
+            world,
+            projection,
+            living_combatants,
+            protected,
+        )
         screening_intents = self._screening_intents(
             world,
             projection,
@@ -258,7 +265,16 @@ class DefensePlanner:
                 and previous.target_position == selected.target_position
                 else int(blocked_now)
             )
-            partner_wait_now = selected.reason == "WAIT_FOR_PARTNER_PROGRESS"
+            metadata = dict(selected.metadata)
+            partner_wait_now = bool(
+                selected.reason
+                in {
+                    "WAIT_FOR_PARTNER_PROGRESS",
+                    "WAIT_FOR_RENDEZVOUS_PROGRESS",
+                    "FORMATION_TARGET_HOLD",
+                }
+                or metadata.get("hold_class") == "PARTNER_PROGRESS_HOLD"
+            )
             consecutive_partner_wait = (
                 previous.consecutive_partner_wait_ticks + 1
                 if partner_wait_now
@@ -276,6 +292,46 @@ class DefensePlanner:
                 consecutive_blocked_ticks=consecutive_blocked,
                 consecutive_partner_wait_ticks=consecutive_partner_wait,
             )
+            if partner_wait_now:
+                partner_id = next(
+                    (
+                        item
+                        for pair in self.memory.squad_states
+                        if actor_id in pair
+                        for item in pair
+                        if item != actor_id
+                    ),
+                    None,
+                )
+                if partner_id is not None:
+                    partner_intent = selected_by_actor.get(partner_id)
+                    remaining = None
+                    if selected.target_position is not None:
+                        partner = world.friendly(partner_id)
+                        if partner is not None:
+                            route = route_to(
+                                world,
+                                partner.position,
+                                selected.target_position,
+                                node_limit=min(self.config.path_node_limit, 512),
+                            )
+                            remaining = None if route is None else route.distance
+                    self.memory.partner_dependency_feedback[actor_id] = (
+                        PartnerDependencyFeedback(
+                            actor_id=actor_id,
+                            partner_id=partner_id,
+                            tick=world.tick,
+                            reason=selected.reason,
+                            remaining_route_distance=remaining,
+                            resolver_accepted=bool(
+                                partner_intent is not None
+                                and partner_intent.action is IntentAction.MOVE
+                            ),
+                            wait_ticks=consecutive_partner_wait,
+                        )
+                    )
+            else:
+                self.memory.partner_dependency_feedback.pop(actor_id, None)
 
     def _screening_intents(
         self,
@@ -1390,9 +1446,16 @@ class DefensePlanner:
                 and v_distance < previous.vanguard_best_distance
             )
         )
+        observed_hold_ticks = max(
+            (
+                item.consecutive_partner_wait_ticks
+                for item in feedback
+            ),
+            default=0,
+        )
         hold_ticks = (
-            previous.partner_hold_ticks + 1
-            if one_arrived and partner_progressing and consecutive
+            max(previous.partner_hold_ticks + 1, observed_hold_ticks)
+            if one_arrived and consecutive
             else (1 if one_arrived else 0)
         )
         completed = v_arrived and r_arrived
@@ -1511,7 +1574,7 @@ class DefensePlanner:
                 lease is not None
                 and lease.partner_progressing
                 and lease.partner_hold_ticks
-                <= self.config.formation_partner_hold_ticks
+                < self.config.formation_partner_hold_ticks
             )
             return [
                 ActionIntent.simple(
@@ -1554,6 +1617,17 @@ class DefensePlanner:
         key = (vanguard.id, ranger.id)
         separation = manhattan(vanguard.position, ranger.position)
         previous = self.memory.squad_rendezvous_leases.get(key)
+        dependency_wait_ticks = max(
+            (
+                feedback.wait_ticks
+                for actor_id in key
+                if (
+                    feedback := self.memory.partner_dependency_feedback.get(actor_id)
+                ) is not None
+                and feedback.tick == world.tick - 1
+            ),
+            default=0,
+        )
         blocked = frozenset(
             (
                 protected
@@ -1579,7 +1653,7 @@ class DefensePlanner:
             candidates.update(between[max(0, middle - 2) : middle + 3])
             for cell in tuple(candidates):
                 candidates.update(neighbor for _, neighbor in cardinal_neighbors(cell))
-        if previous is not None:
+        if previous is not None and dependency_wait_ticks < self.config.formation_partner_hold_ticks:
             candidates.add(previous.rendezvous)
         candidates.update((vanguard.position, ranger.position))
         viable: list[tuple[tuple[int, ...], Position, Route, Route]] = []
@@ -1607,12 +1681,13 @@ class DefensePlanner:
             )
             if v_route is None or r_route is None:
                 continue
-            stable = int(
-                previous is None
-                or previous.rendezvous != cell
-                or previous.stalled_ticks
-                >= self.config.squad_reassembly_no_progress_ticks
-            )
+            if (
+                previous is not None
+                and dependency_wait_ticks >= self.config.formation_partner_hold_ticks
+                and cell == previous.rendezvous
+            ):
+                continue
+            stable = int(previous is None or previous.rendezvous != cell)
             viable.append(
                 (
                     (
@@ -1651,6 +1726,7 @@ class DefensePlanner:
             if previous is None or progressed
             else previous.stalled_ticks + 1
         )
+        stalled = max(stalled, dependency_wait_ticks)
         if stalled >= self.config.squad_reassembly_break_ticks:
             cooldown = PairingCooldown(
                 vanguard_id=vanguard.id,
@@ -1661,21 +1737,13 @@ class DefensePlanner:
             self.memory.squad_states.pop(key, None)
             self.memory.squad_formation_leases.pop(key, None)
             self.memory.squad_rendezvous_leases.pop(key, None)
-            return [
-                ActionIntent.simple(
-                    unit.id,
-                    IntentAction.WAIT,
-                    UnitMission.PATROL,
-                    72,
-                    target_position=unit.position,
-                    reason="PAIRING_COOLDOWN_REASSIGN",
-                    metadata=(
-                        ("hold_class", "BLOCKED_WAIT"),
-                        ("cooldown_until", cooldown.expires_tick),
-                    ),
-                )
-                for unit in (vanguard, ranger)
-            ]
+            return self._reserve_patrol_intents(
+                world,
+                projection,
+                (vanguard, ranger),
+                set(),
+                protected,
+            )
         assigned_tick = (
             previous.assigned_tick
             if previous is not None and previous.rendezvous == rendezvous
@@ -1730,6 +1798,10 @@ class DefensePlanner:
                         metadata=(
                             ("hold_class", "PARTNER_PROGRESS_HOLD"),
                             ("stalled_ticks", stalled),
+                            (
+                                "partner_id",
+                                str(ranger.id if unit.id == vanguard.id else vanguard.id),
+                            ),
                         ),
                     )
                 )
@@ -2152,10 +2224,14 @@ class DefensePlanner:
 
     def _sync_squads(
         self,
+        world: WorldModel,
+        projection: TacticalMap,
         combatants: tuple[EntitySnapshot, ...],
-        tick: int,
+        protected: frozenset[Position],
     ) -> None:
+        tick = world.tick
         living = {unit.id for unit in combatants}
+        by_id = {unit.id: unit for unit in combatants}
         for key, cooldown in tuple(self.memory.squad_pairing_cooldowns.items()):
             if cooldown.expires_tick < tick or not set(key) <= living:
                 self.memory.squad_pairing_cooldowns.pop(key, None)
@@ -2164,6 +2240,45 @@ class DefensePlanner:
                 self.memory.squad_target_backoffs.pop(key, None)
         for key, squad in tuple(self.memory.squad_states.items()):
             if squad.vanguard_id not in living or squad.ranger_id not in living:
+                self.memory.squad_states.pop(key, None)
+                self.memory.squad_formation_leases.pop(key, None)
+                self.memory.squad_rendezvous_leases.pop(key, None)
+                continue
+            vanguard = by_id[squad.vanguard_id]
+            ranger = by_id[squad.ranger_id]
+            feedback_wait = max(
+                (
+                    self.memory.formation_move_feedback[actor_id].consecutive_partner_wait_ticks
+                    for actor_id in key
+                    if actor_id in self.memory.formation_move_feedback
+                ),
+                default=0,
+            )
+            route = None
+            if (
+                manhattan(vanguard.position, ranger.position)
+                > self.config.squad_max_separation
+                or feedback_wait >= self.config.formation_partner_hold_ticks
+            ):
+                route = route_to(
+                    world,
+                    vanguard.position,
+                    ranger.position,
+                    node_limit=min(self.config.path_node_limit, 512),
+                    blocked=(projection.hostile_occupied | protected)
+                    - {vanguard.position, ranger.position},
+                )
+            if route is None and manhattan(
+                vanguard.position, ranger.position
+            ) <= self.config.squad_max_separation:
+                continue
+            if route is None or route.distance > self.config.formation_max_route_distance:
+                self.memory.squad_pairing_cooldowns[key] = PairingCooldown(
+                    vanguard_id=key[0],
+                    ranger_id=key[1],
+                    expires_tick=tick + self.config.formation_pair_cooldown_ticks,
+                    reason="PAIR_ROUTE_INVALID",
+                )
                 self.memory.squad_states.pop(key, None)
                 self.memory.squad_formation_leases.pop(key, None)
                 self.memory.squad_rendezvous_leases.pop(key, None)
@@ -2195,30 +2310,42 @@ class DefensePlanner:
             ),
             key=lambda unit: unit.id.bytes,
         )
-        while vanguards and rangers:
-            candidates = tuple(
-                (
-                    manhattan(v.position, r.position),
-                    v.id.bytes,
-                    r.id.bytes,
-                    v,
-                    r,
+        pairing_costs: dict[tuple[UUID, UUID], int] = {}
+        ranger_positions = frozenset(ranger.position for ranger in rangers)
+        pairing_blocked = projection.hostile_occupied | protected
+        for vanguard in vanguards:
+            distances, _ = bfs_distances(
+                world,
+                vanguard.position,
+                node_limit=min(self.config.path_node_limit, 512),
+                blocked=frozenset(
+                    pairing_blocked - {vanguard.position} - ranger_positions
+                ),
+                targets=ranger_positions,
+            )
+            for ranger in rangers:
+                cooldown = self.memory.squad_pairing_cooldowns.get(
+                    (vanguard.id, ranger.id)
                 )
-                for v in vanguards
-                for r in rangers
+                if cooldown is not None and cooldown.expires_tick >= tick:
+                    continue
+                distance = distances.get(ranger.position)
                 if (
-                    cooldown := self.memory.squad_pairing_cooldowns.get(
-                        (v.id, r.id)
-                    )
-                ) is None
-                or cooldown.expires_tick < tick
-            )
-            if not candidates:
-                break
-            _, _, _, vanguard, ranger = min(
-                candidates,
-                key=lambda item: item[:3],
-            )
+                    distance is None
+                    or distance > self.config.formation_max_route_distance
+                ):
+                    continue
+                pairing_costs[(vanguard.id, ranger.id)] = distance
+        chosen_pairs = self._minimum_path_pairing(
+            tuple(vanguards),
+            tuple(rangers),
+            pairing_costs,
+        )
+        vanguard_by_id = {unit.id: unit for unit in vanguards}
+        ranger_by_id = {unit.id: unit for unit in rangers}
+        for vanguard_id, ranger_id in chosen_pairs:
+            vanguard = vanguard_by_id[vanguard_id]
+            ranger = ranger_by_id[ranger_id]
             key = vanguard.id, ranger.id
             self.memory.squad_states[key] = SquadState(
                 vanguard.id,
@@ -2247,6 +2374,38 @@ class DefensePlanner:
                 radius=self.config.peaceful_squad_radii[layer],
                 sector_index=index,
             )
+
+    @staticmethod
+    def _minimum_path_pairing(
+        vanguards: tuple[EntitySnapshot, ...],
+        rangers: tuple[EntitySnapshot, ...],
+        costs: dict[tuple[UUID, UUID], int],
+    ) -> tuple[tuple[UUID, UUID], ...]:
+        """Maximum-cardinality, minimum-cost deterministic mixed pairing."""
+
+        ordered_r = tuple(sorted(rangers, key=lambda unit: unit.id.bytes))
+        virtual_positions = tuple((index, 0) for index in range(len(ordered_r)))
+        ranger_by_virtual = {
+            virtual_positions[index]: ranger.id
+            for index, ranger in enumerate(ordered_r)
+        }
+        ranger_virtual_by_id = {
+            ranger.id: virtual_positions[index]
+            for index, ranger in enumerate(ordered_r)
+        }
+        matching_costs = {
+            (vanguard_id, ranger_virtual_by_id[ranger_id]): distance
+            for (vanguard_id, ranger_id), distance in costs.items()
+        }
+        matches = minimum_cost_matching(
+            tuple(vanguard.id for vanguard in vanguards),
+            virtual_positions,
+            matching_costs,
+        )
+        return tuple(
+            (vanguard_id, ranger_by_virtual[virtual])
+            for vanguard_id, virtual, _ in matches
+        )
 
     @staticmethod
     def _sector_direction(core: Position, threat: Position) -> Direction:

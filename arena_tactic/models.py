@@ -26,6 +26,7 @@ class UnitMission(str, Enum):
     CORE_SURVIVAL = "CORE_SURVIVAL"
     DEPOSIT = "DEPOSIT"
     ESCAPE = "ESCAPE"
+    CORE_DISENGAGE = "CORE_DISENGAGE"
     ATTACK = "ATTACK"
     RECOVER = "RECOVER"
     RETURN_CARGO = "RETURN_CARGO"
@@ -194,6 +195,30 @@ class EnemyCoreIntel:
     destination: Position | None
     last_seen_tick: int
     sighting_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class EnemyCoreControlZone:
+    core_id: UUID
+    center: Position
+    exclusion_radius: int
+    clear_radius: int
+    last_seen_tick: int
+    visible_now: bool
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerDisengageLease:
+    worker_id: UUID
+    core_id: UUID
+    center: Position
+    waypoint: Position | None
+    assigned_tick: int
+    safe_ticks: int = 0
+    last_distance: int = 0
+    last_position: Position | None = None
+    stalled_ticks: int = 0
+    abandoned_target: Position | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -971,6 +996,30 @@ class FormationMoveFeedback:
     rejection_reason: str | None = None
     consecutive_blocked_ticks: int = 0
     consecutive_partner_wait_ticks: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class PartnerDependencyFeedback:
+    actor_id: UUID
+    partner_id: UUID
+    tick: int
+    reason: str
+    remaining_route_distance: int | None
+    resolver_accepted: bool
+    wait_ticks: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class LongRangeRaidCampaign:
+    target_id: UUID
+    member_ids: tuple[UUID, ...]
+    phase: str
+    started_tick: int
+    route_eta: int
+    search_deadline_tick: int
+    last_position: Position
+    last_group_distance: int | None = None
+    no_progress_ticks: int = 0
 
 
 @dataclass(frozen=True, slots=True)

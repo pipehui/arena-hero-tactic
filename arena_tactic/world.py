@@ -209,6 +209,30 @@ def _sync_events(
             and event.target_id is not None
         ):
             memory.enemy_core_intel.pop(event.target_id, None)
+            destroyed_zone = memory.enemy_core_control_zones.pop(
+                event.target_id,
+                None,
+            )
+            for worker_id, lease in tuple(memory.worker_disengage_leases.items()):
+                if lease.core_id == event.target_id:
+                    memory.worker_disengage_leases.pop(worker_id, None)
+            if destroyed_zone is not None:
+                still_controlled: set[Position] = set()
+                for zone in memory.enemy_core_control_zones.values():
+                    still_controlled.update(
+                        diamond(zone.center, zone.exclusion_radius)
+                    )
+                released = set(
+                    diamond(
+                        destroyed_zone.center,
+                        destroyed_zone.exclusion_radius,
+                    )
+                ) - still_controlled
+                for target in released:
+                    memory.target_backoff_until.pop(target, None)
+                for key in tuple(memory.worker_resource_backoff):
+                    if key[1] in released:
+                        memory.worker_resource_backoff.pop(key, None)
             if memory.counter_siege_target_id == event.target_id:
                 memory.counter_siege_target_id = None
                 memory.counter_siege_last_seen_tick = None
@@ -222,6 +246,7 @@ def _sync_events(
                 memory.raid_last_position = None
                 memory.raid_member_ids = ()
                 memory.raid_phase = "IDLE"
+                memory.raid_long_range_campaign = None
         elif event.event_type == "HARVEST_SUCCEEDED":
             if event.position is not None:
                 memory.resource_harvest_count[event.position] += 1
@@ -409,6 +434,9 @@ def _sync_friendly_memory(
     for unit_id in tuple(memory.worker_escape_states):
         if unit_id not in living_ids:
             memory.worker_escape_states.pop(unit_id, None)
+    for unit_id in tuple(memory.worker_disengage_leases):
+        if unit_id not in living_ids:
+            memory.worker_disengage_leases.pop(unit_id, None)
     for unit_id in tuple(memory.worker_scout_states):
         if unit_id not in living_ids:
             memory.worker_scout_states.pop(unit_id, None)
@@ -441,6 +469,9 @@ def _sync_friendly_memory(
     for unit_id, failure in tuple(memory.failed_unit_moves.items()):
         if unit_id not in living_ids or turn.tick > failure.expires_tick:
             memory.failed_unit_moves.pop(unit_id, None)
+    for unit_id in tuple(memory.partner_dependency_feedback):
+        if unit_id not in living_ids:
+            memory.partner_dependency_feedback.pop(unit_id, None)
     for unit in turn.units:
         existing_mission = memory.unit_missions.get(unit.id)
         if (
@@ -508,7 +539,12 @@ def _sync_enemy_memory(
             sighting_count=sightings,
         )
     for core_id, intel in tuple(memory.enemy_core_intel.items()):
-        if turn.tick - intel.last_seen_tick > config.raid_intel_ttl:
+        active_long_range = (
+            memory.raid_long_range_campaign is not None
+            and memory.raid_long_range_campaign.target_id == core_id
+            and turn.tick <= memory.raid_long_range_campaign.search_deadline_tick
+        )
+        if turn.tick - intel.last_seen_tick > config.raid_intel_ttl and not active_long_range:
             memory.enemy_core_intel.pop(core_id, None)
     if turn.core is not None:
         nearby_combat = [

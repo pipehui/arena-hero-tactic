@@ -678,6 +678,46 @@ class DecisionTraceBuilder:
                     key=lambda item: item[0].bytes,
                 )
             ],
+            "enemy_core_control_zones": [
+                {
+                    "core_id": str(zone.core_id),
+                    "center": list(zone.center),
+                    "exclusion_radius": zone.exclusion_radius,
+                    "clear_radius": zone.clear_radius,
+                    "last_seen_tick": zone.last_seen_tick,
+                    "visible_now": zone.visible_now,
+                }
+                for zone in sorted(
+                    self.memory.enemy_core_control_zones.values(),
+                    key=lambda item: item.core_id.bytes,
+                )
+            ],
+            "worker_disengagements": [
+                {
+                    "worker_id": str(lease.worker_id),
+                    "core_id": str(lease.core_id),
+                    "center": list(lease.center),
+                    "waypoint": None if lease.waypoint is None else list(lease.waypoint),
+                    "assigned_tick": lease.assigned_tick,
+                    "safe_ticks": lease.safe_ticks,
+                    "distance": lease.last_distance,
+                    "last_position": (
+                        None
+                        if lease.last_position is None
+                        else list(lease.last_position)
+                    ),
+                    "stalled_ticks": lease.stalled_ticks,
+                    "abandoned_target": (
+                        None
+                        if lease.abandoned_target is None
+                        else list(lease.abandoned_target)
+                    ),
+                }
+                for lease in sorted(
+                    self.memory.worker_disengage_leases.values(),
+                    key=lambda item: item.worker_id.bytes,
+                )
+            ],
         }
 
     def _combat_dict(
@@ -1092,6 +1132,36 @@ class DecisionTraceBuilder:
                 "containment_mode": self.memory.raid_containment_mode,
                 "containment_radius": self.config.raid_containment_radius,
                 "peace_home_reserve": self.config.raid_peace_home_reserve,
+                "home_force_target": max(
+                    self.config.home_force_floor,
+                    self.memory.home_force_high_water,
+                ),
+                "long_range": (
+                    None
+                    if self.memory.raid_long_range_campaign is None
+                    else {
+                        "target_id": str(self.memory.raid_long_range_campaign.target_id),
+                        "members": [
+                            str(item)
+                            for item in self.memory.raid_long_range_campaign.member_ids
+                        ],
+                        "phase": self.memory.raid_long_range_campaign.phase,
+                        "started_tick": self.memory.raid_long_range_campaign.started_tick,
+                        "route_eta": self.memory.raid_long_range_campaign.route_eta,
+                        "search_deadline_tick": (
+                            self.memory.raid_long_range_campaign.search_deadline_tick
+                        ),
+                        "last_position": list(
+                            self.memory.raid_long_range_campaign.last_position
+                        ),
+                        "last_group_distance": (
+                            self.memory.raid_long_range_campaign.last_group_distance
+                        ),
+                        "no_progress_ticks": (
+                            self.memory.raid_long_range_campaign.no_progress_ticks
+                        ),
+                    }
+                ),
                 "confirmed_nearby_cores": sum(
                     world.tick - intel.last_seen_tick <= self.config.raid_intel_ttl
                     and intel.sighting_count >= self.config.raid_confirmed_sightings
@@ -1231,6 +1301,21 @@ class DecisionTraceBuilder:
                 }
                 for feedback in sorted(
                     self.memory.formation_move_feedback.values(),
+                    key=lambda item: item.actor_id.bytes,
+                )
+            ],
+            "partner_dependencies": [
+                {
+                    "actor_id": str(feedback.actor_id),
+                    "partner_id": str(feedback.partner_id),
+                    "tick": feedback.tick,
+                    "reason": feedback.reason,
+                    "remaining_route_distance": feedback.remaining_route_distance,
+                    "resolver_accepted": feedback.resolver_accepted,
+                    "wait_ticks": feedback.wait_ticks,
+                }
+                for feedback in sorted(
+                    self.memory.partner_dependency_feedback.values(),
                     key=lambda item: item.actor_id.bytes,
                 )
             ],

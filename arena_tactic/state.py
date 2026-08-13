@@ -9,6 +9,7 @@ from arena_hero import Position
 from .models import (
     EnemyTrack,
     EnemyCoreIntel,
+    EnemyCoreControlZone,
     CrisisForceBaseline,
     ManualMoveLease,
     MissionState,
@@ -16,6 +17,7 @@ from .models import (
     MoveFailure,
     PatientAdmissionProgress,
     PairingCooldown,
+    PartnerDependencyFeedback,
     PeacefulFormationAssignment,
     RangerStanceLease,
     ScreeningContactDecision,
@@ -25,6 +27,7 @@ from .models import (
     FormationMoveFeedback,
     SquadState,
     WorkerEscapeState,
+    WorkerDisengageLease,
     WorkerPatrolMode,
     WorkerScoutState,
     ShotFeedback,
@@ -35,6 +38,7 @@ from .models import (
     CargoRouteProgress,
     SegmentedReturnLease,
     ThreatHeatCell,
+    LongRangeRaidCampaign,
 )
 
 
@@ -68,6 +72,7 @@ class TacticMemory:
 
     enemy_tracks: dict[UUID, EnemyTrack] = field(default_factory=dict)
     enemy_core_intel: dict[UUID, EnemyCoreIntel] = field(default_factory=dict)
+    enemy_core_control_zones: dict[UUID, EnemyCoreControlZone] = field(default_factory=dict)
     engaged_enemy_until: dict[UUID, int] = field(default_factory=dict)
     danger_until: dict[Position, int] = field(default_factory=dict)
     threat_heat: dict[Position, ThreatHeatCell] = field(default_factory=dict)
@@ -76,6 +81,7 @@ class TacticMemory:
     position_history: dict[UUID, tuple[Position, ...]] = field(default_factory=dict)
     last_positions: dict[UUID, Position] = field(default_factory=dict)
     worker_escape_states: dict[UUID, WorkerEscapeState] = field(default_factory=dict)
+    worker_disengage_leases: dict[UUID, WorkerDisengageLease] = field(default_factory=dict)
     worker_scout_states: dict[UUID, WorkerScoutState] = field(default_factory=dict)
     worker_task_progress: dict[UUID, WorkerTaskProgress] = field(default_factory=dict)
     worker_resource_backoff: dict[tuple[UUID, Position], int] = field(default_factory=dict)
@@ -158,6 +164,9 @@ class TacticMemory:
     formation_move_feedback: dict[UUID, FormationMoveFeedback] = field(
         default_factory=dict
     )
+    partner_dependency_feedback: dict[UUID, PartnerDependencyFeedback] = field(
+        default_factory=dict
+    )
     squad_pairing_cooldowns: dict[tuple[UUID, UUID], PairingCooldown] = field(
         default_factory=dict
     )
@@ -185,6 +194,7 @@ class TacticMemory:
     raid_phase: str = "IDLE"
     raid_interrupted_tick: int | None = None
     raid_containment_mode: bool = False
+    raid_long_range_campaign: LongRangeRaidCampaign | None = None
     counter_siege_target_id: UUID | None = None
     counter_siege_last_seen_tick: int | None = None
     counter_siege_last_position: Position | None = None
@@ -207,6 +217,7 @@ class TacticMemory:
         self.position_history.clear()
         self.last_positions.clear()
         self.worker_escape_states.clear()
+        self.worker_disengage_leases.clear()
         self.worker_scout_states.clear()
         self.worker_task_progress.clear()
         self.worker_resource_backoff.clear()
@@ -263,6 +274,7 @@ class TacticMemory:
         self.squad_rendezvous_leases.clear()
         self.squad_formation_leases.clear()
         self.formation_move_feedback.clear()
+        self.partner_dependency_feedback.clear()
         self.squad_pairing_cooldowns.clear()
         self.squad_target_backoffs.clear()
         self.peaceful_formation_assignment = None
@@ -278,6 +290,7 @@ class TacticMemory:
         self.raid_phase = "IDLE"
         self.raid_interrupted_tick = None
         self.raid_containment_mode = False
+        self.raid_long_range_campaign = None
         self.counter_siege_target_id = None
         self.counter_siege_last_seen_tick = None
         self.counter_siege_last_position = None

@@ -35,6 +35,90 @@ from tests.helpers import enemy_core, friendly_core, make_turn, uid, unit
 
 
 class EconomyAndLogisticsTests(unittest.TestCase):
+    def test_worker_disengages_from_enemy_core_zone_and_ignores_nearby_resource(self) -> None:
+        core = friendly_core(position=(20, 0))
+        memory = TacticMemory(core_id=core.id, core_position=core.position)
+        memory.known_passable.update(
+            (x, y) for x in range(-3, 22) for y in range(-4, 5)
+        )
+        tactic = BalancedTactic(memory=memory)
+        position = (1, 0)
+
+        for tick in range(1, 5):
+            worker = unit(1, UnitType.WORKER, position)
+            turn = make_turn(
+                tick=tick,
+                core=core,
+                units=(worker,),
+                enemies=((enemy_core(99, (0, 0)),) if tick == 1 else ()),
+                resource_cells=((1, 0),),
+                resources=0,
+            )
+            tactic.choose_actions(turn)
+            action = turn.plan.unit_actions[worker.id]
+            self.assertIsInstance(action, MoveAction)
+            task = next(
+                row
+                for row in tactic.last_decision_trace["tasks"]
+                if row["actor_id"] == str(worker.id)
+            )
+            self.assertEqual(task["mission"], "CORE_DISENGAGE")
+            dx, dy = action.direction.delta
+            destination = position[0] + dx, position[1] + dy
+            self.assertGreater(
+                manhattan(destination, (0, 0)),
+                manhattan(position, (0, 0)),
+            )
+            position = destination
+
+        mission = tactic.memory.unit_missions.get(uid(1))
+        self.assertTrue(mission is None or mission.mission is not UnitMission.HARVEST)
+
+    def test_destroyed_enemy_core_releases_controlled_resource_backoff(self) -> None:
+        core = friendly_core(position=(20, 0))
+        hostile_core = enemy_core(99, (0, 0))
+        resource = (1, 0)
+        memory = TacticMemory(core_id=core.id, core_position=core.position)
+        memory.unit_missions[uid(1)] = MissionState(
+            UnitMission.HARVEST,
+            resource,
+            0,
+        )
+        tactic = BalancedTactic(memory=memory)
+        tactic.choose_actions(
+            make_turn(
+                tick=1,
+                core=core,
+                units=(unit(1, UnitType.WORKER, resource),),
+                enemies=(hostile_core,),
+                resource_cells=(resource,),
+                resources=0,
+            )
+        )
+        self.assertIn(resource, tactic.memory.target_backoff_until)
+        destroyed = ResolutionEvent(
+            event_id=uid(901),
+            tick=2,
+            event_type="DESTRUCTION_PARTICIPATION",
+            target_id=hostile_core.id,
+            reason_code="CORE",
+        )
+
+        tactic.choose_actions(
+            make_turn(
+                tick=2,
+                core=core,
+                units=(unit(1, UnitType.WORKER, (2, 0)),),
+                resource_cells=(resource,),
+                events=(destroyed,),
+                resources=0,
+            )
+        )
+
+        self.assertNotIn(resource, tactic.memory.target_backoff_until)
+        self.assertNotIn(uid(99), tactic.memory.enemy_core_control_zones)
+        self.assertNotIn(uid(1), tactic.memory.worker_disengage_leases)
+
     def test_fog_retreat_does_not_undo_a_safe_visible_escape_step(self) -> None:
         core = friendly_core(position=(10, 0))
         worker_id = uid(1)
