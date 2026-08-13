@@ -21,6 +21,7 @@ from arena_hero import (
 )
 from arena_tactic.log_projection import compact_logged_state, compact_strategy_trace
 from arena_tactic.schema import REPLAY_LOG_SCHEMA_VERSION
+from arena_tactic.submission import PendingSubmission, SubmissionResult
 
 
 LOG_SCHEMA_VERSION = REPLAY_LOG_SCHEMA_VERSION
@@ -35,6 +36,10 @@ def _now() -> datetime:
 
 def _model_dump(model: Any) -> dict[str, Any]:
     return model.model_dump(mode="json")
+
+
+def _format_optional_time(value: datetime | None) -> str | None:
+    return None if value is None else value.isoformat(timespec="milliseconds")
 
 
 def _action_type(action: Any) -> str:
@@ -64,6 +69,8 @@ class ReplayLogger:
         endpoint: str = DEFAULT_ENDPOINT,
         request_timeout: float | None = None,
         request_retries: int | None = None,
+        submission_soft_deadline: float | None = None,
+        max_inflight_submissions: int | None = None,
     ) -> None:
         started_at = _now()
         self.session_id = str(uuid4())
@@ -93,6 +100,8 @@ class ReplayLogger:
                 "endpoint": endpoint,
                 "request_timeout": request_timeout,
                 "request_retries": request_retries,
+                "submission_soft_deadline": submission_soft_deadline,
+                "max_inflight_submissions": max_inflight_submissions,
             }
         ):
             raise OSError(f"Could not initialize replay log: {self._io_error}")
@@ -113,9 +122,11 @@ class ReplayLogger:
         secret: str | None = None,
         strategy: dict[str, object] | None = None,
         recoverable: bool = False,
+        pending: PendingSubmission | None = None,
     ) -> bool:
-        if (accepted is None) == (error is None):
-            raise ValueError("Provide exactly one of accepted or error")
+        provided = sum(value is not None for value in (accepted, error, pending))
+        if provided != 1:
+            raise ValueError("Provide exactly one of accepted, error, or pending")
 
         plan = turn.plan
         plan_data = _model_dump(plan)
@@ -141,7 +152,18 @@ class ReplayLogger:
                 "state": turn.core.view.state.value,
             }
 
-        if accepted is not None:
+        if pending is not None:
+            submission: dict[str, Any] = {
+                "status": "pending",
+                "outcome": None,
+                "queued_at": pending.queued_at.isoformat(timespec="milliseconds"),
+                "lane_id": pending.lane_id,
+                "concurrent_count": pending.concurrent_count,
+                "plan_hash": pending.plan_hash,
+                "idempotency_key_reused": pending.reused_request,
+                "attempt_number": pending.attempt_number,
+            }
+        elif accepted is not None:
             submission: dict[str, Any] = {
                 "status": "accepted",
                 "receipt": _model_dump(accepted),
@@ -198,7 +220,8 @@ class ReplayLogger:
             and failure_stage == "submitting"
         )
         if written and (
-            uncertain_agent_submission
+            pending is not None
+            or uncertain_agent_submission
             or (
                 accepted is not None
                 and accepted.source == CommandSource.AGENT
@@ -206,6 +229,59 @@ class ReplayLogger:
         ):
             self._remember_agent_plan(turn.tick, plan_data)
         return written
+
+    def record_submission_result(
+        self,
+        result: SubmissionResult,
+        *,
+        secret: str | None = None,
+    ) -> bool:
+        """Append asynchronous HTTP/receipt evidence without duplicating a Turn."""
+
+        error = None
+        if result.error_type is not None:
+            message = result.error_message or ""
+            if secret:
+                message = message.replace(secret, "[REDACTED]")
+            message = _BEARER_TOKEN.sub("Bearer [REDACTED]", message)
+            error = {
+                "type": result.error_type,
+                "code": result.error_code,
+                "message": message[:2_000],
+            }
+        return self._write(
+            {
+                "record_type": "submission_update",
+                "schema_version": LOG_SCHEMA_VERSION,
+                "recorded_at": result.recorded_at.isoformat(
+                    timespec="milliseconds"
+                ),
+                "tick": result.tick,
+                "event": result.event,
+                "outcome": (
+                    None if result.outcome is None else result.outcome.value
+                ),
+                "lane_id": result.lane_id,
+                "concurrent_count": result.concurrent_count,
+                "plan_hash": result.plan_hash,
+                "timing_ms": {
+                    "queue": result.queue_ms,
+                    "http": result.http_ms,
+                    "receipt": result.receipt_ms,
+                },
+                "queued_at": _format_optional_time(result.queued_at),
+                "started_at": _format_optional_time(result.started_at),
+                "completed_at": _format_optional_time(result.completed_at),
+                "slow_pending": result.slow_pending,
+                "receipt_confirmed": result.receipt_confirmed,
+                "late_result": result.late_result,
+                "idempotency_key_reused": result.reused_request,
+                "attempt_number": result.attempt_number,
+                "accepted_tick": result.accepted_tick,
+                "accepted_at": _format_optional_time(result.accepted_at),
+                "error": error,
+            }
+        )
 
     def record_turn_skip(self, *, tick: int, reason: str) -> bool:
         """Record a Turn deliberately ignored before planning or submission."""

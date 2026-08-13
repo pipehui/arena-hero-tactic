@@ -85,6 +85,12 @@ from .raid import RaidPlanner
 from .service import CoreServiceChoreography, CoreServicePlanner
 from .service_transit import CoreServiceTransitPlanner
 from .state import TacticMemory
+from .submission import (
+    PendingSubmission,
+    SubmissionCoordinator,
+    SubmissionOutcome,
+    SubmissionResult,
+)
 from .trace import DecisionTraceBuilder
 from .worker import WorkerPlanner
 from .tactic import BalancedTactic
@@ -128,6 +134,7 @@ __all__ = (
     "IntentResolver",
     "PatientAdmissionProgress",
     "PairingCooldown",
+    "PendingSubmission",
     "PeacefulFormationAssignment",
     "SquadFormationBundle",
     "SquadFormationLease",
@@ -154,6 +161,9 @@ __all__ = (
     "RaidPlanner",
     "TacticConfig",
     "TacticMemory",
+    "SubmissionCoordinator",
+    "SubmissionOutcome",
+    "SubmissionResult",
     "ThreatHeatCell",
     "ThreatCell",
     "TacticalMap",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -28,6 +29,8 @@ import balanced_tactic
 from arena_tactic import (
     BalancedTactic,
     CrisisForceBaseline,
+    SubmissionCoordinator,
+    SubmissionOutcome,
     TacticMemory,
     ThreatHeatCell,
     WorkerScoutPhase,
@@ -55,6 +58,21 @@ class _EventGame:
 
     def events(self):
         yield from self.events_to_send
+
+    def close(self):
+        return None
+
+
+class _SubmissionClient:
+    def __init__(self, submitter):
+        self._submitter = submitter
+        self.closed = False
+
+    def submit(self, plan, *, idempotency_key=None):
+        return self._submitter(plan, idempotency_key)
+
+    def close(self):
+        self.closed = True
 
 
 class RuntimeAndPersistenceTests(unittest.TestCase):
@@ -96,7 +114,7 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
             self.assertIn(uid(900), restored.enemy_core_intel)
 
     def test_schema_versions_are_upgraded(self) -> None:
-        self.assertEqual(LOG_SCHEMA_VERSION, 42)
+        self.assertEqual(LOG_SCHEMA_VERSION, 43)
         self.assertEqual(EXPLORATION_MEMORY_SCHEMA_VERSION, 13)
 
     def test_main_translates_sigterm_into_a_graceful_service_stop(self) -> None:
@@ -435,7 +453,7 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
             text = logger.path.read_text(encoding="utf-8")
             first = json.loads(text.splitlines()[0])
 
-        self.assertEqual(first["schema_version"], 42)
+        self.assertEqual(first["schema_version"], 43)
         self.assertNotIn("hidden-token", text)
 
     def test_turn_log_contains_detached_schema_41_strategy(self) -> None:
@@ -460,9 +478,9 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
             logger.close(status="completed", last_tick=9)
             records = [json.loads(line) for line in logger.path.read_text(encoding="utf-8").splitlines()]
 
-        self.assertEqual(records[0]["schema_version"], 42)
+        self.assertEqual(records[0]["schema_version"], 43)
         record = next(item for item in records if item["record_type"] == "turn")
-        self.assertEqual(record["strategy"]["schema_version"], 42)
+        self.assertEqual(record["strategy"]["schema_version"], 43)
         self.assertEqual(record["strategy"]["source_trace_schema"], 41)
         self.assertNotIn("tasks", record["strategy"])
         self.assertIn("resolution", record["strategy"])
@@ -562,8 +580,20 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
 
         first = make_turn(tick=42, units=source.state.objects[1:2], submitter=submit)
         duplicate = make_turn(tick=42, units=source.state.objects[1:2], submitter=submit)
+        clients = iter(
+            (
+                _EventGame((first, duplicate)),
+                _SubmissionClient(submit),
+                _SubmissionClient(submit),
+                _SubmissionClient(submit),
+            )
+        )
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(balanced_tactic, "ArenaHeroClient", return_value=_EventGame((first, duplicate))):
+            with patch.object(
+                balanced_tactic,
+                "ArenaHeroClient",
+                side_effect=lambda **_kwargs: next(clients),
+            ):
                 with redirect_stdout(io.StringIO()):
                     balanced_tactic.play("test-key", directory)
             heartbeat = Path(directory) / "watchdog" / "tactic_heartbeat.json"
@@ -573,21 +603,411 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
         self.assertEqual(heartbeat_record["status"], "COMPLETED")
         self.assertEqual(heartbeat_record["tick"], 42)
 
+    def test_slow_submission_does_not_block_receipt_or_next_turn(self) -> None:
+        submission_started = threading.Event()
+        allow_http_completion = threading.Event()
+        next_turn_reached = threading.Event()
+        blocked_event_loop: list[bool] = []
+        submitted: list[tuple[int, str | None]] = []
+
+        def accepted(tick: int) -> Accepted:
+            return Accepted(
+                accepted=True,
+                tick=tick,
+                source=CommandSource.AGENT,
+                received_at=datetime.now(timezone.utc),
+            )
+
+        def slow_submit(plan, key):
+            submitted.append((plan.tick, key))
+            submission_started.set()
+            if not allow_http_completion.wait(0.5):
+                blocked_event_loop.append(True)
+            return accepted(plan.tick)
+
+        def fast_submit(plan, key):
+            submitted.append((plan.tick, key))
+            return accepted(plan.tick)
+
+        first = make_turn(
+            tick=1,
+            units=(unit(1, UnitType.WORKER, (1, 0)),),
+            submitter=slow_submit,
+        )
+        second = make_turn(tick=2, submitter=fast_submit)
+
+        class StreamingGame(_EventGame):
+            def events(self):
+                yield first
+                self.assert_submission_started()
+                yield Received(
+                    tick=1,
+                    source=CommandSource.AGENT,
+                    received_at=datetime.now(timezone.utc),
+                    plan=first.plan.model_copy(deep=True),
+                )
+                allow_http_completion.set()
+                next_turn_reached.set()
+                yield second
+
+            @staticmethod
+            def assert_submission_started():
+                if not submission_started.wait(1.0):
+                    raise AssertionError("background submission did not start")
+
+        event_game = StreamingGame(())
+        clients = iter(
+            (
+                event_game,
+                _SubmissionClient(slow_submit),
+                _SubmissionClient(fast_submit),
+                _SubmissionClient(fast_submit),
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(
+                balanced_tactic,
+                "ArenaHeroClient",
+                side_effect=lambda **_kwargs: next(clients),
+            ):
+                with redirect_stdout(io.StringIO()):
+                    balanced_tactic.play("test-key", directory)
+
+            records = [
+                json.loads(line)
+                for path in Path(directory).glob("*.jsonl")
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertFalse(blocked_event_loop)
+        self.assertTrue(next_turn_reached.is_set())
+        self.assertEqual([tick for tick, _key in submitted], [1, 2])
+        self.assertEqual(
+            [key for _tick, key in submitted],
+            ["arena-balanced-tactic-1", "arena-balanced-tactic-2"],
+        )
+        self.assertEqual(
+            [record["tick"] for record in records if record["record_type"] == "turn"],
+            [1, 2],
+        )
+        receipt_index = next(
+            index
+            for index, record in enumerate(records)
+            if record["record_type"] == "canonical_receipt" and record["tick"] == 1
+        )
+        http_index = next(
+            index
+            for index, record in enumerate(records)
+            if record["record_type"] == "submission_update"
+            and record["tick"] == 1
+            and record["event"] == "HTTP_COMPLETED"
+        )
+        self.assertLess(receipt_index, http_index)
+        self.assertTrue(records[http_index]["late_result"])
+
+    def test_submission_recovery_reuses_exact_plan_and_idempotency_key(self) -> None:
+        calls: list[tuple[dict[str, object], str | None]] = []
+
+        def submit(plan, key):
+            calls.append((plan.model_dump(mode="json"), key))
+            if len(calls) == 1:
+                raise TransportError("unknown after upload")
+            return Accepted(
+                accepted=True,
+                tick=plan.tick,
+                source=CommandSource.AGENT,
+                received_at=datetime.now(timezone.utc),
+            )
+
+        clients = [_SubmissionClient(submit) for _ in range(3)]
+        client_iter = iter(clients)
+        coordinator = SubmissionCoordinator(
+            lambda: next(client_iter),
+            max_inflight_submissions=3,
+            soft_deadline=5.0,
+        )
+        plan = CommandPlan(
+            tick=7,
+            unit_actions={uid(1): MoveAction(direction=Direction.RIGHT)},
+        )
+        try:
+            first = coordinator.enqueue(
+                plan,
+                idempotency_key="arena-balanced-tactic-7",
+            )
+            self.assertIsNotNone(first)
+            self.assertTrue(
+                self._wait_for_submission_outcome(
+                    coordinator,
+                    SubmissionOutcome.HTTP_OUTCOME_UNKNOWN,
+                )
+            )
+            recovered = coordinator.recover(7)
+            self.assertIsNotNone(recovered)
+            self.assertTrue(recovered.reused_request)
+            self.assertTrue(
+                self._wait_for_submission_outcome(
+                    coordinator,
+                    SubmissionOutcome.HTTP_ACCEPTED,
+                )
+            )
+        finally:
+            coordinator.close(timeout=1.0)
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], calls[1])
+        self.assertTrue(all(client.closed for client in clients))
+
+    def test_submission_coordinator_never_exceeds_three_active_lanes(self) -> None:
+        release = threading.Event()
+        started = [threading.Event() for _ in range(3)]
+
+        def client_for(index: int) -> _SubmissionClient:
+            def submit(plan, _key):
+                started[index].set()
+                release.wait(1.0)
+                return Accepted(
+                    accepted=True,
+                    tick=plan.tick,
+                    source=CommandSource.AGENT,
+                    received_at=datetime.now(timezone.utc),
+                )
+
+            return _SubmissionClient(submit)
+
+        clients = [client_for(index) for index in range(3)]
+        client_iter = iter(clients)
+        coordinator = SubmissionCoordinator(
+            lambda: next(client_iter),
+            max_inflight_submissions=3,
+            soft_deadline=5.0,
+        )
+        try:
+            for tick in range(1, 4):
+                self.assertIsNotNone(
+                    coordinator.enqueue(
+                        CommandPlan(tick=tick),
+                        idempotency_key=f"arena-balanced-tactic-{tick}",
+                    )
+                )
+            self.assertTrue(all(event.wait(1.0) for event in started))
+            self.assertTrue(coordinator.saturated)
+            self.assertIsNone(
+                coordinator.enqueue(
+                    CommandPlan(tick=4),
+                    idempotency_key="arena-balanced-tactic-4",
+                )
+            )
+            saturated = coordinator.saturated_result(4)
+            self.assertEqual(
+                saturated.outcome,
+                SubmissionOutcome.SUBMITTER_SATURATED,
+            )
+            self.assertEqual(saturated.concurrent_count, 3)
+        finally:
+            release.set()
+            coordinator.close(timeout=1.0)
+
+    def test_soft_deadline_marks_pending_without_cancelling_submission(self) -> None:
+        release = threading.Event()
+        started = threading.Event()
+
+        def submit(plan, _key):
+            started.set()
+            release.wait(1.0)
+            return Accepted(
+                accepted=True,
+                tick=plan.tick,
+                source=CommandSource.AGENT,
+                received_at=datetime.now(timezone.utc),
+            )
+
+        clients = [_SubmissionClient(submit)]
+        coordinator = SubmissionCoordinator(
+            lambda: clients[0],
+            max_inflight_submissions=1,
+            soft_deadline=0.01,
+        )
+        try:
+            coordinator.enqueue(
+                CommandPlan(tick=1),
+                idempotency_key="arena-balanced-tactic-1",
+            )
+            self.assertTrue(started.wait(1.0))
+            threading.Event().wait(0.02)
+            events = coordinator.poll()
+            self.assertTrue(any(result.event == "SLOW_PENDING" for result in events))
+            self.assertEqual(coordinator.state_for_tick(1), "PENDING")
+            release.set()
+            self.assertTrue(
+                self._wait_for_submission_outcome(
+                    coordinator,
+                    SubmissionOutcome.HTTP_ACCEPTED,
+                )
+            )
+        finally:
+            release.set()
+            coordinator.close(timeout=1.0)
+
+    def test_background_authentication_rejection_remains_fatal(self) -> None:
+        def rejected(_plan, _key):
+            raise APIError(
+                status_code=401,
+                error="UNAUTHORIZED",
+                message="unauthorized",
+            )
+
+        client = _SubmissionClient(rejected)
+        coordinator = SubmissionCoordinator(
+            lambda: client,
+            max_inflight_submissions=1,
+            soft_deadline=5.0,
+        )
+        try:
+            coordinator.enqueue(
+                CommandPlan(tick=1),
+                idempotency_key="arena-balanced-tactic-1",
+            )
+            self.assertTrue(
+                self._wait_for_submission_outcome(
+                    coordinator,
+                    SubmissionOutcome.FATAL_REJECTED,
+                )
+            )
+            fatal = coordinator.take_fatal_error()
+            self.assertIsInstance(fatal, APIError)
+            self.assertEqual(fatal.error, "UNAUTHORIZED")
+        finally:
+            coordinator.close(timeout=1.0)
+
+    def test_old_tick_confirmation_never_labels_future_memory_as_old(self) -> None:
+        release = threading.Event()
+        started = {1: threading.Event(), 2: threading.Event()}
+
+        def submit(plan, _key):
+            started[plan.tick].set()
+            release.wait(1.0)
+            return Accepted(
+                accepted=True,
+                tick=plan.tick,
+                source=CommandSource.AGENT,
+                received_at=datetime.now(timezone.utc),
+            )
+
+        first = make_turn(tick=1)
+        second = make_turn(tick=2)
+
+        class OrderedReceiptGame(_EventGame):
+            def events(self):
+                yield first
+                yield second
+                if not all(event.wait(1.0) for event in started.values()):
+                    raise AssertionError("submissions did not start")
+                yield Received(
+                    tick=1,
+                    source=CommandSource.AGENT,
+                    received_at=datetime.now(timezone.utc),
+                    plan=first.plan.model_copy(deep=True),
+                )
+                yield Received(
+                    tick=2,
+                    source=CommandSource.AGENT,
+                    received_at=datetime.now(timezone.utc),
+                    plan=second.plan.model_copy(deep=True),
+                )
+                release.set()
+
+        class RecordingStore:
+            def __init__(self):
+                self.path = Path("recording-memory.json")
+                self.restored_through_tick = None
+                self.restored_visit_count = 0
+                self.saved_ticks: list[int] = []
+
+            @staticmethod
+            def load():
+                return TacticMemory()
+
+            def save(self, _memory, *, tick, force=False):
+                self.saved_ticks.append(tick)
+                return True
+
+        store = RecordingStore()
+        clients = iter(
+            (
+                OrderedReceiptGame(()),
+                _SubmissionClient(submit),
+                _SubmissionClient(submit),
+                _SubmissionClient(submit),
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(
+                    balanced_tactic,
+                    "ArenaHeroClient",
+                    side_effect=lambda **_kwargs: next(clients),
+                ),
+                patch.object(
+                    balanced_tactic,
+                    "ExplorationMemoryStore",
+                    return_value=store,
+                ),
+                redirect_stdout(io.StringIO()),
+            ):
+                balanced_tactic.play("test-key", directory)
+
+        self.assertTrue(store.saved_ticks)
+        self.assertNotIn(1, store.saved_ticks)
+        self.assertTrue(all(tick == 2 for tick in store.saved_ticks))
+
+    @staticmethod
+    def _wait_for_submission_outcome(
+        coordinator: SubmissionCoordinator,
+        outcome: SubmissionOutcome,
+    ) -> bool:
+        deadline = datetime.now().timestamp() + 1.0
+        while datetime.now().timestamp() < deadline:
+            if any(result.outcome is outcome for result in coordinator.poll()):
+                return True
+            threading.Event().wait(0.005)
+        return False
+
     def test_command_window_closed_is_recoverable(self) -> None:
         calls: list[int] = []
 
         def closed(plan, key):
-            calls.append(plan.tick)
-            raise APIError(
-                status_code=409,
-                error="COMMAND_WINDOW_CLOSED",
-                message="closed",
+            if plan.tick == 1:
+                calls.append(plan.tick)
+                raise APIError(
+                    status_code=409,
+                    error="COMMAND_WINDOW_CLOSED",
+                    message="closed",
+                )
+            return Accepted(
+                accepted=True,
+                tick=plan.tick,
+                source=CommandSource.AGENT,
+                received_at=datetime.now(timezone.utc),
             )
 
         second = make_turn(tick=2)
         first = make_turn(tick=1, submitter=closed)
+        clients = iter(
+            (
+                _EventGame((first, second)),
+                _SubmissionClient(closed),
+                _SubmissionClient(closed),
+                _SubmissionClient(closed),
+            )
+        )
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(balanced_tactic, "ArenaHeroClient", return_value=_EventGame((first, second))):
+            with patch.object(
+                balanced_tactic,
+                "ArenaHeroClient",
+                side_effect=lambda **_kwargs: next(clients),
+            ):
                 with redirect_stdout(io.StringIO()):
                     balanced_tactic.play("test-key", directory)
 
@@ -598,15 +1018,32 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
         client_options: list[dict[str, object]] = []
 
         def uncertain(plan, key):
-            calls.append(plan.tick)
-            raise TransportError("timed out after upload")
+            if plan.tick == 1:
+                calls.append(plan.tick)
+                raise TransportError("timed out after upload")
+            return Accepted(
+                accepted=True,
+                tick=plan.tick,
+                source=CommandSource.AGENT,
+                received_at=datetime.now(timezone.utc),
+            )
 
         first = make_turn(tick=1, submitter=uncertain)
         second = make_turn(tick=2)
 
+        event_game = _EventGame((first, second))
+        clients = iter(
+            (
+                event_game,
+                _SubmissionClient(uncertain),
+                _SubmissionClient(uncertain),
+                _SubmissionClient(uncertain),
+            )
+        )
+
         def client_factory(**kwargs):
             client_options.append(kwargs)
-            return _EventGame((first, second))
+            return next(clients)
 
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(
@@ -624,13 +1061,22 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
             ]
 
         self.assertEqual(calls, [1])
-        self.assertEqual(client_options[0]["request_timeout"], 2.5)
-        self.assertEqual(client_options[0]["request_retries"], 1)
-        failure = next(record for record in records if record.get("tick") == 1)
-        self.assertTrue(failure["submission"]["recoverable"])
-        self.assertEqual(failure["submission"]["outcome"], "unknown")
+        self.assertEqual(len(client_options), 4)
+        self.assertTrue(
+            all(options["request_timeout"] == 2.5 for options in client_options)
+        )
+        self.assertTrue(
+            all(options["request_retries"] == 1 for options in client_options)
+        )
+        failure = next(
+            record
+            for record in records
+            if record.get("tick") == 1
+            and record.get("record_type") == "submission_update"
+            and record.get("outcome") == "HTTP_OUTCOME_UNKNOWN"
+        )
         self.assertEqual(
-            failure["submission"]["error"]["type"],
+            failure["error"]["type"],
             "TransportError",
         )
 

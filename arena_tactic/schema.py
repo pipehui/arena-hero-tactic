@@ -1,7 +1,7 @@
 """Version identifiers shared by runtime traces, logs, and checkpoints."""
 
 STRATEGY_LOG_SCHEMA_VERSION = 41
-REPLAY_LOG_SCHEMA_VERSION = 42
+REPLAY_LOG_SCHEMA_VERSION = 43
 EXPLORATION_MEMORY_SCHEMA_VERSION = 13
 
 
