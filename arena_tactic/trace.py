@@ -668,6 +668,10 @@ class DecisionTraceBuilder:
                     "stalled_ticks": state.stalled_ticks,
                     "loop_period": state.loop_period,
                     "route_version": state.route_version,
+                    "waypoint_assigned_tick": state.waypoint_assigned_tick,
+                    "waypoint_expires_tick": state.waypoint_expires_tick,
+                    "waypoint_invalid_reason": state.waypoint_invalid_reason,
+                    "last_waypoint_distance": state.last_waypoint_distance,
                 }
                 for worker_id, state in sorted(
                     self.memory.worker_escape_states.items(),
@@ -696,7 +700,10 @@ class DecisionTraceBuilder:
         dynamic_fire_lines = [
             intent
             for intent in resolution.selected
-            if intent.reason == "ADVANCE_TO_DYNAMIC_FIRE_LINE"
+            if intent.reason in {
+                "ADVANCE_TO_DYNAMIC_FIRE_LINE",
+                "LOW_VALUE_FIRE_REPOSITION",
+            }
         ]
         vanguard_intercepts = [
             intent
@@ -780,6 +787,15 @@ class DecisionTraceBuilder:
                     ),
                     "candidate_coverage": dict(intent.metadata).get(
                         "candidate_coverage"
+                    ),
+                    "candidate_rank_limit": dict(intent.metadata).get(
+                        "candidate_rank_limit"
+                    ),
+                    "first_step_high_value_coverage": dict(intent.metadata).get(
+                        "first_step_high_value_coverage"
+                    ),
+                    "low_value_fire_rejected": dict(intent.metadata).get(
+                        "rejected_low_rank_fire"
                     ),
                     "screening_role": dict(intent.metadata).get(
                         "screening_role"
@@ -924,6 +940,45 @@ class DecisionTraceBuilder:
             "home_defense_alert_active": (
                 self.memory.home_defense_alert_until >= world.tick
             ),
+            "defense_trigger": {
+                "global_home_pool": [
+                    {
+                        "enemy_id": str(enemy.enemy_id),
+                        "distance": manhattan(
+                            enemy.observed_position, world.core.position
+                        ),
+                        "reason": (
+                            "INSIDE_HOME_ENGAGE"
+                            if manhattan(
+                                enemy.observed_position, world.core.position
+                            ) <= self.config.home_engage_radius
+                            else "FOUR_TICK_APPROACH"
+                        ),
+                    }
+                    for enemy in projection.enemies
+                    if world.core is not None
+                    and enemy.visible_now
+                    and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+                    and manhattan(enemy.observed_position, world.core.position)
+                    <= self.config.home_engage_radius + 4
+                ],
+                "outer_screen_only": [
+                    {
+                        "enemy_id": str(enemy.enemy_id),
+                        "distance": manhattan(
+                            enemy.observed_position, world.core.position
+                        ),
+                        "reason": "REMOTE_LOCAL_SCREEN",
+                    }
+                    for enemy in projection.enemies
+                    if world.core is not None
+                    and enemy.visible_now
+                    and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+                    and self.config.home_engage_radius + 4
+                    < manhattan(enemy.observed_position, world.core.position)
+                    <= self.config.home_warning_radius
+                ],
+            },
             "formation": self._formation_dict(world, resolution),
             "squads": [
                 {
@@ -1002,7 +1057,24 @@ class DecisionTraceBuilder:
                 key: {"cell": list(value[0]), "assigned_tick": value[1]}
                 for key, value in sorted(self.memory.defense_sector_anchors.items())
             },
-            "ranger_suppressed_cells": len(self.memory.ranger_shot_feedback),
+            "ranger_suppressed_cells": sum(
+                feedback.misses >= self.config.ranger_repeat_miss_limit
+                for feedback in self.memory.ranger_shot_feedback.values()
+            ),
+            "ranger_shot_feedback": [
+                {
+                    "target_id": str(feedback.target_id),
+                    "cell": list(feedback.expected_cell),
+                    "consecutive_misses": feedback.misses,
+                    "suppressed_until": feedback.suppressed_until,
+                    "last_evidence_tick": feedback.last_evidence_tick,
+                    "release_reason": feedback.release_reason,
+                }
+                for feedback in sorted(
+                    self.memory.ranger_shot_feedback.values(),
+                    key=lambda item: (item.target_id.bytes, item.expected_cell),
+                )
+            ],
             "vanguard_suppressed_cells": len(self.memory.vanguard_sweep_feedback),
             "raid": {
                 "phase": self.memory.raid_phase,
@@ -1129,6 +1201,7 @@ class DecisionTraceBuilder:
                     "stalled_ticks": lease.stalled_ticks,
                     "blocked_ticks": lease.blocked_ticks,
                     "partner_hold_ticks": lease.partner_hold_ticks,
+                    "partner_progressing": lease.partner_progressing,
                     "last_rejection_reason": lease.last_rejection_reason,
                 }
                 for lease in sorted(
@@ -1152,6 +1225,9 @@ class DecisionTraceBuilder:
                     ),
                     "rejection_reason": feedback.rejection_reason,
                     "consecutive_blocked_ticks": feedback.consecutive_blocked_ticks,
+                    "consecutive_partner_wait_ticks": (
+                        feedback.consecutive_partner_wait_ticks
+                    ),
                 }
                 for feedback in sorted(
                     self.memory.formation_move_feedback.values(),

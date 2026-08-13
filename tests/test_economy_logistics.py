@@ -26,7 +26,7 @@ from arena_tactic import (
     WorkerScoutPhase,
     WorkerScoutState,
 )
-from arena_tactic.models import MissionState
+from arena_tactic.models import MissionState, WorkerEscapeState
 from arena_tactic.geometry import add_direction, manhattan
 from arena_tactic.planning import weighted_route_to
 from arena_tactic.resource_allocator import minimum_cost_matching
@@ -35,6 +35,119 @@ from tests.helpers import enemy_core, friendly_core, make_turn, uid, unit
 
 
 class EconomyAndLogisticsTests(unittest.TestCase):
+    def test_fog_retreat_does_not_undo_a_safe_visible_escape_step(self) -> None:
+        core = friendly_core(position=(10, 0))
+        worker_id = uid(1)
+        tactic = BalancedTactic()
+        visible = make_turn(
+            tick=1,
+            core=core,
+            units=(unit(1, UnitType.WORKER, (0, 0), cargo=1),),
+            enemies=(unit(100, UnitType.VANGUARD, (2, 0), controlled=False),),
+            resources=0,
+        )
+        tactic.choose_actions(visible)
+        self.assertEqual(visible.plan.unit_actions[worker_id].direction, Direction.LEFT)
+
+        fogged = make_turn(
+            tick=2,
+            core=core,
+            units=(unit(1, UnitType.WORKER, (-1, 0), cargo=1),),
+            enemies=(),
+            resources=0,
+        )
+        tactic.choose_actions(fogged)
+
+        action = fogged.plan.unit_actions[worker_id]
+        self.assertIsInstance(action, MoveAction)
+        dx, dy = action.direction.delta
+        destination = (-1 + dx, dy)
+        # At age one the conservative distance is d(last_seen)-1.  Returning
+        # right would reduce it from two to one and re-enter the pursuit lane.
+        before = max(0, manhattan((-1, 0), (2, 0)) - 1)
+        after = max(0, manhattan(destination, (2, 0)) - 1)
+        self.assertGreaterEqual(after, before)
+
+    def test_escape_loop_keeps_a_valid_waypoint_lease(self) -> None:
+        core = friendly_core(position=(10, 0))
+        worker = unit(1, UnitType.WORKER, (0, 0), cargo=1)
+        threat = unit(100, UnitType.VANGUARD, (2, 0), controlled=False)
+        tactic = BalancedTactic()
+        tactic.choose_actions(
+            make_turn(
+                tick=1,
+                core=core,
+                units=(worker,),
+                enemies=(threat,),
+                resources=0,
+            )
+        )
+        tactic.memory.position_history[worker.id] = (
+            (0, 0),
+            (-1, 0),
+            (0, 0),
+            (-1, 0),
+            (0, 0),
+        )
+        tactic.memory.worker_escape_states[worker.id] = WorkerEscapeState(
+            phase="FLEEING",
+            threat_ids=(threat.id,),
+            last_threat_tick=1,
+            waypoint=(-4, 0),
+            last_min_enemy_distance=2,
+            route_version=1,
+            waypoint_assigned_tick=1,
+            waypoint_expires_tick=5,
+        )
+
+        tactic.choose_actions(
+            make_turn(
+                tick=2,
+                core=core,
+                units=(worker,),
+                enemies=(threat,),
+                resources=0,
+            )
+        )
+
+        state = tactic.memory.worker_escape_states[worker.id]
+        self.assertEqual(state.waypoint, (-4, 0))
+        self.assertEqual(state.route_version, 1)
+
+    def test_clear_core_only_requires_a_locally_viable_exit(self) -> None:
+        worker = unit(1, UnitType.WORKER, (0, 0))
+        memory = TacticMemory(
+            core_id=uid(10_000),
+            core_position=(0, 0),
+            opening_complete=True,
+            worker_scout_states={
+                worker.id: WorkerScoutState(
+                    worker_id=worker.id,
+                    slot=0,
+                    sector_index=0,
+                    stage=0,
+                    phase=WorkerScoutPhase.SECTOR_SCOUT,
+                    target=(300, 0),
+                    assigned_tick=1,
+                )
+            },
+        )
+        memory.known_passable.update((x, 0) for x in range(0, 301))
+        memory.known_passable.update({(-1, 0), (0, 1), (0, -1), (1, 1), (1, -1)})
+        turn = make_turn(tick=2, units=(worker,), resources=0)
+
+        tactic = BalancedTactic(memory=memory)
+        tactic.choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.unit_actions[worker.id], MoveAction)
+        task = next(
+            item
+            for item in tactic.last_decision_trace["tasks"]
+            if item["actor_id"] == str(worker.id)
+        )
+        self.assertEqual(task["mission"], "CLEAR_CORE")
+        self.assertNotEqual(task["reason"], "CORE_EXIT_BLOCKED")
+
     def test_wartime_existing_worker_stack_is_actively_separated(self) -> None:
         core = friendly_core(position=(0, 0))
         first = unit(1, UnitType.WORKER, (3, 0))
@@ -622,7 +735,7 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         self.assertEqual(len(set(posts.values())), len(workers))
         self.assertTrue(all(manhattan((0, 0), post) in {6, 8} for post in posts.values()))
 
-    def test_full_storage_home_guard_yields_the_combat_exclusive_area(self) -> None:
+    def test_remote_contact_does_not_displace_full_storage_home_guard(self) -> None:
         workers = tuple(
             unit(index, UnitType.WORKER, (0, 0), cargo=1)
             for index in range(1, 7)
@@ -648,7 +761,12 @@ class EconomyAndLogisticsTests(unittest.TestCase):
             for post in tactic.memory.worker_home_guard_targets.values()
         }
         self.assertTrue(distances)
-        self.assertTrue(all(distance > tactic.config.combat_exclusive_radius for distance in distances))
+        self.assertTrue(
+            all(
+                distance in tactic.config.worker_full_storage_guard_radii
+                for distance in distances
+            )
+        )
         self.assertFalse(distances & set(tactic.config.peaceful_squad_radii))
 
     def test_damage_heat_persists_and_decays_after_exact_tracks_expire(self) -> None:
@@ -2711,7 +2829,7 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         task = next(item for item in tactic.last_decision_trace["tasks"] if item["actor_id"] == str(worker.id))
         self.assertEqual(task["mission"], "ESCAPE")
 
-    def test_escape_preserves_fresh_threats_and_does_not_immediately_backtrack(self) -> None:
+    def test_escape_preserves_fresh_threats_and_uses_the_only_safe_retreat(self) -> None:
         core = friendly_core(position=(40, -1))
         worker_id = uid(1)
         tactic = BalancedTactic()
@@ -2745,7 +2863,7 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         self.assertEqual(set(state.threat_ids), {uid(100), uid(101), uid(102)})
         action = second.plan.unit_actions[worker_id]
         self.assertIsInstance(action, MoveAction)
-        self.assertNotEqual(action.direction, Direction.DOWN)
+        self.assertEqual(action.direction, Direction.DOWN)
 
     def test_deposited_worker_receives_scout_target_before_leaving_core(self) -> None:
         worker_id = uid(1)

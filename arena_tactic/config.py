@@ -86,6 +86,7 @@ class TacticConfig:
     worker_escape_plan_node_limit: int = 64
     worker_escape_replan_ticks: int = 2
     worker_escape_max_loop_period: int = 4
+    worker_escape_waypoint_lease_ticks: int = 4
     # Once Core storage is saturated, Workers still return home, but spread
     # across dedicated non-combat rings instead of joining the deposit lane.
     # A small hysteresis prevents one point of healing/repair from summoning
@@ -125,6 +126,7 @@ class TacticConfig:
     formation_target_backoff_ticks: int = 8
     formation_pair_cooldown_ticks: int = 8
     formation_partner_hold_ticks: int = 2
+    formation_max_route_distance: int = 12
     formation_yield_ticks: int = 2
     tactical_position_lease_ticks: int = 4
     ranger_repeat_miss_limit: int = 2
@@ -214,6 +216,7 @@ class TacticConfig:
             self.worker_escape_plan_node_limit,
             self.worker_escape_replan_ticks,
             self.worker_escape_max_loop_period,
+            self.worker_escape_waypoint_lease_ticks,
             self.worker_full_storage_release_space,
             self.worker_full_storage_replenishers,
             self.home_warning_radius,
@@ -243,6 +246,7 @@ class TacticConfig:
             self.formation_target_backoff_ticks,
             self.formation_pair_cooldown_ticks,
             self.formation_partner_hold_ticks,
+            self.formation_max_route_distance,
             self.formation_yield_ticks,
             self.tactical_position_lease_ticks,
             self.ranger_repeat_miss_limit,

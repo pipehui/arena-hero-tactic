@@ -16,6 +16,7 @@ from .geometry import (
     manhattan_ring,
     ranger_firing_positions,
     ranger_line_is_clear,
+    unit_attack_cells,
 )
 from .models import (
     ActionIntent,
@@ -71,13 +72,18 @@ class DefensePlanner:
             if unit.hp * 2 > UNIT_MAX_HP[unit.unit_type]
         )
         visible_by_id = {enemy.id: enemy for enemy in world.enemies}
-        current_threat_intel = tuple(
+        warning_intel = tuple(
             enemy
             for enemy in projection.enemies
             if enemy.visible_now
             and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
             and manhattan(enemy.observed_position, world.core.position)
             <= self.config.home_warning_radius
+        )
+        current_threat_intel = tuple(
+            enemy
+            for enemy in warning_intel
+            if self._requires_home_pool(world, enemy)
         )
         threats = tuple(
             visible_by_id[enemy.enemy_id]
@@ -163,6 +169,27 @@ class DefensePlanner:
             protected,
         )
 
+    def _requires_home_pool(self, world: WorldModel, enemy) -> bool:
+        """Keep outer contacts local unless they can reach the home fight soon."""
+
+        assert world.core is not None
+        distance = manhattan(enemy.observed_position, world.core.position)
+        if distance <= self.config.home_engage_radius + 4:
+            return True
+        attacked = unit_attack_cells(
+            enemy.observed_position,
+            enemy.unit_type,
+            world.known_obstacles,
+        )
+        if world.core.position in attacked:
+            return True
+        return any(
+            friendly.position in attacked
+            and manhattan(friendly.position, world.core.position)
+            <= self.config.home_engage_radius
+            for friendly in world.friendlies
+        )
+
     def observe_resolution(
         self,
         world: WorldModel,
@@ -231,6 +258,14 @@ class DefensePlanner:
                 and previous.target_position == selected.target_position
                 else int(blocked_now)
             )
+            partner_wait_now = selected.reason == "WAIT_FOR_PARTNER_PROGRESS"
+            consecutive_partner_wait = (
+                previous.consecutive_partner_wait_ticks + 1
+                if partner_wait_now
+                and previous is not None
+                and previous.tick == world.tick - 1
+                else int(partner_wait_now)
+            )
             self.memory.formation_move_feedback[actor_id] = FormationMoveFeedback(
                 actor_id=actor_id,
                 tick=world.tick,
@@ -239,6 +274,7 @@ class DefensePlanner:
                 target_position=selected.target_position,
                 rejection_reason=rejection,
                 consecutive_blocked_ticks=consecutive_blocked,
+                consecutive_partner_wait_ticks=consecutive_partner_wait,
             )
 
     def _screening_intents(
@@ -1013,24 +1049,21 @@ class DefensePlanner:
             )
 
         unassigned = tuple(key for key in order if key not in assigned)
+        unassigned_units: list[EntitySnapshot] = []
         for key in unassigned:
             _, vanguard, ranger, _, _ = entry_by_key[key]
             self.memory.squad_formation_leases.pop(key, None)
-            for unit in (vanguard, ranger):
-                intents.append(
-                    ActionIntent.simple(
-                        unit.id,
-                        IntentAction.WAIT,
-                        UnitMission.PATROL,
-                        72,
-                        target_position=unit.position,
-                        reason="NO_VIABLE_FORMATION_MOVE",
-                        metadata=(
-                            ("hold_class", "NO_VIABLE_MOVE"),
-                            ("candidate_count", len(candidate_map[key])),
-                        ),
-                    )
+            unassigned_units.extend((vanguard, ranger))
+        if unassigned_units:
+            intents.extend(
+                self._reserve_patrol_intents(
+                    world,
+                    projection,
+                    tuple(unassigned_units),
+                    set(),
+                    frozenset(set(protected) | set(all_reserved)),
                 )
+            )
         self.memory.peaceful_formation_assignment = PeacefulFormationAssignment(
             tick=world.tick,
             bundles=tuple(
@@ -1138,6 +1171,14 @@ class DefensePlanner:
         )[: self.config.formation_candidate_limit * 2]
         candidates: list[SquadFormationBundle] = []
         for anchor in anchors:
+            vanguard_feedback = self.memory.formation_move_feedback.get(vanguard.id)
+            if (
+                anchor == vanguard.position
+                and vanguard_feedback is not None
+                and vanguard_feedback.consecutive_partner_wait_ticks
+                >= self.config.formation_partner_hold_ticks
+            ):
+                continue
             vanguard_route = self._cached_formation_route(
                 world,
                 vanguard.position,
@@ -1146,6 +1187,8 @@ class DefensePlanner:
                 route_cache,
             )
             if vanguard_route is None:
+                continue
+            if vanguard_route.distance > self.config.formation_max_route_distance:
                 continue
             firing_band = tuple(
                 cell
@@ -1160,6 +1203,14 @@ class DefensePlanner:
             for support in firing_band:
                 if support == anchor:
                     continue
+                ranger_feedback = self.memory.formation_move_feedback.get(ranger.id)
+                if (
+                    support == ranger.position
+                    and ranger_feedback is not None
+                    and ranger_feedback.consecutive_partner_wait_ticks
+                    >= self.config.formation_partner_hold_ticks
+                ):
+                    continue
                 backoff_key = (*key, anchor, support)
                 if self.memory.squad_target_backoffs.get(backoff_key, 0) >= world.tick:
                     continue
@@ -1171,6 +1222,8 @@ class DefensePlanner:
                     route_cache,
                 )
                 if ranger_route is None:
+                    continue
+                if ranger_route.distance > self.config.formation_max_route_distance:
                     continue
                 if (
                     vanguard_route.first_position == ranger.position
@@ -1321,16 +1374,32 @@ class DefensePlanner:
             else 0
         )
         one_arrived = v_arrived != r_arrived
+        partner_progressing = bool(
+            (
+                v_arrived
+                and not r_arrived
+                and r_distance is not None
+                and previous.ranger_best_distance is not None
+                and r_distance < previous.ranger_best_distance
+            )
+            or (
+                r_arrived
+                and not v_arrived
+                and v_distance is not None
+                and previous.vanguard_best_distance is not None
+                and v_distance < previous.vanguard_best_distance
+            )
+        )
         hold_ticks = (
             previous.partner_hold_ticks + 1
-            if one_arrived and consecutive
+            if one_arrived and partner_progressing and consecutive
             else (1 if one_arrived else 0)
         )
         completed = v_arrived and r_arrived
         invalid = (
             stalled >= self.config.formation_target_stall_ticks
             or blocked_ticks >= self.config.formation_target_stall_ticks
-            or hold_ticks > self.config.formation_partner_hold_ticks
+            or hold_ticks >= self.config.formation_partner_hold_ticks
         )
         if completed or invalid:
             if invalid:
@@ -1359,6 +1428,7 @@ class DefensePlanner:
             stalled_ticks=stalled,
             blocked_ticks=blocked_ticks,
             partner_hold_ticks=hold_ticks,
+            partner_progressing=partner_progressing,
             last_vanguard_position=vanguard.position,
             last_ranger_position=ranger.position,
             last_rejection_reason=rejection,
@@ -1403,6 +1473,10 @@ class DefensePlanner:
                     (vanguard.position == bundle.anchor)
                     != (ranger.position == bundle.support)
                 ),
+                partner_progressing=(
+                    (vanguard.position == bundle.anchor)
+                    != (ranger.position == bundle.support)
+                ),
                 last_vanguard_position=vanguard.position,
                 last_ranger_position=ranger.position,
             )
@@ -1427,6 +1501,18 @@ class DefensePlanner:
         reason: str,
     ) -> list[ActionIntent]:
         if unit.position == target:
+            key = (
+                (unit.id, partner.id)
+                if unit.unit_type is UnitType.VANGUARD
+                else (partner.id, unit.id)
+            )
+            lease = self.memory.squad_formation_leases.get(key)
+            partner_progressing = bool(
+                lease is not None
+                and lease.partner_progressing
+                and lease.partner_hold_ticks
+                <= self.config.formation_partner_hold_ticks
+            )
             return [
                 ActionIntent.simple(
                     unit.id,
@@ -1434,11 +1520,16 @@ class DefensePlanner:
                     UnitMission.PATROL,
                     72,
                     target_position=target,
-                    reason="WAIT_FOR_PARTNER_PROGRESS",
+                    reason=(
+                        "WAIT_FOR_PARTNER_PROGRESS"
+                        if partner_progressing
+                        else "FORMATION_TARGET_HOLD"
+                    ),
                     metadata=(
                         ("hold_class", "PARTNER_PROGRESS_HOLD"),
                         ("partner_id", str(partner.id)),
                         ("formation_role", reason),
+                        ("partner_progressing", partner_progressing),
                     ),
                 )
             ]

@@ -829,6 +829,8 @@ class ShotFeedback:
     expected_cell: Position
     misses: int
     suppressed_until: int
+    last_evidence_tick: int | None = None
+    release_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -850,6 +852,10 @@ class WorkerEscapeState:
     stalled_ticks: int = 0
     loop_period: int | None = None
     route_version: int = 0
+    waypoint_assigned_tick: int | None = None
+    waypoint_expires_tick: int | None = None
+    waypoint_invalid_reason: str | None = None
+    last_waypoint_distance: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -947,6 +953,7 @@ class SquadFormationLease:
     stalled_ticks: int = 0
     blocked_ticks: int = 0
     partner_hold_ticks: int = 0
+    partner_progressing: bool = False
     last_vanguard_position: Position | None = None
     last_ranger_position: Position | None = None
     last_rejection_reason: str | None = None
@@ -963,6 +970,7 @@ class FormationMoveFeedback:
     target_position: Position | None
     rejection_reason: str | None = None
     consecutive_blocked_ticks: int = 0
+    consecutive_partner_wait_ticks: int = 0
 
 
 @dataclass(frozen=True, slots=True)

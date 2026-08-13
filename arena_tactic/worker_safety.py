@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
+from uuid import UUID
 
 from arena_hero import Direction, Position, UnitType
 
-from .geometry import cardinal_neighbors, manhattan
+from .geometry import cardinal_neighbors, manhattan, unit_attack_cells
 from .models import EntitySnapshot, WorldModel
 from .planning import move_viability, Route, weighted_route_to
 from .projection import TacticalMap
@@ -40,12 +42,97 @@ class WorkerStepSafety:
 class WorkerSafetyEvaluator:
     """One source of truth for Worker risk and two-step survivability."""
 
+    def __init__(self) -> None:
+        self._threat_layer_cache: dict[
+            tuple[int, tuple[UUID, ...], int],
+            tuple[dict[Position, int], ...],
+        ] = {}
+
+    def threat_layers(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        threat_ids: tuple[UUID, ...],
+        depth_limit: int,
+    ) -> tuple[dict[Position, int], ...]:
+        """Conservative attack envelopes after each future movement phase."""
+
+        key = (
+            projection.tick,
+            tuple(sorted(threat_ids, key=lambda item: item.bytes)),
+            depth_limit,
+        )
+        cached = self._threat_layer_cache.get(key)
+        if cached is not None:
+            return cached
+        if len(self._threat_layer_cache) > 32:
+            self._threat_layer_cache.clear()
+        positions = {
+            enemy.enemy_id: (
+                {enemy.observed_position}
+                if enemy.visible_now
+                else set(enemy.possible_positions)
+            )
+            for enemy in projection.enemies
+            if enemy.enemy_id in threat_ids
+        }
+        unit_types = {
+            enemy.enemy_id: enemy.unit_type
+            for enemy in projection.enemies
+            if enemy.enemy_id in positions
+        }
+        layers: list[dict[Position, int]] = []
+        for depth in range(depth_limit + 1):
+            attackers: Counter[Position] = Counter()
+            for enemy_id, enemy_positions in positions.items():
+                attacked: set[Position] = set()
+                for position in enemy_positions:
+                    attacked.update(
+                        unit_attack_cells(
+                            position,
+                            unit_types[enemy_id],
+                            world.known_obstacles,
+                        )
+                    )
+                attackers.update(attacked)
+            layers.append(dict(attackers))
+            if depth == depth_limit:
+                break
+            positions = {
+                enemy_id: enemy_positions
+                | {
+                    neighbor
+                    for position in enemy_positions
+                    for _, neighbor in cardinal_neighbors(position)
+                    if neighbor not in world.known_obstacles
+                }
+                for enemy_id, enemy_positions in positions.items()
+            }
+        result = tuple(layers)
+        self._threat_layer_cache[key] = result
+        return result
+
+    def projected_attackers(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        cell: Position,
+        *,
+        depth: int,
+        threat_ids: tuple[UUID, ...],
+        depth_limit: int,
+    ) -> int:
+        if not threat_ids:
+            return 0
+        layers = self.threat_layers(world, projection, threat_ids, depth_limit)
+        return layers[min(depth, len(layers) - 1)].get(cell, 0)
+
     @staticmethod
     def route_costs(projection: TacticalMap) -> dict[Position, int]:
         return dict(projection.route_costs_for(UnitType.WORKER))
 
-    @staticmethod
     def forward_safe_exits(
+        self,
         world: WorldModel,
         projection: TacticalMap,
         position: Position,
@@ -53,7 +140,19 @@ class WorkerSafetyEvaluator:
         *,
         origin: Position | None = None,
         target: Position | None = None,
+        threat_ids: tuple[UUID, ...] = (),
+        threat_depth: int = 1,
     ) -> int:
+        layers = (
+            self.threat_layers(
+                world,
+                projection,
+                threat_ids,
+                max(1, threat_depth),
+            )
+            if threat_ids
+            else ()
+        )
         return sum(
             neighbor != origin
             and neighbor not in world.known_obstacles
@@ -61,11 +160,15 @@ class WorkerSafetyEvaluator:
             and (neighbor in world.known_passable or neighbor == target)
             and projection.immediate_attackers(neighbor) < hp
             and projection.future_attackers(neighbor) < hp
+            and (
+                not layers
+                or layers[min(threat_depth, len(layers) - 1)].get(neighbor, 0) < hp
+            )
             for _, neighbor in cardinal_neighbors(position)
         )
 
-    @staticmethod
     def survival_terminals(
+        self,
         world: WorldModel,
         projection: TacticalMap,
         start: Position,
@@ -75,7 +178,20 @@ class WorkerSafetyEvaluator:
         depth_limit: int = 2,
         node_limit: int = 32,
         target: Position | None = None,
+        threat_ids: tuple[UUID, ...] = (),
     ) -> int:
+        threat_layers = (
+            self.threat_layers(
+                world,
+                projection,
+                threat_ids,
+                depth_limit,
+            )
+            if threat_ids
+            else ()
+        )
+        if threat_layers and threat_layers[0].get(start, 0) >= hp:
+            return 0
         frontier = [(start, 0)]
         visited = {start}
         if origin is not None:
@@ -94,6 +210,11 @@ class WorkerSafetyEvaluator:
                     or (neighbor not in world.known_passable and neighbor != target)
                     or projection.immediate_attackers(neighbor) >= hp
                     or projection.future_attackers(neighbor) >= hp
+                    or (
+                        threat_layers
+                        and threat_layers[min(depth + 1, depth_limit)].get(neighbor, 0)
+                        >= hp
+                    )
                 ):
                     continue
                 visited.add(neighbor)

@@ -149,7 +149,14 @@ def _sync_events(
             if plan is not None:
                 key = plan.target_id, plan.expected_cell
                 if event.event_type == "SHOT_HIT":
-                    memory.ranger_shot_feedback.pop(key, None)
+                    memory.ranger_shot_feedback[key] = ShotFeedback(
+                        target_id=plan.target_id,
+                        expected_cell=plan.expected_cell,
+                        misses=0,
+                        suppressed_until=turn.tick,
+                        last_evidence_tick=turn.tick,
+                        release_reason="SHOT_HIT",
+                    )
                 else:
                     previous = memory.ranger_shot_feedback.get(key)
                     misses = 1 if previous is None else previous.misses + 1
@@ -158,6 +165,8 @@ def _sync_events(
                         expected_cell=plan.expected_cell,
                         misses=misses,
                         suppressed_until=turn.tick,
+                        last_evidence_tick=turn.tick,
+                        release_reason=None,
                     )
         if event.event_type == "SWEEP_RESOLVED" and event.actor_id is not None:
             plan = memory.last_vanguard_sweeps.get(event.actor_id)
@@ -175,6 +184,8 @@ def _sync_events(
                         expected_cell=plan.expected_cell,
                         misses=misses,
                         suppressed_until=turn.tick,
+                        last_evidence_tick=turn.tick,
+                        release_reason=None,
                     )
         if event.event_type == "DEPOSIT_SUCCEEDED" and event.actor_id is not None:
             # The delivery completes the old resource work order.  Keep the

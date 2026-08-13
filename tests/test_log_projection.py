@@ -54,7 +54,7 @@ class LogProjectionTests(unittest.TestCase):
         compact = compact_strategy_trace(trace)
 
         self.assertEqual(trace, original)
-        self.assertEqual(compact["schema_version"], 38)
+        self.assertEqual(compact["schema_version"], 39)
         self.assertEqual(compact["source_trace_schema"], 36)
         self.assertNotIn("tasks", compact)
         decision = compact["decisions"][0]

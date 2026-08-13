@@ -120,7 +120,7 @@ class WorkerPlanner:
             or any(
                 enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
                 and manhattan(enemy.position, world.core.position)
-                <= self.config.home_warning_radius
+                <= self.config.home_engage_radius + 4
                 for enemy in world.enemies
             )
         )
@@ -336,7 +336,8 @@ class WorkerPlanner:
             self.memory.home_defense_alert_until >= world.tick
             or any(
                 enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
-                and manhattan(enemy.position, core) <= self.config.home_warning_radius
+                and manhattan(enemy.position, core)
+                <= self.config.home_engage_radius + 4
                 for enemy in world.enemies
             )
         )
@@ -1214,22 +1215,51 @@ class WorkerPlanner:
                 or previous.last_min_enemy_distance is None
                 or minimum > previous.last_min_enemy_distance
             )
+            waypoint_progressed = bool(
+                previous is not None
+                and previous.waypoint is not None
+                and previous.last_waypoint_distance is not None
+                and manhattan(worker.position, previous.waypoint)
+                < previous.last_waypoint_distance
+            )
             stalled = (
                 previous.stalled_ticks + 1
-                if same_threats and not improved
+                if same_threats and not improved and not waypoint_progressed
                 else 0
             )
             history = self.memory.position_history.get(worker.id, ())
             loop_period = self._escape_loop_period(history)
             waypoint = None if previous is None else previous.waypoint
             route_version = 0 if previous is None else previous.route_version
+            waypoint_assigned_tick = (
+                None if previous is None else previous.waypoint_assigned_tick
+            )
+            waypoint_expires_tick = (
+                None if previous is None else previous.waypoint_expires_tick
+            )
+            invalid_reason = None
             if (
                 waypoint == worker.position
                 or not same_threats
-                or loop_period is not None
+                or (
+                    waypoint_expires_tick is not None
+                    and world.tick > waypoint_expires_tick
+                )
                 or stalled >= self.config.worker_escape_replan_ticks
             ):
+                invalid_reason = (
+                    "WAYPOINT_REACHED"
+                    if waypoint == worker.position
+                    else "THREAT_SET_CHANGED"
+                    if not same_threats
+                    else "WAYPOINT_LEASE_EXPIRED"
+                    if waypoint_expires_tick is not None
+                    and world.tick > waypoint_expires_tick
+                    else "WAYPOINT_ROUTE_STALLED"
+                )
                 waypoint = None
+                waypoint_assigned_tick = None
+                waypoint_expires_tick = None
             return WorkerEscapeState(
                 phase=phase,
                 threat_ids=threat_ids,
@@ -1240,6 +1270,14 @@ class WorkerPlanner:
                 stalled_ticks=stalled,
                 loop_period=loop_period,
                 route_version=route_version,
+                waypoint_assigned_tick=waypoint_assigned_tick,
+                waypoint_expires_tick=waypoint_expires_tick,
+                waypoint_invalid_reason=invalid_reason,
+                last_waypoint_distance=(
+                    None
+                    if waypoint is None
+                    else manhattan(worker.position, waypoint)
+                ),
             )
 
         if threats:
@@ -1291,7 +1329,13 @@ class WorkerPlanner:
             )
             self.memory.worker_escape_states[worker.id] = state
             return state
-        exits = self._safe_exits(world, projection, worker.position, worker.hp)
+        exits = self._safe_exits(
+            world,
+            projection,
+            worker.position,
+            worker.hp,
+            threat_ids=previous.threat_ids,
+        )
         safe_ticks = previous.safe_ticks + 1 if exits >= 2 else 0
         if safe_ticks >= self.config.worker_escape_safe_ticks:
             self.memory.worker_escape_states.pop(worker.id, None)
@@ -1328,7 +1372,22 @@ class WorkerPlanner:
         for index, (direction, destination) in enumerate(cardinal_neighbors(worker.position)):
             if destination in world.known_obstacles or destination in projection.hostile_occupied:
                 continue
+            # Only a currently visible firing position is authoritative for
+            # this Tick.  Fog envelopes remain future risk; treating every
+            # uncertain old position as a current attacker can freeze a
+            # Worker even when one observable safe retreat exists.
             immediate = projection.immediate_attackers(destination)
+            future = max(
+                projection.future_attackers(destination),
+                self.safety.projected_attackers(
+                    world,
+                    projection,
+                    destination,
+                    depth=1,
+                    threat_ids=state.threat_ids,
+                    depth_limit=self.config.worker_escape_plan_depth,
+                ),
+            )
             allowed = (
                 self.config.worker_escape_nonfatal_hit_budget
                 if worker.hp == UNIT_MAX_HP[UnitType.WORKER]
@@ -1342,6 +1401,7 @@ class WorkerPlanner:
                 destination,
                 worker.hp,
                 origin=worker.position,
+                threat_ids=state.threat_ids,
             )
             horizon = self._survival_horizon(
                 world,
@@ -1349,6 +1409,7 @@ class WorkerPlanner:
                 destination,
                 worker.hp,
                 origin=worker.position,
+                threat_ids=state.threat_ids,
             )
             retreat_target = world.core.destination or world.core.position
             viability = move_viability(
@@ -1363,7 +1424,10 @@ class WorkerPlanner:
                     "CORE_SERVICE" if destination == retreat_target else None
                 ),
             )
-            if not viability.viable or horizon == 0:
+            if not viability.viable or (
+                horizon == 0
+                and worker.hp < UNIT_MAX_HP[UnitType.WORKER]
+            ):
                 continue
             recent = self._recent_threat(projection, destination, state.threat_ids)
             heat = projection.worker_exposure(destination)[2]
@@ -1396,7 +1460,7 @@ class WorkerPlanner:
                     destination=destination,
                     viability=viability,
                     immediate_attackers=immediate,
-                    future_attackers=projection.future_attackers(destination),
+                    future_attackers=future,
                     recent_threat=recent,
                     heat=heat,
                     minimum_enemy_distance=minimum,
@@ -1467,18 +1531,34 @@ class WorkerPlanner:
                 worker.position,
                 world.core.destination or world.core.position,
             )
+            def safe_fog_homeward(row: _EscapeCandidate) -> bool:
+                return (
+                    row.immediate_attackers == 0
+                    and row.future_attackers == 0
+                    and row.survival_terminals > 0
+                    and row.forward_exits > 0
+                    and (
+                        state.last_min_enemy_distance is None
+                        or row.minimum_enemy_distance
+                        >= state.last_min_enemy_distance
+                    )
+                    and all(
+                        row.destination not in enemy.movement_corridor
+                        and row.destination not in enemy.future_attack_cells
+                        for threat_id in state.threat_ids
+                        if (enemy := projection.enemy(threat_id)) is not None
+                    )
+                )
+
             homeward_survivable = [
                 row
                 for row in rows
-                if row.immediate_attackers == 0
-                and row.future_attackers == 0
-                and row.survival_terminals > 0
-                and row.forward_exits > 0
-                and manhattan(
+                if manhattan(
                     row.destination,
                     world.core.destination or world.core.position,
                 )
-                <= current_home_distance
+                < current_home_distance
+                and safe_fog_homeward(row)
             ]
             if homeward_survivable:
                 filter_rejections["NOT_SAFE_HOMEWARD_PROGRESS"] = (
@@ -1487,6 +1567,31 @@ class WorkerPlanner:
                     - len(homeward_survivable)
                 )
                 rows = homeward_survivable
+            else:
+                # A fogged threat never grants a blind shortcut home.  Keep
+                # moving laterally/outward (or explicitly wait) until a
+                # homeward step satisfies every conservative safety gate.
+                rejected_homeward = sum(
+                    manhattan(
+                        row.destination,
+                        world.core.destination or world.core.position,
+                    )
+                    < current_home_distance
+                    for row in rows
+                )
+                rows = [
+                    row
+                    for row in rows
+                    if manhattan(
+                        row.destination,
+                        world.core.destination or world.core.position,
+                    )
+                    >= current_home_distance
+                ]
+                filter_rejections["FOG_HOMEWARD_SAFETY_GATE"] = (
+                    filter_rejections.get("FOG_HOMEWARD_SAFETY_GATE", 0)
+                    + rejected_homeward
+                )
 
         ordered = sorted(rows, key=lambda row: row.score)
         if ordered:
@@ -1494,8 +1599,11 @@ class WorkerPlanner:
             waypoint = state.waypoint
             should_replan = (
                 waypoint is None
-                or state.loop_period is not None
                 or state.stalled_ticks >= self.config.worker_escape_replan_ticks
+                or (
+                    state.waypoint_expires_tick is not None
+                    and world.tick > state.waypoint_expires_tick
+                )
             )
             if should_replan:
                 waypoint = first.waypoint
@@ -1504,6 +1612,22 @@ class WorkerPlanner:
                 state,
                 waypoint=waypoint,
                 route_version=route_version,
+                waypoint_assigned_tick=(
+                    world.tick
+                    if waypoint != state.waypoint
+                    else state.waypoint_assigned_tick
+                ),
+                waypoint_expires_tick=(
+                    world.tick + self.config.worker_escape_waypoint_lease_ticks
+                    if waypoint != state.waypoint
+                    else state.waypoint_expires_tick
+                ),
+                waypoint_invalid_reason=None,
+                last_waypoint_distance=(
+                    None
+                    if waypoint is None
+                    else manhattan(worker.position, waypoint)
+                ),
             )
             self.memory.worker_escape_states[worker.id] = state
 
@@ -1550,6 +1674,22 @@ class WorkerPlanner:
                     ),
                     ("escape_loop_period", state.loop_period),
                     ("escape_waypoint", row.waypoint),
+                    ("escape_waypoint_lease", state.waypoint),
+                    ("escape_waypoint_assigned_tick", state.waypoint_assigned_tick),
+                    ("escape_waypoint_expires_tick", state.waypoint_expires_tick),
+                    ("escape_waypoint_distance", state.last_waypoint_distance),
+                    (
+                        "fog_homeward_allowed",
+                        state.phase == "FLEEING"
+                        or (
+                            manhattan(
+                                row.destination,
+                                world.core.destination or world.core.position,
+                            )
+                            >= current_home_distance
+                            or safe_fog_homeward(row)
+                        ),
+                    ),
                     ("escape_route_version", state.route_version),
                     (
                         "escape_filter_rejections",
@@ -1574,16 +1714,35 @@ class WorkerPlanner:
         )
         return intents
 
-    def _safe_exits(self, world, projection, position, hp, *, origin=None):
+    def _safe_exits(
+        self,
+        world,
+        projection,
+        position,
+        hp,
+        *,
+        origin=None,
+        threat_ids=(),
+    ):
         return self.safety.forward_safe_exits(
             world,
             projection,
             position,
             hp,
             origin=origin,
+            threat_ids=threat_ids,
         )
 
-    def _survival_horizon(self, world, projection, start, hp, *, origin=None):
+    def _survival_horizon(
+        self,
+        world,
+        projection,
+        start,
+        hp,
+        *,
+        origin=None,
+        threat_ids=(),
+    ):
         return self.safety.survival_terminals(
             world,
             projection,
@@ -1592,6 +1751,7 @@ class WorkerPlanner:
             origin=origin,
             depth_limit=self.config.worker_escape_plan_depth,
             node_limit=self.config.worker_escape_plan_node_limit,
+            threat_ids=threat_ids,
         )
 
     def _escape_outlook(
@@ -2070,13 +2230,15 @@ class WorkerPlanner:
                 world,
                 unit.position,
                 destination,
-                target=scout_target,
+                # Clearing the physical Core slot is a local operation.  A
+                # durable scout target may be hundreds of cells away and must
+                # not make a safe adjacent exit fail merely because this
+                # bounded check cannot prove the whole expedition route.
+                target=None,
                 blocked=frozenset(protected - {destination}),
-                node_limit=min(self.config.path_node_limit, 256),
-                require_continuation=(
-                    scout_target is not None and destination != scout_target
-                ),
-                require_open_area=scout_target is None,
+                node_limit=min(self.config.path_node_limit, 128),
+                require_continuation=False,
+                require_open_area=True,
             )
             if not viability.viable:
                 continue
@@ -2116,6 +2278,7 @@ class WorkerPlanner:
                         occupied.get(destination, 0) == 1,
                     ),
                     ("scout_target", scout_target),
+                    ("local_exit_only", True),
                 ) + viability.metadata,
             )
             for score, direction, destination, viability in sorted(
@@ -3072,7 +3235,7 @@ class WorkerPlanner:
             enemy.visible_now
             and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
             and manhattan(enemy.observed_position, world.core.position)
-            <= self.config.home_warning_radius
+            <= self.config.home_engage_radius + 4
             for enemy in projection.enemies
         )
 

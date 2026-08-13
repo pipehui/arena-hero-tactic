@@ -91,6 +91,20 @@ class CombatPlanner:
             if until < world.tick:
                 self.memory.engaged_enemy_until.pop(enemy_id, None)
         for key, feedback in tuple(self.memory.ranger_shot_feedback.items()):
+            target = world.enemy(feedback.target_id)
+            if (
+                feedback.misses >= self.config.ranger_repeat_miss_limit
+                and target is not None
+                and target.position == feedback.expected_cell
+            ):
+                self.memory.ranger_shot_feedback[key] = replace(
+                    feedback,
+                    misses=0,
+                    suppressed_until=world.tick,
+                    last_evidence_tick=world.tick,
+                    release_reason="CURRENT_OCCUPANCY",
+                )
+                continue
             if world.tick > feedback.suppressed_until + self.config.ranger_miss_suppress_ticks:
                 self.memory.ranger_shot_feedback.pop(key, None)
         for key, feedback in tuple(self.memory.vanguard_sweep_feedback.items()):
@@ -613,11 +627,13 @@ class CombatPlanner:
                 for _, assigned_cell in state.mission_assignments.get(enemy.id, ()):
                     coverage[assigned_cell] += 1
                 for index, cell in enumerate(state.candidates_by_target[enemy.id]):
+                    if index >= 2:
+                        continue
                     if not ranger_line_is_clear(
                         ranger.position,
                         cell,
                         world.known_obstacles,
-                    ):
+                    ) or self._shot_suppressed(world.tick, mission, cell):
                         continue
                     # High-confidence movement deserves concentrated fire on
                     # its top prediction.  Otherwise spread opportunistic
@@ -749,17 +765,31 @@ class CombatPlanner:
                 MoveViability,
             ]
         ] = []
-        urgent_missions = tuple(
+        positioning_missions = tuple(
             mission
             for mission in state.missions
-            if mission.urgent
-            and (
+            if (
                 mission.target_type is not UnitType.WORKER
                 or len(state.mission_assignments.get(mission.target_id, ()))
                 < mission.required_hits
             )
+            and (
+                mission.urgent
+                or not any(
+                    ranger_line_is_clear(
+                        state.ranger_by_id[ranger_id].position,
+                        cell,
+                        world.known_obstacles,
+                    )
+                    and not self._shot_suppressed(world.tick, mission, cell)
+                    for ranger_id in state.available
+                    for cell in mission.candidate_cells[:2]
+                )
+            )
         )
-        mission_by_target = {mission.target_id: mission for mission in urgent_missions}
+        mission_by_target = {
+            mission.target_id: mission for mission in positioning_missions
+        }
         screen_target_by_ranger: dict[UUID, UUID] = {}
         screen_roles: dict[tuple[UUID, UUID], str] = {}
         rejected_options: defaultdict[UUID, list[RangerStanceOption]] = defaultdict(list)
@@ -859,7 +889,7 @@ class CombatPlanner:
                 ],
             ] = {}
             ranked_missions = sorted(
-                urgent_missions,
+                positioning_missions,
                 key=lambda mission: self.target_priority(
                     world,
                     projection,
@@ -882,9 +912,14 @@ class CombatPlanner:
                     # but only the assigned pair may leave the inner defense
                     # to improve an outer screening line.
                     continue
+                high_value_cells = (
+                    mission.candidate_cells
+                    if mission.urgent
+                    else mission.candidate_cells[:2]
+                )
                 stance_cells = {
                     stance
-                    for candidate in mission.candidate_cells
+                    for candidate in high_value_cells
                     for stance in ranger_firing_positions(candidate)
                 }
                 for stance in stance_cells:
@@ -903,13 +938,14 @@ class CombatPlanner:
                         continue
                     coverage = sum(
                         ranger_line_is_clear(stance, cell, world.known_obstacles)
-                        for cell in mission.candidate_cells
+                        for cell in high_value_cells
                     )
                     if not coverage:
                         continue
                     ranked_coverage = tuple(
                         index
                         for index, cell in enumerate(mission.candidate_cells)
+                        if cell in high_value_cells
                         if ranger_line_is_clear(stance, cell, world.known_obstacles)
                     )
                     route = route_from_field(
@@ -1027,6 +1063,14 @@ class CombatPlanner:
                         for index, cell in enumerate(mission.candidate_cells)
                         if cell in destination_visible
                     )
+                    first_step_high_value_coverage = sum(
+                        ranger_line_is_clear(
+                            destination,
+                            cell,
+                            world.known_obstacles,
+                        )
+                        for cell in high_value_cells
+                    )
                     history = self.memory.position_history.get(ranger.id, ())
                     reverse_window = history[
                         -(
@@ -1083,6 +1127,7 @@ class CombatPlanner:
                             and mission.candidate_cells[0] not in destination_visible
                         ),
                         lease_rank,
+                        -first_step_high_value_coverage,
                         min(ranked_coverage),
                         -coverage,
                         immediate_attackers,
@@ -1197,16 +1242,39 @@ class CombatPlanner:
                     risk=stance_option.risk,
                     exclusive_destination=True,
                     tie_break=score,
-                    reason="ADVANCE_TO_DYNAMIC_FIRE_LINE",
+                    reason=(
+                        "ADVANCE_TO_DYNAMIC_FIRE_LINE"
+                        if mission_by_target[target_id].urgent
+                        else "LOW_VALUE_FIRE_REPOSITION"
+                    ),
                     metadata=(
                         ("target_id", str(target_id)),
                         ("firing_stance", stance),
                         ("screening_role", stance_option.role),
                         ("visible_candidates", stance_option.visible_candidates),
                         ("candidate_coverage", len(stance_option.firing_candidates)),
+                        ("candidate_rank_limit", 2),
+                        (
+                            "first_step_high_value_coverage",
+                            sum(
+                                ranger_line_is_clear(
+                                    destination,
+                                    cell,
+                                    world.known_obstacles,
+                                )
+                                for cell in mission_by_target[
+                                    target_id
+                                ].candidate_cells[:2]
+                            ),
+                        ),
+                        (
+                            "rejected_low_rank_fire",
+                            not mission_by_target[target_id].urgent,
+                        ),
                         ("route_distance", stance_option.route_distance),
                         ("stance_exclusive", True),
-                    ) + viability.metadata,
+                    )
+                    + viability.metadata,
                 )
             )
             previous_lease = self.memory.ranger_stance_leases.get(
@@ -1628,9 +1696,16 @@ class CombatPlanner:
         mission: FireMission,
         cell: Position,
     ) -> bool:
-        if mission.confidence == "HIGH":
-            return False
         feedback = self.memory.ranger_shot_feedback.get((mission.target_id, cell))
+        try:
+            role = mission.candidate_roles[mission.candidate_cells.index(cell)]
+        except (ValueError, IndexError):
+            role = ""
+        # Authoritative current occupancy is new evidence.  Confidence alone
+        # is not: a high-confidence predictor must not erase two observed
+        # misses at the same empty cell.
+        if role == "CURRENT":
+            return False
         return bool(
             feedback is not None
             and feedback.misses >= self.config.ranger_repeat_miss_limit
