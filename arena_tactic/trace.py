@@ -211,6 +211,46 @@ class DecisionTraceBuilder:
                         }
                     ),
                 }
+            if actor is not None and actor.id in self.memory.service_transit_progress:
+                transit = self.memory.service_transit_progress[actor.id]
+                if service_state is None:
+                    service_state = {}
+                service_state["transit"] = {
+                    "kind": transit.kind.value,
+                    "destination": (
+                        None
+                        if transit.destination is None
+                        else list(transit.destination)
+                    ),
+                    "remaining_distance": transit.remaining_distance,
+                    "selected": transit.selected,
+                    "stalled_ticks": transit.stalled_ticks,
+                    "rejection_reason": transit.rejection_reason,
+                    "shared_with_id": (
+                        None
+                        if transit.shared_with_id is None
+                        else str(transit.shared_with_id)
+                    ),
+                }
+            if actor is not None and actor.id in self.memory.service_transit_routes:
+                route = self.memory.service_transit_routes[actor.id]
+                if service_state is None:
+                    service_state = {}
+                service_state["transit_route"] = {
+                    "kind": route.kind.value,
+                    "target": list(route.target),
+                    "route_distance": route.route_distance,
+                    "service_tick": route.service_tick,
+                    "exit_tick": route.exit_tick,
+                    "options": [
+                        {
+                            "direction": direction.value,
+                            "destination": list(destination),
+                            "remaining_distance": distance,
+                        }
+                        for direction, destination, distance in route.options
+                    ],
+                }
             rows.append(
                 {
                     "actor_id": None if final.actor_id is None else str(final.actor_id),
@@ -774,6 +814,30 @@ class DecisionTraceBuilder:
                 ],
             },
             "fire_missions": [self.fire_mission_dict(item) for item in fire_missions],
+            "low_value_shots_deferred": [
+                {
+                    "target_id": str(mission.target_id),
+                    "target_type": mission.target_type.value,
+                    "confidence": mission.confidence,
+                    "candidate_cells": [list(cell) for cell in mission.candidate_cells],
+                    "reason": "SINGLE_RANGER_MOVING_WORKER_LOW_CONFIDENCE",
+                }
+                for mission in fire_missions
+                if mission.target_type is UnitType.WORKER
+                and not mission.urgent
+                and mission.confidence != "HIGH"
+                and len(mission.candidate_cells) > 1
+                and not mission.assignments
+                and len(
+                    [
+                        unit
+                        for unit in world.friendlies
+                        if unit.unit_type is UnitType.RANGER
+                        and unit.hp * 2 > UNIT_MAX_HP[UnitType.RANGER]
+                    ]
+                )
+                == 1
+            ],
             "enemy_action_candidates": [
                 {
                     "target_id": str(mission.target_id),
@@ -1129,6 +1193,23 @@ class DecisionTraceBuilder:
                     else list(self.memory.raid_last_position)
                 ),
                 "members": [str(item) for item in self.memory.raid_member_ids],
+                "return_handoffs": [
+                    {
+                        "actor_id": str(intent.actor_id),
+                        "action": intent.action.value,
+                        "destination": (
+                            None
+                            if intent.target_position is None
+                            else list(intent.target_position)
+                        ),
+                        "reason": intent.reason,
+                        "released": dict(intent.metadata).get(
+                            "released_from_raid", False
+                        ),
+                    }
+                    for intent in resolution.selected
+                    if intent.reason.startswith("RAID_RETURN")
+                ],
                 "containment_mode": self.memory.raid_containment_mode,
                 "containment_radius": self.config.raid_containment_radius,
                 "peace_home_reserve": self.config.raid_peace_home_reserve,

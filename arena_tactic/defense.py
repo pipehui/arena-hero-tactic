@@ -34,7 +34,14 @@ from .models import (
     UnitMission,
     WorldModel,
 )
-from .planning import Route, bfs_distances, move_viability, path_to, route_to
+from .planning import (
+    Route,
+    bfs_distances,
+    move_viability,
+    path_to,
+    route_from_field,
+    route_to,
+)
 from .projection import TacticalMap
 from .resource_allocator import minimum_cost_matching
 from .rules import UNIT_MAX_HP
@@ -119,7 +126,7 @@ class DefensePlanner:
         self._sync_squads(
             world,
             projection,
-            living_combatants,
+            healthy,
             protected,
         )
         screening_intents = self._screening_intents(
@@ -1829,6 +1836,7 @@ class DefensePlanner:
         assert world.core is not None
         intents: list[ActionIntent] = []
         occupied = {unit.position for unit in world.friendlies}
+        reserved_first_steps: set[Position] = set()
         reserve_ring = [
             cell
             for radius in self.config.peaceful_squad_radii
@@ -1857,23 +1865,67 @@ class DefensePlanner:
                     )
                 )
                 continue
-            target = min(
-                reserve_ring,
-                key=lambda cell: (
-                    self.memory.visit_counts.get(cell, 0),
-                    manhattan(unit.position, cell),
-                    cell,
+            distances, parents = bfs_distances(
+                world,
+                unit.position,
+                node_limit=self.config.path_node_limit,
+                blocked=frozenset(
+                    (projection.hostile_occupied | protected) - {unit.position}
+                ),
+                targets=frozenset(reserve_ring),
+            )
+            reachable = []
+            for target in reserve_ring:
+                route = route_from_field(
+                    unit.position,
+                    target,
+                    distances,
+                    parents,
+                    obstacles=world.known_obstacles,
+                )
+                if (
+                    route is None
+                    or route.first_position is None
+                    or route.first_position in reserved_first_steps
+                ):
+                    continue
+                reachable.append((route.distance, target, route.first_position))
+            if not reachable:
+                intents.append(
+                    ActionIntent.simple(
+                        unit.id,
+                        IntentAction.WAIT,
+                        UnitMission.PATROL,
+                        72,
+                        target_position=unit.position,
+                        reason="NO_VIABLE_FORMATION_MOVE",
+                        metadata=(("hold_class", "NO_VIABLE_MOVE"),),
+                    )
+                )
+                continue
+            _, target, _ = min(
+                reachable,
+                key=lambda row: (
+                    self.memory.visit_counts.get(row[1], 0),
+                    row[0],
+                    row[1],
                 ),
             )
-            intents.extend(
-                self._move_or_wait(
-                    world,
-                    projection,
-                    unit,
-                    target,
-                    protected,
-                    "UNPAIRED_HOME_RESERVE_PATROL",
-                )
+            unit_intents = self._move_or_wait(
+                world,
+                projection,
+                unit,
+                target,
+                protected,
+                "UNPAIRED_HOME_RESERVE_PATROL",
+                reserved_first_steps=frozenset(reserved_first_steps),
+            )
+            intents.extend(unit_intents)
+            reserved_first_steps.update(
+                intent.target_position
+                for intent in unit_intents
+                if intent.action is IntentAction.MOVE
+                and intent.target_position is not None
             )
             reserve_ring.remove(target)
         return intents
@@ -1928,6 +1980,7 @@ class DefensePlanner:
         mission=UnitMission.PATROL,
         move_priority=70,
         wait_priority=72,
+        reserved_first_steps: frozenset[Position] = frozenset(),
     ):
         if unit.position == target:
             return [
@@ -1963,6 +2016,7 @@ class DefensePlanner:
                 or destination not in world.known_passable
                 or destination in projection.hostile_occupied
                 or destination in protected
+                or destination in reserved_first_steps
             ):
                 continue
             terminal_exception = self._combat_terminal_exception(

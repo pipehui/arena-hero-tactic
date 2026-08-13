@@ -54,6 +54,14 @@ class CoreServicePhase(str, Enum):
     EGRESS = "EGRESS"
 
 
+class ServiceTransitKind(str, Enum):
+    """Why an actor is travelling through the shared Core service network."""
+
+    DEPOSIT = "DEPOSIT"
+    HEAL = "HEAL"
+    DEPOSIT_THEN_HEAL = "DEPOSIT_THEN_HEAL"
+
+
 class IntentAction(str, Enum):
     WAIT = "WAIT"
     MOVE = "MOVE"
@@ -77,6 +85,7 @@ class DestinationExclusivity(str, Enum):
 
     NONE = "NONE"
     COMBAT = "COMBAT_EXCLUSIVE"
+    SERVICE_TRANSIT = "SERVICE_TRANSIT"
     PHYSICAL = "PHYSICAL_EXCLUSIVE"
 
 
@@ -539,6 +548,34 @@ class CoreServiceJob:
     resource_cost: int = 0
     resource_gain: int = 0
     reason: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceTransitRoute:
+    """Executable, shared route projection for a Core service actor."""
+
+    actor_id: UUID
+    kind: ServiceTransitKind
+    target: Position
+    route_distance: int | None
+    options: tuple[tuple[Direction, Position, int], ...] = ()
+    service_tick: int | None = None
+    exit_tick: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceTransitProgress:
+    """Resolver feedback for either cargo return or patient recovery transit."""
+
+    actor_id: UUID
+    kind: ServiceTransitKind
+    tick: int
+    destination: Position | None
+    remaining_distance: int | None
+    selected: bool
+    stalled_ticks: int = 0
+    rejection_reason: str | None = None
+    shared_with_id: UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)

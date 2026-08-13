@@ -623,6 +623,11 @@ class CombatPlanner:
                 ):
                     continue
                 mission = missions[enemy.id]
+                if self._defer_single_worker_shot(world, mission, state):
+                    # One Ranger cannot cover an uncertain moving Worker's
+                    # branch set.  Preserve contact or improve a top-two line
+                    # instead of spending every Tick on a generic empty cell.
+                    continue
                 coverage: dict[Position, int] = defaultdict(int)
                 for _, assigned_cell in state.mission_assignments.get(enemy.id, ()):
                     coverage[assigned_cell] += 1
@@ -657,6 +662,29 @@ class CombatPlanner:
             state.assignments[ranger_id] = target_id, cell, "OPPORTUNISTIC_FIRE"
             state.mission_assignments[target_id].append((ranger_id, cell))
             state.available.remove(ranger_id)
+
+    @staticmethod
+    def _defer_single_worker_shot(world, mission, state) -> bool:
+        if (
+            mission.target_type is not UnitType.WORKER
+            or mission.urgent
+            or mission.confidence == "HIGH"
+            or len(mission.candidate_cells) <= 1
+        ):
+            return False
+        healthy = [
+            ranger
+            for ranger in state.rangers
+            if ranger.hp * 2 > UNIT_MAX_HP[UnitType.RANGER]
+        ]
+        if len(healthy) != 1:
+            return False
+        track = world.track(mission.target_id)
+        return bool(
+            track is not None
+            and len(track.samples) >= 2
+            and track.samples[-2][1] != track.samples[-1][1]
+        )
 
     @staticmethod
     def _assigned_fire_intents(state):
@@ -775,6 +803,7 @@ class CombatPlanner:
             )
             and (
                 mission.urgent
+                or self._defer_single_worker_shot(world, mission, state)
                 or not any(
                     ranger_line_is_clear(
                         state.ranger_by_id[ranger_id].position,

@@ -35,6 +35,44 @@ from tests.helpers import enemy_core, friendly_core, make_turn, uid, unit
 
 
 class EconomyAndLogisticsTests(unittest.TestCase):
+    def test_wounded_ranger_uses_full_health_ranger_cell_on_service_route(self) -> None:
+        core = friendly_core(position=(3, 0))
+        patient = unit(1, UnitType.RANGER, (0, 0), hp=1)
+        guard = unit(2, UnitType.RANGER, (1, 0))
+        memory = TacticMemory(
+            core_id=core.id,
+            core_position=core.position,
+            opening_complete=True,
+        )
+        memory.known_passable.update({(0, 0), (1, 0), (2, 0), (3, 0)})
+        tactic = BalancedTactic(memory=memory)
+        turn = make_turn(
+            core=core,
+            units=(patient, guard),
+            obstacle_cells=((0, -1), (0, 1), (1, -1), (1, 1)),
+            resources=2,
+        )
+
+        tactic.choose_actions(turn)
+
+        action = turn.plan.unit_actions[patient.id]
+        self.assertIsInstance(action, MoveAction)
+        self.assertEqual(action.direction, Direction.RIGHT)
+        decision = next(
+            row
+            for row in tactic.last_decision_trace["decisions"]
+            if row["actor_id"] == str(patient.id)
+        )
+        self.assertEqual(
+            decision["final"]["destination_exclusivity"],
+            "SERVICE_TRANSIT",
+        )
+        self.assertEqual(
+            decision["service"]["transit"]["shared_with_id"],
+            str(guard.id),
+        )
+        self.assertTrue(decision["service"]["transit_route"]["options"])
+
     def test_worker_disengages_from_enemy_core_zone_and_ignores_nearby_resource(self) -> None:
         core = friendly_core(position=(20, 0))
         memory = TacticMemory(core_id=core.id, core_position=core.position)

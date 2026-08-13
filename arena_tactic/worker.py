@@ -10,7 +10,6 @@ from .geometry import cardinal_neighbors, diamond, manhattan, manhattan_ring
 from .models import (
     ActionIntent,
     CoreServiceQueue,
-    DestinationExclusivity,
     EntitySnapshot,
     EnemyCoreControlZone,
     IntentAction,
@@ -39,6 +38,7 @@ from .projection import TacticalMap
 from .resource_allocator import ResourceAllocator
 from .rules import UNIT_MAX_HP
 from .state import TacticMemory
+from .service_transit import CoreServiceTransitPlanner
 from .worker_safety import WorkerSafetyEvaluator
 
 
@@ -103,6 +103,7 @@ class WorkerPlanner:
         self.memory = memory
         self.resources = resources
         self.safety = WorkerSafetyEvaluator()
+        self.transit = CoreServiceTransitPlanner(config)
 
     def intents(
         self,
@@ -2495,74 +2496,32 @@ class WorkerPlanner:
                 blocked_first_steps.add(alternate.first_position)
                 routes.append(alternate)
 
-        intents: list[ActionIntent] = []
-        rejected_first_steps = 0
-        for rank, route in enumerate(routes):
-            if route.first_direction is None or route.first_position is None:
-                continue
-            if (
-                route.first_position in world.known_obstacles
-                or route.first_position in projection.hostile_occupied
-                or route.first_position in projection.immediate_damage
-            ):
-                rejected_first_steps += 1
-                continue
-            terminal_exception = (
-                "CORE_SERVICE"
-                if route.first_position == world.core.position
-                else None
-            )
-            # ``primary_route`` is the authoritative route produced by the
-            # same danger/obstacle model that scheduled this service.  Only
-            # prove the executable first step locally here.  Re-running a
-            # 512-node proof all the way to a remote entrance rejected valid
-            # 100+ cell routes and froze their Workers indefinitely.
-            viability = move_viability(
-                world,
-                worker.position,
-                route.first_position,
-                target=None,
-                node_limit=min(self.config.path_node_limit, 64),
-                require_continuation=False,
-                require_open_area=False,
-                terminal_exception=terminal_exception,
-            )
-            if not viability.viable:
-                rejected_first_steps += 1
-                continue
-            intents.append(
-                ActionIntent.move(
-                    worker.id,
-                    UnitMission.RETURN_CARGO,
-                    priority + rank,
-                    route.first_direction,
-                    route.first_position,
-                    risk=self._risk(projection, route.first_position),
-                    destination_exclusivity=(
-                        DestinationExclusivity.PHYSICAL
-                        if route.first_position == world.core.position
-                        else DestinationExclusivity.NONE
-                    ),
-                    tie_break=(rank, route.distance),
-                    reason=reason if rank == 0 else "SERVICE_ROUTE_ALTERNATE",
-                    metadata=(
-                        ("route_rank", rank),
-                        ("allow_protected", True),
-                        (
-                            "allow_head_on_swap",
-                            route.first_position == world.core.position
-                            or worker.position == world.core.position,
-                        ),
-                        ("service_slot", route_target),
-                        ("scheduled_deposit_tick", reservation.scheduled_deposit_tick),
-                        ("departure_tick", reservation.departure_tick),
-                        ("remaining_distance", reservation.route_distance),
-                        ("route_mode", reservation.route_mode),
-                        ("lane_version", reservation.lane_version),
-                        ("waypoint", reservation.waypoint),
-                    ) + viability.metadata,
-                )
-            )
+        service_job = next(
+            (job for job in service.jobs if job.actor_id == worker.id),
+            None,
+        )
+        kind = self.transit.kind_for(service_job, worker)
+        descriptor, intents, rejected_first_steps = self.transit.intents(
+            world,
+            projection,
+            worker,
+            route_target,
+            tuple(routes),
+            mission=UnitMission.RETURN_CARGO,
+            priority=priority,
+            reason=reason,
+            kind=kind,
+            job=service_job,
+            metadata=(
+                ("service_slot", route_target),
+                ("scheduled_deposit_tick", reservation.scheduled_deposit_tick),
+                ("departure_tick", reservation.departure_tick),
+                ("route_mode", reservation.route_mode),
+                ("lane_version", reservation.lane_version),
+                ("waypoint", reservation.waypoint),
+            ),
+        )
+        self.memory.service_transit_routes[worker.id] = descriptor
         intents.append(
             ActionIntent.simple(
                 worker.id,

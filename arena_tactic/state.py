@@ -34,6 +34,8 @@ from .models import (
     ShotPlan,
     ScreeningGroupState,
     ServiceMoveFeedback,
+    ServiceTransitProgress,
+    ServiceTransitRoute,
     ServiceLaneLease,
     CargoRouteProgress,
     SegmentedReturnLease,
@@ -131,6 +133,12 @@ class TacticMemory:
     service_ready_since_ticks: dict[UUID, int] = field(default_factory=dict)
     service_patient_gateways: dict[UUID, Position] = field(default_factory=dict)
     patient_admission_progress: PatientAdmissionProgress | None = None
+    service_transit_progress: dict[UUID, ServiceTransitProgress] = field(
+        default_factory=dict
+    )
+    service_transit_routes: dict[UUID, ServiceTransitRoute] = field(
+        default_factory=dict
+    )
     storage_saturated: bool = False
     worker_home_guard_targets: dict[UUID, Position] = field(default_factory=dict)
 
@@ -250,6 +258,8 @@ class TacticMemory:
         self.service_ready_since_ticks.clear()
         self.service_patient_gateways.clear()
         self.patient_admission_progress = None
+        self.service_transit_progress.clear()
+        self.service_transit_routes.clear()
         self.storage_saturated = False
         self.worker_home_guard_targets.clear()
         self.opening_complete = False

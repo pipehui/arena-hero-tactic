@@ -22,6 +22,8 @@ from .models import (
     IntentResolution,
     MoveAttempt,
     ServiceMoveFeedback,
+    ServiceTransitKind,
+    ServiceTransitProgress,
     UnitMission,
     WorldModel,
 )
@@ -196,6 +198,7 @@ class DecisionKernel:
         world = context.world
         projection = context.tactical_map
         service = context.service
+        self.memory.service_transit_routes.clear()
         fire_missions, fire_intents, legal_opportunities = self.combat.fire_intents(
             world,
             projection,
@@ -450,3 +453,47 @@ class DecisionKernel:
                 stalled_ticks=stalled,
             )
         self.memory.service_move_feedback = next_feedback
+
+        transit_rows: dict[UUID, list[tuple[ActionIntent, str | None]]] = {}
+        for intent in resolution.selected:
+            if intent.actor_id is not None and dict(intent.metadata).get(
+                "service_transit_kind"
+            ):
+                transit_rows.setdefault(intent.actor_id, []).append((intent, None))
+        for row in resolution.rejected:
+            intent = row.intent
+            if intent.actor_id is not None and dict(intent.metadata).get(
+                "service_transit_kind"
+            ):
+                transit_rows.setdefault(intent.actor_id, []).append((intent, row.reason))
+        next_transit: dict[UUID, ServiceTransitProgress] = {}
+        for actor_id, rows in transit_rows.items():
+            chosen = next((item for item in rows if item[1] is None), None)
+            primary, rejection = chosen or min(
+                rows,
+                key=lambda item: item[0].sort_key(),
+            )
+            metadata = dict(primary.metadata)
+            previous = self.memory.service_transit_progress.get(actor_id)
+            stalled = 0
+            if rejection is not None:
+                stalled = (
+                    previous.stalled_ticks + 1
+                    if previous is not None
+                    and not previous.selected
+                    and previous.destination == primary.target_position
+                    else 1
+                )
+            shared = metadata.get("service_transit_shared_with")
+            next_transit[actor_id] = ServiceTransitProgress(
+                actor_id=actor_id,
+                kind=ServiceTransitKind(metadata["service_transit_kind"]),
+                tick=world.tick,
+                destination=primary.target_position,
+                remaining_distance=metadata.get("remaining_distance"),
+                selected=rejection is None,
+                stalled_ticks=stalled,
+                rejection_reason=rejection,
+                shared_with_id=None if shared is None else UUID(str(shared)),
+            )
+        self.memory.service_transit_progress = next_transit

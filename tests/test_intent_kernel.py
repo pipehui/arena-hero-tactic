@@ -125,6 +125,139 @@ class IntentKernelTests(unittest.TestCase):
         rejection = next(item for item in result.rejected if item.intent == ranger_move)
         self.assertEqual(rejection.reason, "COMBAT_UNIT_EXCLUSIVE")
 
+    def test_recovery_transit_can_share_with_one_full_health_combatant(self) -> None:
+        patient = unit(1, UnitType.RANGER, (0, 0), hp=1)
+        guard = unit(2, UnitType.RANGER, (1, 0), hp=2)
+        world = build_world_model(
+            make_turn(
+                core=friendly_core(position=(4, 0)),
+                units=(patient, guard),
+            )
+        )
+        transit = ActionIntent.move(
+            patient.id,
+            UnitMission.RECOVER,
+            40,
+            Direction.RIGHT,
+            guard.position,
+            destination_exclusivity=DestinationExclusivity.SERVICE_TRANSIT,
+            reason="CORE_SERVICE_TRANSIT",
+        )
+
+        result = IntentResolver(combat_exclusive=True).resolve(world, (transit,))
+
+        self.assertEqual(result.for_actor(patient.id), transit)
+
+    def test_recovery_transit_rejects_wounded_or_double_occupied_cells(self) -> None:
+        patient = unit(1, UnitType.RANGER, (0, 0), hp=1)
+        wounded_guard = unit(2, UnitType.VANGUARD, (1, 0), hp=2)
+        world = build_world_model(
+            make_turn(
+                core=friendly_core(position=(4, 0)),
+                units=(patient, wounded_guard),
+            )
+        )
+        transit = ActionIntent.move(
+            patient.id,
+            UnitMission.RECOVER,
+            40,
+            Direction.RIGHT,
+            wounded_guard.position,
+            destination_exclusivity=DestinationExclusivity.SERVICE_TRANSIT,
+        )
+        wait = ActionIntent.simple(patient.id, IntentAction.WAIT, UnitMission.RECOVER, 41)
+
+        result = IntentResolver(combat_exclusive=True).resolve(world, (transit, wait))
+
+        self.assertEqual(result.for_actor(patient.id), wait)
+        rejection = next(item for item in result.rejected if item.intent == transit)
+        self.assertEqual(rejection.reason, "SERVICE_TRANSIT_OCCUPANT_NOT_FULL")
+
+        second_guard = unit(3, UnitType.WORKER, (1, 0))
+        crowded_world = build_world_model(
+            make_turn(
+                core=friendly_core(position=(4, 0)),
+                units=(patient, wounded_guard, second_guard),
+            )
+        )
+        crowded = IntentResolver(combat_exclusive=True).resolve(
+            crowded_world,
+            (transit, wait),
+        )
+        crowded_rejection = next(
+            item for item in crowded.rejected if item.intent == transit
+        )
+        self.assertEqual(crowded_rejection.reason, "PHYSICAL_CELL_CAPACITY")
+
+    def test_recovery_transit_does_not_cancel_resident_combat_action(self) -> None:
+        patient = unit(1, UnitType.VANGUARD, (0, 0), hp=2)
+        guard = unit(2, UnitType.RANGER, (1, 0), hp=2)
+        world = build_world_model(
+            make_turn(
+                core=friendly_core(position=(4, 0)),
+                units=(patient, guard),
+            )
+        )
+        transit = ActionIntent.move(
+            patient.id,
+            UnitMission.RECOVER,
+            40,
+            Direction.RIGHT,
+            guard.position,
+            destination_exclusivity=DestinationExclusivity.SERVICE_TRANSIT,
+        )
+        fire = ActionIntent.simple(
+            guard.id,
+            IntentAction.SHOOT_CELL,
+            UnitMission.ATTACK,
+            30,
+            expected_cell=(1, 3),
+        )
+
+        result = IntentResolver(combat_exclusive=True).resolve(world, (transit, fire))
+
+        self.assertEqual(result.for_actor(patient.id), transit)
+        self.assertEqual(result.for_actor(guard.id), fire)
+
+    def test_recovery_transit_does_not_share_with_another_incoming_combatant(self) -> None:
+        patient = unit(1, UnitType.RANGER, (0, 0), hp=1)
+        guard = unit(2, UnitType.VANGUARD, (2, 0))
+        world = build_world_model(
+            make_turn(
+                core=friendly_core(position=(4, 0)),
+                units=(patient, guard),
+            )
+        )
+        transit = ActionIntent.move(
+            patient.id,
+            UnitMission.RECOVER,
+            40,
+            Direction.RIGHT,
+            (1, 0),
+            destination_exclusivity=DestinationExclusivity.SERVICE_TRANSIT,
+        )
+        incoming = ActionIntent.move(
+            guard.id,
+            UnitMission.HOME_DEFENSE,
+            50,
+            Direction.LEFT,
+            (1, 0),
+            destination_exclusivity=DestinationExclusivity.COMBAT,
+        )
+        waits = (
+            ActionIntent.simple(patient.id, IntentAction.WAIT, UnitMission.RECOVER, 41),
+            ActionIntent.simple(guard.id, IntentAction.WAIT, UnitMission.WAIT, 51),
+        )
+
+        result = IntentResolver(combat_exclusive=True).resolve(
+            world,
+            (transit, incoming, *waits),
+        )
+
+        self.assertEqual(result.for_actor(patient.id).action, IntentAction.WAIT)
+        rejection = next(item for item in result.rejected if item.intent == transit)
+        self.assertEqual(rejection.reason, "SERVICE_TRANSIT_INCOMING_COMBAT")
+
     def test_wartime_allows_worker_and_combatant_but_not_two_workers(self) -> None:
         first = unit(1, UnitType.WORKER, (-1, 0))
         second = unit(2, UnitType.WORKER, (1, 0))

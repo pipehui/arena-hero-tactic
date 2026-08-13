@@ -13,10 +13,11 @@ from .models import (
     UnitMission,
     WorldModel,
 )
-from .planning import move_viability, weighted_route_to
+from .planning import Route, move_viability
 from .projection import TacticalMap
 from .rules import UNIT_MAX_HP
 from .service import service_protected_positions
+from .service_transit import CoreServiceTransitPlanner
 from .state import TacticMemory
 from .worker_safety import WorkerSafetyEvaluator
 
@@ -32,6 +33,7 @@ class RecoveryPlanner:
         self.config = config
         self.memory = memory or TacticMemory()
         self.worker_safety = WorkerSafetyEvaluator()
+        self.transit = CoreServiceTransitPlanner(config)
 
     def intents(
         self,
@@ -244,96 +246,76 @@ class RecoveryPlanner:
                         None,
                     )
                     if job_step is not None:
-                        # The unified calendar and the actor now consume the
-                        # same safe first step.  Alternative high-exit moves
-                        # remain available if the resolver rejects it, but may
-                        # no longer make a calm wounded Worker drift away from
-                        # treatment or oscillate between staging cells.
-                        intents.append(
-                            ActionIntent.move(
-                                unit.id,
-                                UnitMission.RECOVER,
-                                priority - 1,
-                                job_step.direction,
-                                job_step.destination,
-                                risk=self.worker_safety.risk(
-                                    projection, job_step.destination
-                                ),
-                                exclusive_destination=True,
-                                tie_break=job_step.score,
-                                reason="CORE_SERVICE_ROUTE_ADVANCE",
-                                metadata=(
-                                    ("allow_protected", True),
-                                    ("allow_head_on_swap", True),
-                                    ("forward_exits", job_step.forward_exits),
-                                    ("survival_terminals", job_step.survival_terminals),
-                                    ("service_tick", service_job.service_tick),
-                                ),
-                            )
-                        )
-                    for step in steps:
-                        intents.append(
-                            ActionIntent.move(
-                                unit.id,
-                                UnitMission.RECOVER,
-                                priority,
-                                step.direction,
-                                step.destination,
-                                risk=self.worker_safety.risk(
-                                    projection, step.destination
-                                ),
-                                exclusive_destination=True,
-                                tie_break=step.score,
-                                reason=(
-                                    service.service
-                                    if admitted or scheduled
-                                    else "WORKER_RECOVERY_SAFE_APPROACH"
-                                ),
-                                metadata=(
-                                    ("allow_protected", admitted or scheduled),
-                                    ("allow_head_on_swap", admitted or scheduled),
-                                    ("forward_exits", step.forward_exits),
-                                    ("survival_terminals", step.survival_terminals),
-                                    ("first_step_heat", step.heat),
-                                    ("future_attackers", step.future_attackers),
-                                    ("route_reachable", step.route_reachable),
-                                ),
-                            )
-                        )
-                    route_blocked = not steps
-                else:
-                    route = weighted_route_to(
-                        world,
-                        unit.position,
-                        target,
-                        node_limit=self.config.path_node_limit,
-                        blocked=route_block,
-                        cell_costs=self.worker_safety.route_costs(projection),
-                    )
-                    if route is not None and route.first_direction is not None:
-                        intents.append(
-                            ActionIntent.move(
-                                unit.id,
-                                UnitMission.RECOVER,
-                                priority,
-                                route.first_direction,
-                                route.first_position,
-                                risk=self._risk(projection, route.first_position),
-                                exclusive_destination=True,
-                                tie_break=(route.distance,),
-                                reason=(
-                                    service.service
-                                    if admitted or scheduled
-                                    else "RECOVERY_STAGING_APPROACH"
-                                ),
-                                metadata=(
-                                    ("allow_protected", admitted or scheduled),
-                                    ("allow_head_on_swap", admitted or scheduled),
-                                ),
-                            )
+                        ordered_steps = (job_step,) + tuple(
+                            step for step in steps if step is not job_step
                         )
                     else:
-                        route_blocked = True
+                        ordered_steps = steps
+                    descriptor, transit_intents, rejected = self.transit.intents(
+                        world,
+                        projection,
+                        unit,
+                        target,
+                        tuple(step.route for step in ordered_steps[:3]),
+                        mission=UnitMission.RECOVER,
+                        priority=priority - 1 if job_step is not None else priority,
+                        reason=(
+                            "CORE_SERVICE_ROUTE_ADVANCE"
+                            if job_step is not None
+                            else (
+                                service.service
+                                if admitted or scheduled
+                                else "WORKER_RECOVERY_SAFE_APPROACH"
+                            )
+                        ),
+                        kind=self.transit.kind_for(service_job, unit),
+                        job=service_job,
+                        metadata=(("worker_safe_route", True),),
+                    )
+                    self.memory.service_transit_routes[unit.id] = descriptor
+                    intents.extend(transit_intents)
+                    route_blocked = not transit_intents and (not steps or rejected > 0)
+                else:
+                    preferred = None
+                    if (
+                        service_job is not None
+                        and service_job.first_direction is not None
+                        and service_job.first_position is not None
+                    ):
+                        preferred = Route(
+                            service_job.route_distance or 1,
+                            service_job.first_direction,
+                            service_job.first_position,
+                        )
+                    routes = self.transit.routes(
+                        world,
+                        unit,
+                        target,
+                        blocked=route_block,
+                        cell_costs=self.worker_safety.route_costs(projection),
+                        preferred=preferred,
+                    )
+                    kind = self.transit.kind_for(service_job, unit)
+                    descriptor, transit_intents, rejected = self.transit.intents(
+                        world,
+                        projection,
+                        unit,
+                        target,
+                        routes,
+                        mission=UnitMission.RECOVER,
+                        priority=priority,
+                        reason=(
+                            service.service
+                            if admitted or scheduled
+                            else "RECOVERY_STAGING_APPROACH"
+                        ),
+                        kind=kind,
+                        job=service_job,
+                        metadata=(("scheduled", scheduled),),
+                    )
+                    self.memory.service_transit_routes[unit.id] = descriptor
+                    intents.extend(transit_intents)
+                    route_blocked = not transit_intents and (not routes or rejected > 0)
             intents.append(
                 ActionIntent.simple(
                     unit.id,

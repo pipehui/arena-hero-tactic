@@ -15,6 +15,7 @@ from .models import (
     RejectedIntent,
     WorldModel,
 )
+from .rules import UNIT_MAX_HP
 
 
 def _actor_key(actor_id: UUID | None) -> tuple[int, bytes]:
@@ -349,6 +350,38 @@ class IntentResolver:
                 and selected[unit.id].action is IntentAction.MOVE
             ]
             combat_movers.sort(key=ActionIntent.sort_key)
+            service_transit_movers = [
+                intent
+                for intent in combat_movers
+                if intent.destination_exclusivity
+                is DestinationExclusivity.SERVICE_TRANSIT
+            ]
+            service_transit_allowed: set[ActionIntent] = set()
+            if service_transit_movers:
+                for transit in service_transit_movers:
+                    actor = next(
+                        unit for unit in combat_units if unit.id == transit.actor_id
+                    )
+                    others = [unit for unit in combat_units if unit.id != actor.id]
+                    incoming_others = [
+                        unit
+                        for unit in others
+                        if unit.id in selected
+                        and selected[unit.id].action is IntentAction.MOVE
+                    ]
+                    if (
+                        transit.mission.value != "RECOVER"
+                        or actor.hp >= UNIT_MAX_HP[actor.unit_type]
+                    ):
+                        invalid.setdefault(transit, "INVALID_SERVICE_TRANSIT_ACTOR")
+                    elif incoming_others or len(service_transit_movers) > 1:
+                        invalid.setdefault(transit, "SERVICE_TRANSIT_INCOMING_COMBAT")
+                    elif len(others) == 1 and (
+                        others[0].hp >= UNIT_MAX_HP[others[0].unit_type]
+                    ):
+                        service_transit_allowed.add(transit)
+                    elif others:
+                        invalid.setdefault(transit, "SERVICE_TRANSIT_OCCUPANT_NOT_FULL")
             combat_policy = self._combat_cell_is_exclusive(
                 destination,
                 projected_core_position,
@@ -361,7 +394,14 @@ class IntentResolver:
                 stationary_combat = len(combat_units) - len(combat_movers)
                 keep = 0 if stationary_combat else 1
                 for loser in combat_movers[keep:]:
-                    invalid[loser] = "COMBAT_UNIT_EXCLUSIVE"
+                    if loser not in service_transit_allowed:
+                        if (
+                            loser.destination_exclusivity
+                            is DestinationExclusivity.SERVICE_TRANSIT
+                        ):
+                            invalid.setdefault(loser, "COMBAT_UNIT_EXCLUSIVE")
+                        else:
+                            invalid[loser] = "COMBAT_UNIT_EXCLUSIVE"
 
             if self.wartime_worker_exclusive:
                 workers = [

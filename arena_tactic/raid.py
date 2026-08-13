@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from math import ceil
+from uuid import UUID
 from arena_hero import Direction, Position, UnitType
 
 from .config import TacticConfig
@@ -924,16 +925,119 @@ class RaidPlanner:
     def _return_intents(self, world, projection, members, protected):
         assert world.core is not None
         intents: list[ActionIntent] = []
-        returned = 0
-        for unit in members:
-            if manhattan(unit.position, world.core.position) <= self.config.home_engage_radius:
-                returned += 1
-                intents.append(self._wait(unit, "RAID_RETURN_HOLD"))
+        continuing: list[UUID] = []
+        reserved_handoffs: set[Position] = set()
+        for unit in sorted(members, key=lambda item: item.id.bytes):
+            # A casualty is no longer formation-dependent.  The unified Core
+            # service planner immediately owns its RECOVER trip, so a healthy
+            # expedition partner can never pin it at the home boundary.
+            if unit.hp < UNIT_MAX_HP[unit.unit_type]:
                 continue
-            intents.extend(self._move(world, projection, unit, world.core.position, protected, "RAID_RETURN"))
-        if returned == len(members):
+            if manhattan(unit.position, world.core.position) <= self.config.home_engage_radius:
+                intents.extend(
+                    self._handoff_intents(
+                        world,
+                        projection,
+                        unit,
+                        protected,
+                        reserved_handoffs,
+                    )
+                )
+                continue
+            continuing.append(unit.id)
+            intents.extend(
+                self._move(
+                    world,
+                    projection,
+                    unit,
+                    world.core.position,
+                    protected,
+                    "RAID_RETURN",
+                )
+            )
+        self.memory.raid_member_ids = tuple(continuing)
+        if self.memory.raid_long_range_campaign is not None:
+            self.memory.raid_long_range_campaign = replace(
+                self.memory.raid_long_range_campaign,
+                member_ids=tuple(continuing),
+                phase="RETURNING",
+            )
+        if not continuing:
             self._clear()
         return intents
+
+    def _handoff_intents(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        unit: EntitySnapshot,
+        protected: frozenset[Position],
+        reserved: set[Position],
+    ) -> list[ActionIntent]:
+        """Clear the return corridor once and release a healthy member home."""
+
+        assert world.core is not None
+        occupied = dict(world.occupied_cells)
+        rows = []
+        for index, (direction, destination) in enumerate(
+            cardinal_neighbors(unit.position)
+        ):
+            if (
+                destination in reserved
+                or destination in protected
+                or destination in world.known_obstacles
+                or destination in projection.hostile_occupied
+                or occupied.get(destination, 0) >= 2
+                or projection.immediate_attackers(destination) >= unit.hp
+                or projection.future_attackers(destination) >= unit.hp
+            ):
+                continue
+            viability = move_viability(
+                world,
+                unit.position,
+                destination,
+                target=None,
+                blocked=frozenset(protected - {unit.position, destination}),
+                node_limit=min(self.config.path_node_limit, 128),
+                require_open_area=True,
+            )
+            if not viability.viable:
+                continue
+            score = (
+                int(
+                    manhattan(destination, world.core.position)
+                    > self.config.home_engage_radius
+                ),
+                occupied.get(destination, 0),
+                projection.immediate_attackers(destination),
+                projection.future_attackers(destination),
+                -viability.forward_exits,
+                manhattan(destination, world.core.position),
+                index,
+            )
+            rows.append((score, direction, destination, viability))
+        if not rows:
+            return [self._wait(unit, "RAID_RETURN_HANDOFF_BLOCKED")]
+        score, direction, destination, viability = min(rows, key=lambda row: row[0])
+        reserved.add(destination)
+        return [
+            ActionIntent.move(
+                unit.id,
+                UnitMission.RAID,
+                60,
+                direction,
+                destination,
+                risk=score[2] * 100 + score[3] * 10,
+                exclusive_destination=True,
+                tie_break=score,
+                reason="RAID_RETURN_HANDOFF",
+                metadata=(
+                    ("handoff_position", destination),
+                    ("released_from_raid", True),
+                )
+                + viability.metadata,
+            )
+        ]
 
     def _move(self, world, projection, unit, target, protected, reason):
         blocked = (projection.hostile_occupied | protected) - {unit.position, target}

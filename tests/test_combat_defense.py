@@ -34,6 +34,64 @@ from tests.helpers import enemy_core, friendly_core, make_turn, uid, unit
 
 
 class CombatDefenseTests(unittest.TestCase):
+    def test_returning_raid_member_handoffs_instead_of_waiting_at_radius(self) -> None:
+        core = friendly_core(position=(0, 0))
+        member = unit(1, UnitType.RANGER, (13, 0))
+        memory = TacticMemory(
+            core_id=core.id,
+            core_position=core.position,
+            opening_complete=True,
+            raid_member_ids=(member.id,),
+            raid_phase="RETURNING",
+        )
+        memory.known_passable.update(
+            (x, y) for x in range(-15, 16) for y in range(-3, 4)
+        )
+        tactic = BalancedTactic(memory=memory)
+        turn = make_turn(core=core, units=(member,), resources=0)
+
+        tactic.choose_actions(turn)
+
+        self.assertNotIsInstance(turn.plan.unit_actions[member.id], WaitAction)
+        self.assertNotIn(member.id, tactic.memory.raid_member_ids)
+
+    def test_single_ranger_does_not_blind_fire_at_moving_nonurgent_worker(self) -> None:
+        core = friendly_core(position=(20, 20))
+        ranger = unit(1, UnitType.RANGER, (0, 0))
+        tactic = BalancedTactic(memory=TacticMemory(opening_complete=True))
+        tactic.choose_actions(
+            make_turn(
+                tick=1,
+                core=core,
+                units=(ranger,),
+                enemies=(unit(100, UnitType.WORKER, (3, 0), controlled=False),),
+                resources=0,
+            )
+        )
+        turn = make_turn(
+            tick=2,
+            core=core,
+            units=(ranger,),
+            enemies=(unit(100, UnitType.WORKER, (2, 0), controlled=False),),
+            resources=0,
+        )
+
+        tactic.choose_actions(turn)
+
+        self.assertNotIsInstance(turn.plan.unit_actions[ranger.id], ShootAction)
+        mission = next(
+            row
+            for row in tactic.last_decision_trace["combat"]["fire_missions"]
+            if row["target_id"] == str(uid(100))
+        )
+        self.assertFalse(mission["urgent"])
+        self.assertEqual(
+            tactic.last_decision_trace["combat"]["low_value_shots_deferred"][0][
+                "target_id"
+            ],
+            str(uid(100)),
+        )
+
     def test_confirmed_distance_fifty_core_launches_surplus_two_by_two_raid(self) -> None:
         core = friendly_core(position=(0, 0))
         vanguards = tuple(
@@ -270,7 +328,7 @@ class CombatDefenseTests(unittest.TestCase):
             if squad.support_target is not None
         ]
         self.assertEqual(len(supports), len(set(supports)))
-        self.assertEqual(tactic.last_decision_trace["schema_version"], 39)
+        self.assertEqual(tactic.last_decision_trace["schema_version"], 40)
         formation = tactic.last_decision_trace["combat"]["formation"]
         assigned_supports = [
             tuple(bundle["support"])

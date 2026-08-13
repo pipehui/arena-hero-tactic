@@ -11,6 +11,9 @@ from .models import (
     CargoRouteProgress,
     CoreServiceJob,
     CoreServicePhase,
+    ServiceTransitKind,
+    ServiceTransitRoute,
+    ServiceTransitProgress,
     CoreSlotSchedule,
     CoreServiceWindow,
     CoreServiceQueue,
@@ -79,6 +82,7 @@ from .recovery import RecoveryPlanner
 from .production import ProductionPlanner
 from .raid import RaidPlanner
 from .service import CoreServiceChoreography, CoreServicePlanner
+from .service_transit import CoreServiceTransitPlanner
 from .state import TacticMemory
 from .trace import DecisionTraceBuilder
 from .worker import WorkerPlanner
@@ -93,6 +97,9 @@ __all__ = (
     "CargoRouteProgress",
     "CoreServiceJob",
     "CoreServicePhase",
+    "ServiceTransitKind",
+    "ServiceTransitRoute",
+    "ServiceTransitProgress",
     "CoreSlotSchedule",
     "CoreServiceWindow",
     "CoreServiceQueue",
@@ -108,6 +115,7 @@ __all__ = (
     "CombatPlanner",
     "CoreServiceChoreography",
     "CoreServicePlanner",
+    "CoreServiceTransitPlanner",
     "DEFAULT_CONFIG",
     "DefensePlanner",
     "DecisionContext",
