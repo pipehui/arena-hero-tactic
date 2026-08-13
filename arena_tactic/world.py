@@ -156,10 +156,15 @@ def _sync_events(
                         suppressed_until=turn.tick,
                         last_evidence_tick=turn.tick,
                         release_reason="SHOT_HIT",
+                        last_attempt_tick=turn.tick,
                     )
                 else:
                     previous = memory.ranger_shot_feedback.get(key)
-                    misses = 1 if previous is None else previous.misses + 1
+                    consecutive = bool(
+                        previous is not None
+                        and previous.last_attempt_tick in {turn.tick - 1, turn.tick}
+                    )
+                    misses = 1 if not consecutive else previous.misses + 1
                     memory.ranger_shot_feedback[key] = ShotFeedback(
                         target_id=plan.target_id,
                         expected_cell=plan.expected_cell,
@@ -167,6 +172,7 @@ def _sync_events(
                         suppressed_until=turn.tick,
                         last_evidence_tick=turn.tick,
                         release_reason=None,
+                        last_attempt_tick=turn.tick,
                     )
         if event.event_type == "SWEEP_RESOLVED" and event.actor_id is not None:
             plan = memory.last_vanguard_sweeps.get(event.actor_id)

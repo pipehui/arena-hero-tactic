@@ -35,6 +35,7 @@ from .models import (
     VanguardIntent,
     VanguardIntentEstimate,
     VanguardAssignmentCandidate,
+    VanguardInterceptLease,
     VanguardInterceptTask,
     WorldModel,
 )
@@ -42,6 +43,7 @@ from .projection import TacticalMap
 from .planning import (
     MoveViability,
     move_viability,
+    path_to,
     route_from_field,
     route_to,
     weighted_distance_field,
@@ -92,17 +94,31 @@ class CombatPlanner:
                 self.memory.engaged_enemy_until.pop(enemy_id, None)
         for key, feedback in tuple(self.memory.ranger_shot_feedback.items()):
             target = world.enemy(feedback.target_id)
+            stationary_ticks = self._stationary_ticks(world.track(feedback.target_id))
+            current_attack = bool(
+                target is not None
+                and self._enemy_attacks_any_friendly(
+                    world,
+                    target,
+                    target.position,
+                )
+            )
             if (
                 feedback.misses >= self.config.ranger_repeat_miss_limit
                 and target is not None
                 and target.position == feedback.expected_cell
+                and (stationary_ticks >= 2 or current_attack)
             ):
                 self.memory.ranger_shot_feedback[key] = replace(
                     feedback,
                     misses=0,
                     suppressed_until=world.tick,
                     last_evidence_tick=world.tick,
-                    release_reason="CURRENT_OCCUPANCY",
+                    release_reason=(
+                        "STATIONARY_CONFIRMATION"
+                        if stationary_ticks >= 2
+                        else "CURRENT_ATTACK_CONFIRMATION"
+                    ),
                 )
                 continue
             if world.tick > feedback.suppressed_until + self.config.ranger_miss_suppress_ticks:
@@ -387,6 +403,7 @@ class CombatPlanner:
         self._allocate_urgent_remainders(world, projection, state)
         self._allocate_enemy_core_fire(world, state)
         self._allocate_opportunistic_fire(world, projection, state)
+        self._release_redundant_adjacent_vanguard_shooters(world, state)
 
         intents, shot_plans = self._assigned_fire_intents(state)
         last_stand, last_stand_plans = self._last_stand_fire(
@@ -623,6 +640,14 @@ class CombatPlanner:
                 ):
                     continue
                 mission = missions[enemy.id]
+                if self._worker_fire_blocked_by_urgent_combat(
+                    world,
+                    projection,
+                    ranger,
+                    mission,
+                    state,
+                ):
+                    continue
                 if self._defer_single_worker_shot(world, mission, state):
                     # One Ranger cannot cover an uncertain moving Worker's
                     # branch set.  Preserve contact or improve a top-two line
@@ -662,6 +687,79 @@ class CombatPlanner:
             state.assignments[ranger_id] = target_id, cell, "OPPORTUNISTIC_FIRE"
             state.mission_assignments[target_id].append((ranger_id, cell))
             state.available.remove(ranger_id)
+
+    def _worker_fire_blocked_by_urgent_combat(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        ranger: EntitySnapshot,
+        mission,
+        state,
+    ) -> bool:
+        if mission.target_type is not UnitType.WORKER or mission.urgent:
+            return False
+        blocked = frozenset(
+            (projection.hostile_occupied | projection.service_positions)
+            - {ranger.position}
+        )
+        for combat_mission in state.missions:
+            if (
+                not combat_mission.urgent
+                or combat_mission.target_type
+                not in {UnitType.VANGUARD, UnitType.RANGER}
+            ):
+                continue
+            for cell in combat_mission.candidate_cells[:2]:
+                if ranger_line_is_clear(
+                    ranger.position,
+                    cell,
+                    world.known_obstacles,
+                ):
+                    return True
+                for stance in ranger_firing_positions(cell):
+                    if (
+                        manhattan(ranger.position, stance) > 2
+                        or stance not in world.known_passable
+                        or stance in blocked
+                    ):
+                        continue
+                    route = route_to(
+                        world,
+                        ranger.position,
+                        stance,
+                        node_limit=min(self.config.path_node_limit, 64),
+                        blocked=blocked - {stance},
+                    )
+                    if route is not None and route.distance <= 2:
+                        return True
+        return False
+
+    def _release_redundant_adjacent_vanguard_shooters(self, world, state) -> None:
+        missions = {mission.target_id: mission for mission in state.missions}
+        for ranger_id, (target_id, _cell, _reason) in sorted(
+            tuple(state.assignments.items()),
+            key=lambda item: item[0].bytes,
+        ):
+            mission = missions.get(target_id)
+            ranger = state.ranger_by_id[ranger_id]
+            adjacent_vanguard = any(
+                enemy.unit_type is UnitType.VANGUARD
+                and manhattan(ranger.position, enemy.position) == 1
+                for enemy in world.enemies
+            )
+            assigned = state.mission_assignments.get(target_id, [])
+            if (
+                mission is None
+                or not mission.urgent
+                or not adjacent_vanguard
+                or len(assigned) <= mission.required_hits
+            ):
+                continue
+            state.assignments.pop(ranger_id, None)
+            state.mission_assignments[target_id] = [
+                row for row in assigned if row[0] != ranger_id
+            ]
+            state.available.add(ranger_id)
 
     @staticmethod
     def _defer_single_worker_shot(world, mission, state) -> bool:
@@ -918,7 +1016,17 @@ class CombatPlanner:
                 ],
             ] = {}
             ranked_missions = sorted(
-                positioning_missions,
+                (
+                    mission
+                    for mission in positioning_missions
+                    if not self._worker_fire_blocked_by_urgent_combat(
+                        world,
+                        projection,
+                        ranger,
+                        mission,
+                        state,
+                    )
+                ),
                 key=lambda mission: self.target_priority(
                     world,
                     projection,
@@ -1730,10 +1838,14 @@ class CombatPlanner:
             role = mission.candidate_roles[mission.candidate_cells.index(cell)]
         except (ValueError, IndexError):
             role = ""
-        # Authoritative current occupancy is new evidence.  Confidence alone
-        # is not: a high-confidence predictor must not erase two observed
-        # misses at the same empty cell.
-        if role == "CURRENT":
+        # Movement resolves before fire.  A single current observation is not
+        # enough to erase repeated evidence that the target leaves this cell.
+        # Only a confirmed hold or a current attack makes it authoritative for
+        # the combat snapshot.
+        if (
+            mission.prediction_mode == VanguardIntent.STATIONARY.value
+            or "CURRENT_ATTACK_AVAILABLE" in mission.evidence
+        ) and role in {"CURRENT", "CURRENT_HOLD", "CURRENT_ATTACK"}:
             return False
         return bool(
             feedback is not None
@@ -1873,6 +1985,40 @@ class CombatPlanner:
                     for cell in ordered[:5]
                 ),
                 ("CURRENT_ATTACK_AVAILABLE", "OBSTACLE_AWARE_APPROACH"),
+                stationary_ticks=self._stationary_ticks(track),
+            )
+
+        stationary_ticks = self._stationary_ticks(track)
+        if stationary_ticks >= 2:
+            alternatives = sorted(
+                (cell for cell in legal if cell != enemy.position),
+                key=lambda cell: (
+                    -self._enemy_action_value(world, enemy, cell),
+                    approach_costs.get(cell, 1 << 20),
+                    cell,
+                ),
+            )
+            ordered = self._dedupe_legal(
+                [enemy.position, *alternatives, *trajectory],
+                legal,
+            )
+            return VanguardIntentEstimate(
+                enemy.id,
+                VanguardIntent.STATIONARY,
+                "HIGH" if stationary_ticks >= 3 else "MEDIUM",
+                tuple(ordered[:5]),
+                tuple(
+                    "CURRENT_HOLD" if cell == enemy.position else "HOLD_EXIT"
+                    for cell in ordered[:5]
+                ),
+                (
+                    "THREE_TICK_STATIONARY"
+                    if stationary_ticks >= 3
+                    else "TWO_TICK_STATIONARY",
+                    f"STATIONARY_TICKS={stationary_ticks}",
+                    "OBSTACLE_AWARE_APPROACH",
+                ),
+                stationary_ticks=stationary_ticks,
             )
 
         if track is not None and len(track.samples) >= 3:
@@ -1901,6 +2047,7 @@ class CombatPlanner:
                         for cell in ordered[:5]
                     ),
                     ("TWO_TICK_OUTWARD_MOTION", "OBSTACLE_AWARE_APPROACH"),
+                    stationary_ticks=stationary_ticks,
                 )
 
         moved = bool(
@@ -1960,6 +2107,7 @@ class CombatPlanner:
                     "PROTECTED_TARGET_CLOSING",
                     "OBSTACLE_AWARE_APPROACH",
                 ),
+                stationary_ticks=stationary_ticks,
             )
 
         motion = next((cell for cell in trajectory if cell != enemy.position), None)
@@ -1979,8 +2127,11 @@ class CombatPlanner:
                 cell,
             ),
         )
+        # When intent is unresolved the current cell remains a first-class
+        # outcome: the Vanguard may simply hold.  Do not demote WAIT behind
+        # every speculative lateral branch.
         ordered = self._dedupe_legal(
-            [cell for cell in (approach, motion, *lateral, enemy.position) if cell is not None],
+            [cell for cell in (approach, enemy.position, motion, *lateral) if cell is not None],
             legal,
         )
         return VanguardIntentEstimate(
@@ -1999,7 +2150,24 @@ class CombatPlanner:
                 for cell in ordered[:5]
             ),
             ("INTENT_NOT_RESOLVED", "OBSTACLE_AWARE_APPROACH"),
+            stationary_ticks=stationary_ticks,
         )
+
+    @staticmethod
+    def _stationary_ticks(track) -> int:
+        if track is None or not track.samples:
+            return 0
+        ticks = 0
+        last_position = track.samples[-1][1]
+        last_tick = None
+        for tick, position in reversed(track.samples):
+            if position != last_position or tick == last_tick:
+                if tick == last_tick:
+                    continue
+                break
+            ticks += 1
+            last_tick = tick
+        return ticks
 
     def _hostile_approach_estimate(
         self,
@@ -2295,6 +2463,7 @@ class CombatPlanner:
             and unit.id != self.memory.beacon_mission_actor_id
         )
         if not urgent or not vanguards:
+            self.memory.vanguard_intercept_leases.clear()
             return HomeCombatAssignment(
                 unassigned_vanguards=tuple(unit.id for unit in vanguards),
                 uncovered_targets=tuple(enemy.id for enemy in urgent),
@@ -2371,15 +2540,45 @@ class CombatPlanner:
             candidates = predictions[target.id]
             rows = []
             for vanguard in available:
-                intercept, cost = self._vanguard_assignment_cost(
+                lease = self.memory.vanguard_intercept_leases.get(vanguard.id)
+                if self._vanguard_lease_valid(
                     world,
                     projection,
                     vanguard,
                     target,
                     predictions[target.id],
-                    fields[vanguard.id],
-                    reserved=frozenset(reserved_intercepts),
-                )
+                    lease,
+                    frozenset(reserved_intercepts),
+                ):
+                    assert lease is not None
+                    intercept = lease.intercept_cell
+                    route_distance = fields[vanguard.id].get(intercept, 1 << 20)
+                    cost = (
+                        -1,
+                        projection.immediate_attackers(intercept),
+                        projection.future_attackers(intercept),
+                        0,
+                        route_distance,
+                        -sum(
+                            len(predictions[target.id]) - rank
+                            for rank, cell in enumerate(predictions[target.id])
+                            if manhattan(intercept, cell) == 1
+                        ),
+                        0,
+                        manhattan(intercept, world.core.position),
+                        intercept[0],
+                        intercept[1],
+                    )
+                else:
+                    intercept, cost = self._vanguard_assignment_cost(
+                        world,
+                        projection,
+                        vanguard,
+                        target,
+                        predictions[target.id],
+                        fields[vanguard.id],
+                        reserved=frozenset(reserved_intercepts),
+                    )
                 if intercept in reserved_intercepts:
                     continue
                 rows.append((cost, vanguard.id.bytes, vanguard, intercept))
@@ -2389,6 +2588,33 @@ class CombatPlanner:
             assigned.add(vanguard.id)
             reserved_intercepts.add(intercept)
             response_counts[target.id] += 1
+            previous_lease = self.memory.vanguard_intercept_leases.get(vanguard.id)
+            route_distance = fields[vanguard.id].get(intercept, 1 << 20)
+            same_lease = bool(
+                previous_lease is not None
+                and previous_lease.target_id == target.id
+                and previous_lease.intercept_cell == intercept
+            )
+            progressed = bool(
+                same_lease
+                and route_distance < previous_lease.last_route_distance
+            )
+            self.memory.vanguard_intercept_leases[vanguard.id] = VanguardInterceptLease(
+                vanguard_id=vanguard.id,
+                target_id=target.id,
+                intercept_cell=intercept,
+                assigned_tick=(
+                    previous_lease.assigned_tick
+                    if same_lease
+                    else world.tick
+                ),
+                last_route_distance=route_distance,
+                no_progress_ticks=(
+                    0
+                    if not same_lease or route_distance == 0 or progressed
+                    else previous_lease.no_progress_ticks + 1
+                ),
+            )
             tasks.append(
                 VanguardInterceptTask(
                     vanguard_id=vanguard.id,
@@ -2418,6 +2644,9 @@ class CombatPlanner:
                 pass
 
         covered = {task.target_id for task in tasks}
+        for vanguard_id in tuple(self.memory.vanguard_intercept_leases):
+            if vanguard_id not in assigned:
+                self.memory.vanguard_intercept_leases.pop(vanguard_id, None)
         selected_pairs = {(task.vanguard_id, task.target_id) for task in tasks}
         candidate_rows = tuple(
             VanguardAssignmentCandidate(
@@ -2455,6 +2684,55 @@ class CombatPlanner:
             ),
         )
 
+    def _vanguard_lease_valid(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        vanguard: EntitySnapshot,
+        target: EntitySnapshot,
+        candidates: tuple[Position, ...],
+        lease: VanguardInterceptLease | None,
+        reserved: frozenset[Position],
+    ) -> bool:
+        if (
+            lease is None
+            or lease.target_id != target.id
+            or lease.intercept_cell in reserved
+            or lease.intercept_cell in world.known_obstacles
+            or lease.intercept_cell in projection.hostile_occupied
+            or lease.intercept_cell in projection.service_positions
+            or lease.no_progress_ticks >= 2
+            or projection.immediate_attackers(lease.intercept_cell) >= vanguard.hp
+        ):
+            return False
+        assert world.core is not None
+        if manhattan(target.position, world.core.position) < manhattan(
+            lease.intercept_cell,
+            world.core.position,
+        ):
+            return False
+        route = route_to(
+            world,
+            vanguard.position,
+            lease.intercept_cell,
+            node_limit=self.config.path_node_limit,
+            blocked=frozenset(
+                (projection.hostile_occupied | projection.service_positions)
+                - {vanguard.position, lease.intercept_cell}
+            ),
+        )
+        if route is None and vanguard.position != lease.intercept_cell:
+            return False
+        coverage = any(
+            manhattan(lease.intercept_cell, candidate) == 1
+            for candidate in candidates[:2]
+        )
+        return bool(
+            coverage
+            or world.tick
+            < lease.assigned_tick + self.config.vanguard_intercept_lease_ticks
+        )
+
     def _vanguard_assignment_cost(
         self,
         world: WorldModel,
@@ -2479,6 +2757,38 @@ class CombatPlanner:
             and manhattan(neighbor, world.core.position)
             <= self.config.home_pursuit_radius
         }
+        protected = min(
+            (
+                world.core.position,
+                *(
+                    unit.position
+                    for unit in world.friendlies
+                    if unit.unit_type in {UnitType.WORKER, UnitType.RANGER}
+                ),
+            ),
+            key=lambda cell: manhattan(target.position, cell),
+        )
+        approach_path = path_to(
+            world,
+            target.position,
+            protected,
+            node_limit=self.config.path_node_limit,
+            blocked=frozenset(
+                (projection.hostile_occupied | projection.service_positions)
+                - {target.position, protected}
+            ),
+        )
+        if approach_path is not None:
+            for path_cell in approach_path[1:4]:
+                for _, neighbor in cardinal_neighbors(path_cell):
+                    if (
+                        neighbor in world.known_passable
+                        and neighbor not in world.known_obstacles
+                        and neighbor not in projection.hostile_occupied
+                        and neighbor not in projection.service_positions
+                        and neighbor not in reserved
+                    ):
+                        intercepts.add(neighbor)
         if (
             vanguard.position not in reserved
             and any(manhattan(vanguard.position, cell) == 1 for cell in candidates)
@@ -2487,6 +2797,7 @@ class CombatPlanner:
         if not intercepts:
             return vanguard.position, (
                 1,
+                1 << 20,
                 1 << 20,
                 0,
                 1,
@@ -2498,6 +2809,10 @@ class CombatPlanner:
             )
         screening = self.memory.screening_groups.get(target.id)
         rows = []
+        close_engagement = (
+            manhattan(vanguard.position, target.position)
+            <= self.config.vanguard_engage_distance
+        )
         for cell in intercepts:
             coverage = sum(
                 len(candidates) - rank
@@ -2505,22 +2820,37 @@ class CombatPlanner:
                 if manhattan(cell, candidate) == 1
             )
             path_cost = distances.get(cell, 1 << 20)
-            rows.append(
-                (
-                    (
-                        int(cell != vanguard.position or not coverage),
-                        path_cost,
-                        -coverage,
-                        int(screening is None or vanguard.id not in screening.vanguard_ids),
-                        projection.immediate_attackers(cell),
-                        projection.future_attackers(cell),
-                        manhattan(cell, world.core.position),
-                        cell[0],
-                        cell[1],
-                    ),
-                    cell,
+            fatal = int(projection.immediate_attackers(cell) >= vanguard.hp)
+            if close_engagement:
+                # At contact range, sealing the enemy's real movement options
+                # is worth one non-fatal exposure.  Fatal cells remain a hard
+                # last resort; beyond contact range exposure again dominates.
+                cost = (
+                    fatal,
+                    -coverage,
+                    projection.immediate_attackers(cell),
+                    projection.future_attackers(cell),
+                    int(cell != vanguard.position or not coverage),
+                    path_cost,
+                    int(screening is None or vanguard.id not in screening.vanguard_ids),
+                    manhattan(cell, world.core.position),
+                    cell[0],
+                    cell[1],
                 )
-            )
+            else:
+                cost = (
+                    fatal,
+                    projection.immediate_attackers(cell),
+                    projection.future_attackers(cell),
+                    int(cell != vanguard.position or not coverage),
+                    path_cost,
+                    -coverage,
+                    int(screening is None or vanguard.id not in screening.vanguard_ids),
+                    manhattan(cell, world.core.position),
+                    cell[0],
+                    cell[1],
+                )
+            rows.append((cost, cell))
         cost, intercept = min(rows, key=lambda row: row[0])
         return intercept, cost
 
@@ -2771,6 +3101,8 @@ class CombatPlanner:
             if vanguard.position == assigned_intercept
             else (1 << 20 if current_path is None else current_path.distance)
         )
+        current_immediate = projection.immediate_attackers(vanguard.position)
+        current_future = projection.future_attackers(vanguard.position)
         for index, (direction, destination) in enumerate(
             cardinal_neighbors(vanguard.position)
         ):
@@ -2822,6 +3154,12 @@ class CombatPlanner:
                 next_path_cost < current_path_cost
                 or route_block < current_route_block
                 or candidate_coverage > current_coverage
+                or (
+                    (current_immediate > 0 or current_future > 0)
+                    and immediate == 0
+                    and future == 0
+                    and route_block <= current_route_block + 2
+                )
             )
             if improves_intercept:
                 terminal_exception = (
@@ -2858,6 +3196,12 @@ class CombatPlanner:
                     index,
                 )
                 options.append((score, direction, destination, viability))
+        if current_immediate > 0 or current_future > 0:
+            safe_options = [
+                row for row in options if row[0][4] == 0 and row[0][5] == 0
+            ]
+            if safe_options:
+                options = safe_options
         intents = [
             ActionIntent.move(
                 vanguard.id,
@@ -2909,7 +3253,7 @@ class CombatPlanner:
                     54,
                     reason=(
                         "HOLD_INTERCEPT_LINE"
-                        if projection.immediate_attackers(vanguard.position) < vanguard.hp
+                        if current_immediate == 0 and current_future == 0
                         else "NO_SURVIVABLE_ACTION"
                     ),
                     target_id=target.id,

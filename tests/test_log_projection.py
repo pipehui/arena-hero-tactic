@@ -11,6 +11,7 @@ from arena_hero import (
     CommandPlan,
     CommandSource,
     Received,
+    TransportError,
     UnitType,
 )
 
@@ -54,7 +55,7 @@ class LogProjectionTests(unittest.TestCase):
         compact = compact_strategy_trace(trace)
 
         self.assertEqual(trace, original)
-        self.assertEqual(compact["schema_version"], 41)
+        self.assertEqual(compact["schema_version"], 42)
         self.assertEqual(compact["source_trace_schema"], 36)
         self.assertNotIn("tasks", compact)
         decision = compact["decisions"][0]
@@ -187,6 +188,42 @@ class LogProjectionTests(unittest.TestCase):
         )
         self.assertFalse(receipt["matches_turn_plan"])
         self.assertIn("plan", receipt)
+
+    def test_unknown_submission_can_match_later_agent_receipt(self) -> None:
+        worker = unit(1, UnitType.WORKER, (1, 0))
+        turn = make_turn(tick=20, units=(worker,))
+        tactic = BalancedTactic()
+        tactic.choose_actions(turn)
+        with tempfile.TemporaryDirectory() as directory:
+            logger = ReplayLogger(directory)
+            logger.record_turn(
+                turn,
+                decision_ms=1.0,
+                submission_ms=5_000.0,
+                error=TransportError("response timed out"),
+                failure_stage="submitting",
+                recoverable=True,
+                strategy=tactic.last_decision_trace,
+            )
+            logger.record_receipt(
+                Received(
+                    tick=20,
+                    source=CommandSource.AGENT,
+                    received_at=datetime.now(timezone.utc),
+                    plan=turn.plan,
+                )
+            )
+            logger.close(status="completed", last_tick=20)
+            records = [
+                json.loads(line)
+                for line in logger.path.read_text(encoding="utf-8").splitlines()
+            ]
+
+        receipt = next(
+            row for row in records if row["record_type"] == "canonical_receipt"
+        )
+        self.assertTrue(receipt["matches_turn_plan"])
+        self.assertEqual(receipt["plan_ref"]["tick"], 20)
 
     def test_representative_projection_reduces_raw_json_by_at_least_45_percent(self) -> None:
         trace = self._representative_trace(actor_count=53, cargo_count=21)

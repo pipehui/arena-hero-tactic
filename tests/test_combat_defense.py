@@ -276,7 +276,7 @@ class CombatDefenseTests(unittest.TestCase):
         self.assertIsInstance(action, ShootAction)
         self.assertNotEqual(action.expected_cell, (1, 0))
 
-    def test_authoritative_current_occupancy_releases_miss_suppression(self) -> None:
+    def test_single_current_observation_does_not_release_miss_suppression(self) -> None:
         ranger = unit(1, UnitType.RANGER, (3, 0))
         target_id = uid(100)
         core = friendly_core(position=(10, 10))
@@ -301,11 +301,85 @@ class CombatDefenseTests(unittest.TestCase):
         tactic.choose_actions(turn)
 
         action = turn.plan.unit_actions[ranger.id]
-        self.assertIsInstance(action, ShootAction)
-        self.assertEqual(action.expected_cell, (0, 0))
+        self.assertFalse(
+            isinstance(action, ShootAction) and action.expected_cell == (0, 0)
+        )
         feedback = tactic.memory.ranger_shot_feedback[(target_id, (0, 0))]
+        self.assertEqual(feedback.misses, 2)
+        self.assertIsNone(feedback.release_reason)
+
+    def test_stationary_vanguard_promotes_current_cell_and_releases_suppression(self) -> None:
+        core = friendly_core(position=(10, 10))
+        rangers = (
+            unit(1, UnitType.RANGER, (3, 0)),
+            unit(2, UnitType.RANGER, (0, 3)),
+        )
+        target = unit(100, UnitType.VANGUARD, (0, 0), controlled=False)
+        tactic = BalancedTactic(
+            memory=TacticMemory(core_id=core.id, core_position=core.position)
+        )
+        tactic.memory.ranger_shot_feedback[(target.id, target.position)] = ShotFeedback(
+            target_id=target.id,
+            expected_cell=target.position,
+            misses=2,
+            suppressed_until=4,
+            last_evidence_tick=1,
+        )
+
+        tactic.choose_actions(
+            make_turn(tick=1, core=core, units=rangers, enemies=(target,), resources=0)
+        )
+        tactic.choose_actions(
+            make_turn(tick=2, core=core, units=rangers, enemies=(target,), resources=0)
+        )
+
+        mission = tactic.last_decision_trace["combat"]["fire_missions"][0]
+        self.assertEqual(mission["prediction_mode"], "STATIONARY")
+        self.assertEqual(mission["candidate_cells"][0], [0, 0])
+        self.assertIn("TWO_TICK_STATIONARY", mission["evidence"])
+        feedback = tactic.memory.ranger_shot_feedback[(target.id, target.position)]
         self.assertEqual(feedback.misses, 0)
-        self.assertEqual(feedback.release_reason, "CURRENT_OCCUPANCY")
+        self.assertEqual(feedback.release_reason, "STATIONARY_CONFIRMATION")
+
+    def test_three_tick_stationary_vanguard_concentrates_current_cell_fire(self) -> None:
+        core = friendly_core(position=(10, 10))
+        rangers = tuple(
+            unit(index, UnitType.RANGER, position)
+            for index, position in enumerate(
+                ((3, 0), (-3, 0), (0, 3), (0, -3)),
+                start=1,
+            )
+        )
+        target = unit(100, UnitType.VANGUARD, (0, 0), controlled=False)
+        tactic = BalancedTactic(
+            memory=TacticMemory(core_id=core.id, core_position=core.position)
+        )
+
+        for tick in range(1, 4):
+            turn = make_turn(
+                tick=tick,
+                core=core,
+                units=rangers,
+                enemies=(target,),
+                resources=0,
+            )
+            tactic.choose_actions(turn)
+
+        mission = tactic.last_decision_trace["combat"]["fire_missions"][0]
+        self.assertEqual(mission["prediction_mode"], "STATIONARY")
+        self.assertEqual(mission["confidence"], "HIGH")
+        shots = [
+            action
+            for action in turn.plan.unit_actions.values()
+            if isinstance(action, ShootAction)
+        ]
+        self.assertGreaterEqual(len(shots), target.hp)
+        self.assertTrue(
+            all(
+                action.expected_cell == target.position
+                for action in shots[: target.hp]
+            )
+        )
 
     def test_peaceful_squads_globally_reserve_distinct_support_slots(self) -> None:
         vanguards = (
@@ -328,7 +402,7 @@ class CombatDefenseTests(unittest.TestCase):
             if squad.support_target is not None
         ]
         self.assertEqual(len(supports), len(set(supports)))
-        self.assertEqual(tactic.last_decision_trace["schema_version"], 40)
+        self.assertEqual(tactic.last_decision_trace["schema_version"], 41)
         formation = tactic.last_decision_trace["combat"]["formation"]
         assigned_supports = [
             tuple(bundle["support"])
@@ -724,6 +798,93 @@ class CombatDefenseTests(unittest.TestCase):
         tasks = tactic.last_decision_trace["combat"]["home_vanguard_assignment"]["tasks"]
         intercepts = [tuple(row["intercept_cell"]) for row in tasks]
         self.assertEqual(len(intercepts), len(set(intercepts)))
+        self.assertLessEqual(len(tasks), len(enemies) * 2)
+
+    def test_vanguard_intercept_line_is_leased_across_prediction_noise(self) -> None:
+        vanguards = (
+            unit(1, UnitType.VANGUARD, (-2, -2)),
+            unit(2, UnitType.VANGUARD, (2, -2)),
+        )
+        target = unit(900, UnitType.VANGUARD, (0, -6), controlled=False)
+        memory = TacticMemory(opening_complete=True)
+        memory.known_passable.update(
+            (x, y) for x in range(-9, 10) for y in range(-9, 10)
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(
+            make_turn(tick=1, units=vanguards, enemies=(target,), resources=0)
+        )
+        first = {
+            row["vanguard_id"]: tuple(row["intercept_cell"])
+            for row in tactic.last_decision_trace["combat"][
+                "home_vanguard_assignment"
+            ]["tasks"]
+        }
+        tactic.choose_actions(
+            make_turn(tick=2, units=vanguards, enemies=(target,), resources=0)
+        )
+        second_rows = tactic.last_decision_trace["combat"][
+            "home_vanguard_assignment"
+        ]["tasks"]
+        second = {
+            row["vanguard_id"]: tuple(row["intercept_cell"])
+            for row in second_rows
+        }
+
+        self.assertEqual(second, first)
+        self.assertTrue(second_rows)
+        self.assertTrue(
+            all(row["lease"]["assigned_tick"] == 1 for row in second_rows)
+        )
+
+    def test_urgent_combat_target_suppresses_nonurgent_worker_fire(self) -> None:
+        rangers = (
+            unit(1, UnitType.RANGER, (13, 0)),
+            unit(2, UnitType.RANGER, (10, 3)),
+            unit(3, UnitType.RANGER, (10, -3)),
+        )
+        enemies = (
+            unit(100, UnitType.VANGUARD, (10, 0), controlled=False),
+            unit(101, UnitType.WORKER, (16, 0), controlled=False),
+        )
+        turn = make_turn(
+            core=friendly_core(position=(0, 0)),
+            units=rangers,
+            enemies=enemies,
+            resources=0,
+        )
+        tactic = BalancedTactic()
+
+        tactic.choose_actions(turn)
+
+        worker_cell = enemies[1].position
+        self.assertFalse(
+            any(
+                isinstance(action, ShootAction)
+                and action.expected_cell == worker_cell
+                for action in turn.plan.unit_actions.values()
+            )
+        )
+
+    def test_remote_ranger_may_fire_at_worker_when_it_cannot_reinforce(self) -> None:
+        ranger = unit(1, UnitType.RANGER, (27, 0))
+        enemies = (
+            unit(100, UnitType.VANGUARD, (10, 0), controlled=False),
+            unit(101, UnitType.WORKER, (30, 0), controlled=False),
+        )
+        turn = make_turn(
+            core=friendly_core(position=(0, 0)),
+            units=(ranger,),
+            enemies=enemies,
+            resources=0,
+        )
+
+        BalancedTactic().choose_actions(turn)
+
+        action = turn.plan.unit_actions[ranger.id]
+        self.assertIsInstance(action, ShootAction)
+        self.assertEqual(action.expected_cell, enemies[1].position)
 
     def test_global_vanguard_assignment_uses_nearest_defender_before_uuid_order(self) -> None:
         vanguards = (
@@ -1374,6 +1535,7 @@ class CombatDefenseTests(unittest.TestCase):
             core=friendly_core(position=(0, 5)),
             units=(vanguard,),
             enemies=(enemy,),
+            obstacle_cells=((2, -1), (2, 1), (3, 0)),
             resources=0,
         )
 

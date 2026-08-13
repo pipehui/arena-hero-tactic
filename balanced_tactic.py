@@ -6,7 +6,7 @@ from getpass import getpass
 from pathlib import Path
 from time import perf_counter
 
-from arena_hero import APIError, ArenaHeroClient, Received, Turn
+from arena_hero import APIError, ArenaHeroClient, Received, TransportError, Turn
 
 from arena_tactic import (
     DEFAULT_CONFIG,
@@ -35,6 +35,9 @@ def choose_actions(turn: Turn, tactic: BalancedTactic | None = None) -> Balanced
 def play(
     api_key: str,
     log_directory: str | os.PathLike[str] | None = None,
+    *,
+    request_timeout: float = 2.5,
+    request_retries: int = 1,
 ) -> None:
     normalized_api_key = api_key.strip(" \t\r\n\v\f")
     if not normalized_api_key:
@@ -45,16 +48,28 @@ def play(
         log_root / "watchdog" / "tactic_process.lock"
     )
     with instance_lock:
-        _play_locked(normalized_api_key, log_root)
+        _play_locked(
+            normalized_api_key,
+            log_root,
+            request_timeout=request_timeout,
+            request_retries=request_retries,
+        )
 
 
 def _play_locked(
     normalized_api_key: str,
     log_root: Path,
+    *,
+    request_timeout: float,
+    request_retries: int,
 ) -> None:
     memory_store = ExplorationMemoryStore(log_root)
     tactic = BalancedTactic(memory=memory_store.load())
-    replay = ReplayLogger(log_root)
+    replay = ReplayLogger(
+        log_root,
+        request_timeout=request_timeout,
+        request_retries=request_retries,
+    )
     heartbeat = HeartbeatWriter(log_root / "watchdog" / "tactic_heartbeat.json")
     heartbeat.mark("CONNECTING")
     print(f"Replay log: {replay.path}", flush=True)
@@ -79,7 +94,11 @@ def _play_locked(
             terminal_ticks.pop(next(iter(terminal_ticks)))
 
     try:
-        with ArenaHeroClient(api_key=normalized_api_key) as game:
+        with ArenaHeroClient(
+            api_key=normalized_api_key,
+            request_timeout=request_timeout,
+            request_retries=request_retries,
+        ) as game:
             stage = "waiting_for_turn"
             for event in game.events():
                 if isinstance(event, Received):
@@ -170,6 +189,33 @@ def _play_locked(
                         strategy=tactic.last_decision_trace,
                     )
                     raise
+                except TransportError as error:
+                    # The request may have reached the server even though the
+                    # response was lost.  Replanning or changing the
+                    # idempotency key would risk submitting two plans for the
+                    # same Tick, so mark the Tick terminal locally and wait for
+                    # the next authoritative Turn/receipt.
+                    submission_ms = (perf_counter() - submission_started) * 1_000
+                    turn_failure_logged = True
+                    replay.record_turn(
+                        turn,
+                        decision_ms=decision_ms,
+                        submission_ms=submission_ms,
+                        error=error,
+                        failure_stage=stage,
+                        secret=normalized_api_key,
+                        strategy=tactic.last_decision_trace,
+                        recoverable=True,
+                    )
+                    mark_terminal(turn.tick)
+                    heartbeat.mark("SUBMISSION_OUTCOME_UNKNOWN", tick=turn.tick)
+                    print(
+                        f"tick={turn.tick} submission=outcome_unknown",
+                        flush=True,
+                    )
+                    stage = "waiting_for_turn"
+                    turn_failure_logged = False
+                    continue
                 except Exception as error:
                     submission_ms = (perf_counter() - submission_started) * 1_000
                     turn_failure_logged = True

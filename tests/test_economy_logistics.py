@@ -378,6 +378,65 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         action = turn.plan.unit_actions[worker.id]
         self.assertNotEqual(getattr(action, "direction", None), Direction.DOWN)
 
+    def test_full_health_worker_rejects_zero_survival_terminal_in_live_ambush(self) -> None:
+        core = friendly_core(position=(405, -156))
+        worker_id = 1
+        tactic = BalancedTactic(
+            memory=TacticMemory(core_id=core.id, core_position=core.position)
+        )
+        frames = (
+            (
+                101944,
+                (351, -152),
+                ((351, -151),),
+                ((100, UnitType.VANGUARD, (353, -152)),),
+            ),
+            (
+                101945,
+                (350, -152),
+                ((348, -153), (349, -154), (350, -149), (351, -151)),
+                (
+                    (100, UnitType.VANGUARD, (352, -152)),
+                    (101, UnitType.RANGER, (350, -150)),
+                ),
+            ),
+            (
+                101946,
+                (349, -152),
+                ((348, -153), (349, -154), (351, -151)),
+                (
+                    (100, UnitType.VANGUARD, (351, -152)),
+                    (101, UnitType.RANGER, (350, -150)),
+                ),
+            ),
+        )
+        for tick, position, obstacles, hostile_rows in frames:
+            worker = unit(worker_id, UnitType.WORKER, position, cargo=1)
+            enemies = tuple(
+                unit(identifier, unit_type, hostile_position, controlled=False)
+                for identifier, unit_type, hostile_position in hostile_rows
+            )
+            turn = make_turn(
+                tick=tick,
+                core=core,
+                units=(worker,),
+                enemies=enemies,
+                obstacle_cells=obstacles,
+                resources=0,
+            )
+            tactic.choose_actions(turn)
+
+        action = turn.plan.unit_actions[worker.id]
+        self.assertFalse(
+            isinstance(action, MoveAction) and action.direction is Direction.UP
+        )
+        task = next(
+            row
+            for row in tactic.last_decision_trace["tasks"]
+            if row["actor_id"] == str(worker.id)
+        )
+        self.assertNotEqual(task["metadata"].get("survival_terminals"), 0)
+
     def test_escape_history_never_forces_worker_toward_visible_vanguard(self) -> None:
         core = friendly_core(position=(10, 10))
         worker = unit(1, UnitType.WORKER, (0, 0))
@@ -2951,7 +3010,7 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         task = next(item for item in tactic.last_decision_trace["tasks"] if item["actor_id"] == str(worker.id))
         self.assertEqual(task["mission"], "ESCAPE")
 
-    def test_escape_preserves_fresh_threats_and_uses_the_only_safe_retreat(self) -> None:
+    def test_escape_preserves_fresh_threats_and_waits_without_survival_terminal(self) -> None:
         core = friendly_core(position=(40, -1))
         worker_id = uid(1)
         tactic = BalancedTactic()
@@ -2984,8 +3043,13 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         state = tactic.memory.worker_escape_states[worker_id]
         self.assertEqual(set(state.threat_ids), {uid(100), uid(101), uid(102)})
         action = second.plan.unit_actions[worker_id]
-        self.assertIsInstance(action, MoveAction)
-        self.assertEqual(action.direction, Direction.DOWN)
+        self.assertIsInstance(action, WaitAction)
+        task = next(
+            row
+            for row in tactic.last_decision_trace["tasks"]
+            if row["actor_id"] == str(worker_id)
+        )
+        self.assertEqual(task["reason"], "NO_SURVIVABLE_ROUTE")
 
     def test_deposited_worker_receives_scout_target_before_leaving_core(self) -> None:
         worker_id = uid(1)

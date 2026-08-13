@@ -91,6 +91,7 @@ class DestinationExclusivity(str, Enum):
 
 class VanguardIntent(str, Enum):
     ATTACKING = "ATTACKING"
+    STATIONARY = "STATIONARY"
     RETREATING = "RETREATING"
     BLIND_SPOT_APPROACH = "BLIND_SPOT_APPROACH"
     UNCERTAIN = "UNCERTAIN"
@@ -737,6 +738,17 @@ class VanguardInterceptTask:
 
 
 @dataclass(frozen=True, slots=True)
+class VanguardInterceptLease:
+    vanguard_id: UUID
+    target_id: UUID
+    intercept_cell: Position
+    assigned_tick: int
+    last_route_distance: int
+    no_progress_ticks: int = 0
+    invalidation_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class VanguardAssignmentCandidate:
     vanguard_id: UUID
     target_id: UUID
@@ -792,6 +804,7 @@ class VanguardIntentEstimate:
     candidate_cells: tuple[Position, ...]
     candidate_roles: tuple[str, ...]
     evidence: tuple[str, ...] = ()
+    stationary_ticks: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -893,6 +906,7 @@ class ShotFeedback:
     suppressed_until: int
     last_evidence_tick: int | None = None
     release_reason: str | None = None
+    last_attempt_tick: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

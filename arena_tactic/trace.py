@@ -998,8 +998,27 @@ class DecisionTraceBuilder:
                         "sector": task.sector.value,
                         "phase": task.phase,
                         "intercept_cell": list(task.intercept_cell),
-                        "candidate_cells": [list(cell) for cell in task.candidate_cells],
+                        "candidate_cells": [
+                            list(cell) for cell in task.candidate_cells
+                        ],
                         "cost": list(task.cost),
+                        "lease": (
+                            None
+                            if (
+                                lease := self.memory.vanguard_intercept_leases.get(
+                                    task.vanguard_id
+                                )
+                            )
+                            is None
+                            else {
+                                "target_id": str(lease.target_id),
+                                "intercept_cell": list(lease.intercept_cell),
+                                "assigned_tick": lease.assigned_tick,
+                                "last_route_distance": lease.last_route_distance,
+                                "no_progress_ticks": lease.no_progress_ticks,
+                                "invalidation_reason": lease.invalidation_reason,
+                            }
+                        ),
                     }
                     for task in home_combat_assignment.tasks
                 ],
@@ -1173,6 +1192,7 @@ class DecisionTraceBuilder:
                     "suppressed_until": feedback.suppressed_until,
                     "last_evidence_tick": feedback.last_evidence_tick,
                     "release_reason": feedback.release_reason,
+                    "last_attempt_tick": feedback.last_attempt_tick,
                 }
                 for feedback in sorted(
                     self.memory.ranger_shot_feedback.values(),
@@ -1804,6 +1824,16 @@ class DecisionTraceBuilder:
             "prediction_mode": mission.prediction_mode,
             "candidate_roles": list(mission.candidate_roles),
             "evidence": list(mission.evidence),
+            "stationary_ticks": (
+                next(
+                    (
+                        int(item.removeprefix("STATIONARY_TICKS="))
+                        for item in mission.evidence
+                        if item.startswith("STATIONARY_TICKS=")
+                    ),
+                    0,
+                )
+            ),
             "split_fire": mission.split_fire,
             "shooters": [str(shooter) for shooter in mission.assigned_shooters],
             "assignments": [

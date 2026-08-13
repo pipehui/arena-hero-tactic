@@ -203,11 +203,36 @@ class WorkerSafetyEvaluator:
                 terminals += 1
                 continue
             for _, neighbor in cardinal_neighbors(cell):
+                unknown_frontier = (
+                    neighbor not in world.known_passable
+                    and neighbor != target
+                    and neighbor not in world.known_obstacles
+                    and neighbor not in projection.hostile_occupied
+                )
+                if unknown_frontier:
+                    # Unknown terrain is never traversed as a proved route,
+                    # but a safely reached frontier is a viable continuation:
+                    # visibility on the next Tick will reveal whether it is
+                    # open.  Without this terminal case, a Worker near the
+                    # edge of its current vision is falsely classified as
+                    # trapped even while moving directly away from threats.
+                    if (
+                        projection.immediate_attackers(neighbor) < hp
+                        and projection.future_attackers(neighbor) < hp
+                        and (
+                            not threat_layers
+                            or threat_layers[
+                                min(depth + 1, depth_limit)
+                            ].get(neighbor, 0)
+                            < hp
+                        )
+                    ):
+                        terminals += 1
+                    continue
                 if (
                     neighbor in visited
                     or neighbor in world.known_obstacles
                     or neighbor in projection.hostile_occupied
-                    or (neighbor not in world.known_passable and neighbor != target)
                     or projection.immediate_attackers(neighbor) >= hp
                     or projection.future_attackers(neighbor) >= hp
                     or (

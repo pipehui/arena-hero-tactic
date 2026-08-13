@@ -1807,10 +1807,11 @@ class WorkerPlanner:
                     "CORE_SERVICE" if destination == retreat_target else None
                 ),
             )
-            if not viability.viable or (
-                horizon == 0
-                and worker.hp < UNIT_MAX_HP[UnitType.WORKER]
-            ):
+            # A full-health Worker may spend its single non-fatal hit budget to
+            # cross an exposed cell, but never to enter a cell from which every
+            # continuation is fatal.  Treating a full-health unit as an
+            # exception here was what allowed the 101946 death pocket.
+            if not viability.viable or horizon == 0:
                 continue
             recent = self._recent_threat(projection, destination, state.threat_ids)
             heat = projection.worker_exposure(destination)[2]

@@ -118,6 +118,7 @@ class TacticConfig:
     outer_screen_no_progress_ticks: int = 2
     outer_screen_reverse_suppress_ticks: int = 2
     vanguard_engage_distance: int = 4
+    vanguard_intercept_lease_ticks: int = 4
     combat_exclusive_radius: int = 13
     peaceful_squad_radii: tuple[int, ...] = (5, 10, 15)
     squad_max_separation: int = 4
@@ -247,6 +248,7 @@ class TacticConfig:
             self.outer_screen_no_progress_ticks,
             self.outer_screen_reverse_suppress_ticks,
             self.vanguard_engage_distance,
+            self.vanguard_intercept_lease_ticks,
             self.combat_exclusive_radius,
             self.squad_max_separation,
             self.squad_reassembly_no_progress_ticks,

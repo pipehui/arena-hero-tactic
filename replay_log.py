@@ -15,6 +15,7 @@ from arena_hero import (
     Accepted,
     CommandSource,
     Received,
+    TransportError,
     Turn,
     __version__ as arena_hero_version,
 )
@@ -61,6 +62,8 @@ class ReplayLogger:
         *,
         tactic_name: str = "balanced_tactic",
         endpoint: str = DEFAULT_ENDPOINT,
+        request_timeout: float | None = None,
+        request_retries: int | None = None,
     ) -> None:
         started_at = _now()
         self.session_id = str(uuid4())
@@ -88,6 +91,8 @@ class ReplayLogger:
                 "tactic": tactic_name,
                 "arena_hero_sdk": arena_hero_version,
                 "endpoint": endpoint,
+                "request_timeout": request_timeout,
+                "request_retries": request_retries,
             }
         ):
             raise OSError(f"Could not initialize replay log: {self._io_error}")
@@ -145,6 +150,11 @@ class ReplayLogger:
             assert error is not None
             submission = {
                 "status": "error",
+                "outcome": (
+                    "unknown"
+                    if isinstance(error, TransportError)
+                    else "rejected"
+                ),
                 "stage": failure_stage,
                 "recoverable": recoverable,
                 "error": _safe_error(error, secret),
@@ -181,10 +191,18 @@ class ReplayLogger:
                 "submission": submission,
             }
         )
-        if (
-            written
-            and accepted is not None
-            and accepted.source == CommandSource.AGENT
+        uncertain_agent_submission = bool(
+            accepted is None
+            and isinstance(error, TransportError)
+            and recoverable
+            and failure_stage == "submitting"
+        )
+        if written and (
+            uncertain_agent_submission
+            or (
+                accepted is not None
+                and accepted.source == CommandSource.AGENT
+            )
         ):
             self._remember_agent_plan(turn.tick, plan_data)
         return written

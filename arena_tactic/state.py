@@ -41,6 +41,7 @@ from .models import (
     SegmentedReturnLease,
     ThreatHeatCell,
     LongRangeRaidCampaign,
+    VanguardInterceptLease,
 )
 
 
@@ -189,6 +190,9 @@ class TacticMemory:
     ranger_stance_leases: dict[tuple[UUID, UUID], RangerStanceLease] = field(
         default_factory=dict
     )
+    vanguard_intercept_leases: dict[UUID, VanguardInterceptLease] = field(
+        default_factory=dict
+    )
     defense_sector_anchors: dict[str, tuple[Position, int]] = field(
         default_factory=dict
     )
@@ -237,6 +241,7 @@ class TacticMemory:
         self.last_vanguard_sweeps.clear()
         self.ranger_shot_feedback.clear()
         self.vanguard_sweep_feedback.clear()
+        self.vanguard_intercept_leases.clear()
         self.cargo_arrival_ticks.clear()
         self.service_admission_id = None
         self.service_kind = None
