@@ -84,6 +84,21 @@ class ProductionPlanner:
         home_alert = self.memory.home_defense_alert_until >= world.tick
         home_target = max(self.config.home_force_floor, self.memory.home_force_high_water)
         combat_count = vanguards + rangers
+        mature_worker_target = self.config.stockpile_worker_target
+        mature_combat_target = max(
+            self.config.stockpile_combat_target,
+            home_target,
+        )
+        species_floor_missing = (
+            vanguards < self.config.minimum_vanguards
+            or rangers < self.config.minimum_rangers
+        )
+        stockpile_ready = bool(
+            world.population >= self.config.population_stockpile_threshold
+            and workers >= mature_worker_target
+            and combat_count >= mature_combat_target
+            and not species_floor_missing
+        )
         next_worker_target = ceil(
             (world.population + 1) * self.config.worker_ratio_percent / 100
         )
@@ -160,12 +175,11 @@ class ProductionPlanner:
                 )
                 chosen = reinforcement_order[0]
                 reason = "EMERGENCY_HOME_FORCE"
-            elif world.population >= self.config.population_stockpile_threshold:
-                # At high population the marginal unit is too expensive to
-                # repay itself during a normal session.  Peaceful deficits
-                # caused by raids or remote losses intentionally do not spend
-                # the reserve; only the explicit crisis/rebuild branches above
-                # may produce here.
+            elif stockpile_ready:
+                # The mature economy is complete only at 35 Workers plus 35
+                # combat Units (and any higher learned home-force target).
+                # From that point on, marginal production is intentionally
+                # suspended so the Core keeps its defensive reserve.
                 reason = "HIGH_POP_STOCKPILE"
             elif world.population < self.config.worker_only_population_threshold:
                 if workers < next_worker_target:
@@ -190,18 +204,51 @@ class ProductionPlanner:
                     chosen = UnitType.WORKER
                     reason = "PRE25_ECONOMY"
             elif (
-                vanguards < self.config.minimum_vanguards
-                or rangers < self.config.minimum_rangers
+                species_floor_missing
+                or combat_count < mature_combat_target
+            ) and (
+                species_floor_missing
+                or combat_count <= workers
+                or workers >= mature_worker_target
                 or combat_count < home_target
             ):
                 reinforcement_order = self._reinforcement_candidates(
-                    vanguards, rangers, home_enemies, combat_count, home_target
+                    vanguards,
+                    rangers,
+                    home_enemies,
+                    combat_count,
+                    mature_combat_target,
                 )
                 chosen = reinforcement_order[0]
-                reason = "POST25_HOME_FORCE"
-            else:
+                reason = "MATURE_COMBAT_TARGET"
+            elif workers < mature_worker_target:
                 chosen = UnitType.WORKER
-                reason = "POST25_WORKER_ONLY"
+                reason = "MATURE_WORKER_TARGET"
+            elif species_floor_missing or combat_count < mature_combat_target:
+                reinforcement_order = self._reinforcement_candidates(
+                    vanguards,
+                    rangers,
+                    home_enemies,
+                    combat_count,
+                    mature_combat_target,
+                )
+                chosen = reinforcement_order[0]
+                reason = "MATURE_COMBAT_TARGET"
+            elif world.population < self.config.population_stockpile_threshold:
+                if combat_count <= workers:
+                    reinforcement_order = self._reinforcement_candidates(
+                        vanguards,
+                        rangers,
+                        home_enemies,
+                        combat_count,
+                        mature_combat_target,
+                    )
+                    chosen = reinforcement_order[0]
+                else:
+                    chosen = UnitType.WORKER
+                reason = "MATURE_FORCE_BALANCE"
+            else:
+                reason = "HIGH_POP_STOCKPILE"
 
         available = max(0, world.resources - reserved_resources)
         strategic_primary = chosen

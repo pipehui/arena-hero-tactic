@@ -1186,20 +1186,20 @@ class EconomyAndLogisticsTests(unittest.TestCase):
 
         self.assertEqual(tactic.last_decision_trace["economy"]["worker_target"], math.ceil(11 / 2))
 
-    def test_post_25_normal_production_is_worker_after_home_force_is_met(self) -> None:
+    def test_post_25_production_builds_toward_mature_combat_target(self) -> None:
         units = tuple(
             [unit(i, UnitType.WORKER, (20 + i, 0)) for i in range(1, 14)]
             + [unit(100 + i, UnitType.VANGUARD, (i, 5)) for i in range(1, 7)]
             + [unit(200 + i, UnitType.RANGER, (i, -5)) for i in range(1, 7)]
         )
-        turn = make_turn(units=units, resources=8)
+        turn = make_turn(units=units, resources=125)
 
         BalancedTactic(memory=TacticMemory(opening_complete=True)).choose_actions(turn)
 
         self.assertIsInstance(turn.plan.core_action, SpawnAction)
-        self.assertEqual(turn.plan.core_action.unit_type, UnitType.WORKER)
+        self.assertEqual(turn.plan.core_action.unit_type, UnitType.VANGUARD)
 
-    def test_population_35_stockpiles_even_at_full_storage(self) -> None:
+    def test_population_35_does_not_mean_mature_force_stockpile(self) -> None:
         units = tuple(
             [unit(i, UnitType.WORKER, (20 + i, 0)) for i in range(1, 24)]
             + [unit(100 + i, UnitType.VANGUARD, (i, 5)) for i in range(1, 7)]
@@ -1210,28 +1210,48 @@ class EconomyAndLogisticsTests(unittest.TestCase):
 
         tactic.choose_actions(turn)
 
-        self.assertIsInstance(turn.plan.core_action, WaitAction)
+        self.assertIsInstance(turn.plan.core_action, SpawnAction)
+        self.assertEqual(turn.plan.core_action.unit_type, UnitType.VANGUARD)
         candidates = tactic.last_decision_trace["economy"]["production_candidates"]
-        self.assertFalse(any(item.get("selected") for item in candidates))
-        self.assertEqual(
-            {item["reason"] for item in candidates},
-            {"HIGH_POP_STOCKPILE"},
+        selected = next(item for item in candidates if item["selected"])
+        self.assertEqual(selected["production_mode"], "MATURE_COMBAT_TARGET")
+
+    def test_mature_force_fills_missing_combat_before_stockpiling(self) -> None:
+        units = tuple(
+            [unit(i, UnitType.WORKER, (40 + i, 0)) for i in range(1, 36)]
+            + [unit(100 + i, UnitType.VANGUARD, (i, 5)) for i in range(1, 18)]
+            + [unit(200 + i, UnitType.RANGER, (i, -5)) for i in range(1, 18)]
         )
+        tactic = BalancedTactic(memory=TacticMemory(opening_complete=True))
+        turn = make_turn(units=units, resources=345)
 
-        full = make_turn(tick=2, units=units, resources=175)
-        tactic.choose_actions(full)
-        self.assertIsInstance(full.plan.core_action, WaitAction)
+        tactic.choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.core_action, SpawnAction)
+        self.assertIn(
+            turn.plan.core_action.unit_type,
+            {UnitType.VANGUARD, UnitType.RANGER},
+        )
         candidates = tactic.last_decision_trace["economy"]["production_candidates"]
-        self.assertEqual({item["reason"] for item in candidates}, {"HIGH_POP_STOCKPILE"})
+        selected = next(item for item in candidates if item["selected"])
+        self.assertEqual(selected["production_mode"], "MATURE_COMBAT_TARGET")
 
-        with_vanguard = (*units, unit(500, UnitType.VANGUARD, (10, 10)))
-        not_full = make_turn(tick=3, units=with_vanguard, resources=175)
-        tactic.choose_actions(not_full)
-        self.assertIsInstance(not_full.plan.core_action, WaitAction)
+    def test_mature_force_fills_missing_worker_before_stockpiling(self) -> None:
+        units = tuple(
+            [unit(i, UnitType.WORKER, (40 + i, 0)) for i in range(1, 35)]
+            + [unit(100 + i, UnitType.VANGUARD, (i, 5)) for i in range(1, 19)]
+            + [unit(200 + i, UnitType.RANGER, (i, -5)) for i in range(1, 18)]
+        )
+        tactic = BalancedTactic(memory=TacticMemory(opening_complete=True))
+        turn = make_turn(units=units, resources=345)
 
-        full_again = make_turn(tick=4, units=with_vanguard, resources=180)
-        tactic.choose_actions(full_again)
-        self.assertIsInstance(full_again.plan.core_action, WaitAction)
+        tactic.choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.core_action, SpawnAction)
+        self.assertEqual(turn.plan.core_action.unit_type, UnitType.WORKER)
+        candidates = tactic.last_decision_trace["economy"]["production_candidates"]
+        selected = next(item for item in candidates if item["selected"])
+        self.assertEqual(selected["production_mode"], "MATURE_WORKER_TARGET")
 
     def test_population_70_balanced_force_keeps_full_stockpile(self) -> None:
         units = tuple(
@@ -1259,6 +1279,12 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         candidates = tactic.last_decision_trace["economy"]["production_candidates"]
         self.assertEqual({item["production_mode"] for item in candidates}, {"HIGH_POP_STOCKPILE"})
         self.assertFalse(any(item["selected"] for item in candidates))
+        economy = tactic.last_decision_trace["economy"]
+        self.assertTrue(economy["stockpile_active"])
+        self.assertEqual(economy["stockpile_worker_target"], 35)
+        self.assertEqual(economy["stockpile_combat_target"], 35)
+        self.assertEqual(economy["stockpile_worker_gap"], 0)
+        self.assertEqual(economy["stockpile_combat_gap"], 0)
 
     def test_high_population_post_crisis_rebuild_uses_available_stockpile(self) -> None:
         memory = TacticMemory(

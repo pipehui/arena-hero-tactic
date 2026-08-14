@@ -73,7 +73,12 @@ class TacticConfig:
     opening_worker_target: int = 4
     worker_ratio_percent: int = 50
     worker_only_population_threshold: int = 25
-    population_stockpile_threshold: int = 35
+    # Mature-force stockpiling means 35 Workers plus 35 combat Units, not 35
+    # total population.  Keep the aggregate threshold as a compatibility guard
+    # and expose the two composition targets explicitly.
+    population_stockpile_threshold: int = 70
+    stockpile_worker_target: int = 35
+    stockpile_combat_target: int = 35
     minimum_vanguards: int = 6
     minimum_rangers: int = 6
     home_force_floor: int = 12
@@ -223,6 +228,8 @@ class TacticConfig:
             self.worker_ratio_percent,
             self.worker_only_population_threshold,
             self.population_stockpile_threshold,
+            self.stockpile_worker_target,
+            self.stockpile_combat_target,
             self.minimum_vanguards,
             self.minimum_rangers,
             self.home_force_floor,
@@ -316,6 +323,10 @@ class TacticConfig:
             raise ValueError("worker ratio must be within 1..100")
         if self.population_stockpile_threshold <= self.worker_only_population_threshold:
             raise ValueError("stockpile population must exceed worker-only threshold")
+        if self.population_stockpile_threshold < (
+            self.stockpile_worker_target + self.stockpile_combat_target
+        ):
+            raise ValueError("stockpile population must cover both force targets")
         if self.outer_screen_min_radius < self.home_engage_radius:
             raise ValueError("outer screen must start at or beyond home engagement")
         if self.outer_screen_max_radius < self.outer_screen_min_radius:

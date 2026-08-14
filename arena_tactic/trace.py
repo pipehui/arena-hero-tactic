@@ -462,6 +462,10 @@ class DecisionTraceBuilder:
         resolution: IntentResolution,
     ) -> dict[str, object]:
         workers = sum(unit.unit_type is UnitType.WORKER for unit in world.friendlies)
+        combat_units = sum(
+            unit.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+            for unit in world.friendlies
+        )
         selected_by_actor = {
             intent.actor_id: intent
             for intent in resolution.selected
@@ -482,10 +486,23 @@ class DecisionTraceBuilder:
             "worker_target": ceil(
                 world.population * self.config.worker_ratio_percent / 100
             ),
-            "stockpile_active": (
-                world.population >= self.config.population_stockpile_threshold
-            ),
+            "stockpile_active": production_mode == "HIGH_POP_STOCKPILE",
             "stockpile_population_threshold": self.config.population_stockpile_threshold,
+            "stockpile_worker_target": self.config.stockpile_worker_target,
+            "stockpile_combat_target": self.config.stockpile_combat_target,
+            "stockpile_worker_gap": max(
+                0,
+                self.config.stockpile_worker_target - workers,
+            ),
+            "stockpile_combat_gap": max(
+                0,
+                max(
+                    self.config.stockpile_combat_target,
+                    self.config.home_force_floor,
+                    self.memory.home_force_high_water,
+                )
+                - combat_units,
+            ),
             "production_mode": production_mode,
             "full_storage_gate": world.resources == world.resource_capacity,
             "crisis_force_baseline": (
