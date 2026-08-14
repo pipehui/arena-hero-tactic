@@ -736,7 +736,10 @@ def sector_scout_candidates(
     # Probe inward along the stable sector ray.  This is independent of total
     # explored-map size and finds the nearest reachable-looking frontier near
     # the nominal ring without rescanning every known cell for every Worker.
-    minimum = max(1, radius - 30)
+    # A stable scouting band refreshes a narrow annulus; probing all the way
+    # back toward Core silently turns a 30-cell slot into an inner patrol and
+    # also lets successive assignments drift outward again.
+    minimum = max(1, radius - 3)
     for distance in range(radius, minimum - 1, -1):
         waypoint = (
             core[0] + dx * distance // scale,

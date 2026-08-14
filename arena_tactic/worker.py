@@ -119,7 +119,7 @@ class WorkerPlanner:
             unit for unit in world.friendlies if unit.unit_type is UnitType.WORKER
         )
         self._refresh_enemy_core_control_zones(world)
-        self._ensure_scout_states(workers, world.tick)
+        self._ensure_scout_states(workers, world.tick, world.core.position)
         intents, escaping = self._survival_intents(world, projection, service, workers)
         deconflicting: set[UUID] = set()
         home_defense_active = (
@@ -176,34 +176,13 @@ class WorkerPlanner:
                 and worker.id != world.beacon.carrier_id
                 and worker.id not in service_ids
             )
-            # Full storage means "stop harvesting", not "freeze the entire
-            # vision network".  Loaded Workers have no useful economic action
-            # until capacity opens, so they use the distributed parking rings.
-            # Only when fewer than four carriers exist do the closest empty
-            # Workers fill the near-home reserve; every other empty Worker
-            # keeps a danger-aware scout task.
+            # Full storage means "stop harvesting", not "send cargo back to
+            # the frontier".  Every carrier converges on the same bounded
+            # economic staging belt; empty Workers keep bounded scout tasks.
             carriers = tuple(
                 worker for worker in guard_eligible if worker.cargo > 0
             )
-            reserve_slots = max(
-                0,
-                self.config.worker_full_storage_near_reserve_count
-                - len(carriers),
-            )
-            reserve_workers = tuple(
-                sorted(
-                    (
-                        worker
-                        for worker in guard_eligible
-                        if worker.cargo == 0
-                    ),
-                    key=lambda worker: (
-                        manhattan(worker.position, world.core.position),
-                        worker.id.bytes,
-                    ),
-                )[:reserve_slots]
-            )
-            guard_workers = carriers + reserve_workers
+            guard_workers = carriers
             guarding = self._home_guard_assignments(
                 world,
                 projection,
@@ -222,6 +201,7 @@ class WorkerPlanner:
                 if mission is not None and mission.mission in {
                     UnitMission.HARVEST,
                     UnitMission.HOME_GUARD,
+                    UnitMission.FULL_STORAGE_STAGING,
                 }:
                     self.memory.unit_missions.pop(worker.id, None)
             exploration_assignments = self._exploration_assignments(
@@ -359,13 +339,7 @@ class WorkerPlanner:
         service: CoreServiceQueue,
         workers: tuple[EntitySnapshot, ...],
     ) -> dict[UUID, Position]:
-        """Park saturated-economy Workers without forming a Core wall.
-
-        Only four stable UUID slots use the 8/10 near reserve.  Every other
-        Worker receives an exclusive 12--20 sector post, keeping service and
-        combat geometry clear while still leaving the economy close enough to
-        resume immediately when storage has headroom.
-        """
+        """Return every saturated carrier to one bounded economic belt."""
 
         assert world.core is not None
         living = {worker.id for worker in workers}
@@ -420,8 +394,7 @@ class WorkerPlanner:
                 and projection.threat_heat.get(cell, 0) == 0
             )
 
-        near_candidates = legal_cells(self.config.worker_full_storage_guard_radii)
-        outer_candidates = legal_cells(
+        primary_candidates = legal_cells(
             tuple(
                 range(
                     self.config.worker_full_storage_parking_min_radius,
@@ -429,7 +402,8 @@ class WorkerPlanner:
                 )
             )
         )
-        if not near_candidates and not outer_candidates:
+        fallback_candidates = legal_cells((13, 14))
+        if not primary_candidates and not fallback_candidates:
             self.memory.worker_home_guard_targets.clear()
             self.memory.worker_parking_assignments.clear()
             return {}
@@ -437,74 +411,35 @@ class WorkerPlanner:
         ordered_workers = tuple(sorted(workers, key=lambda unit: unit.id.bytes))
         used: set[Position] = set()
         assignments: dict[UUID, Position] = {}
-        near_count = min(
-            self.config.worker_full_storage_near_reserve_count,
-            len(ordered_workers),
+
+        primary_set = set(primary_candidates)
+        all_candidates = primary_candidates + tuple(
+            cell for cell in fallback_candidates if cell not in primary_set
         )
-        previous_near = tuple(
-            worker
-            for worker in ordered_workers
-            if (
-                previous := self.memory.worker_parking_assignments.get(worker.id)
-            ) is not None
-            and previous.zone == "NEAR_RESERVE"
-        )
-        near_workers = list(previous_near[:near_count])
-        if len(near_workers) < near_count:
-            near_ids = {worker.id for worker in near_workers}
-            near_workers.extend(
-                sorted(
-                    (
-                        worker
-                        for worker in ordered_workers
-                        if worker.id not in near_ids
-                    ),
-                    key=lambda worker: (
-                        worker.cargo == 0,
-                        manhattan(worker.position, core),
-                        worker.id.bytes,
-                    ),
-                )[: near_count - len(near_workers)]
-            )
-        near_ids = {worker.id for worker in near_workers}
-        worker_zones = {
-            worker.id: (
-                "NEAR_RESERVE" if worker.id in near_ids else "OUTER_PARKING"
-            )
-            for worker in ordered_workers
-        }
-        zone_candidates = {
-            "NEAR_RESERVE": near_candidates,
-            "OUTER_PARKING": outer_candidates,
-        }
+        # A carrier already resting in a legal 8--12 cell is stable by
+        # definition.  Preserve it before considering older assignments so a
+        # remap never pulls it inward and then pushes it out again.
         for worker in ordered_workers:
+            if worker.position in primary_set and worker.position not in used:
+                assignments[worker.id] = worker.position
+                used.add(worker.position)
+        for worker in ordered_workers:
+            if worker.id in assignments:
+                continue
             previous = self.memory.worker_home_guard_targets.get(worker.id)
-            candidates = zone_candidates[worker_zones[worker.id]]
-            if previous in set(candidates) and previous not in used:
+            if previous in all_candidates and previous not in used:
                 assignments[worker.id] = previous
                 used.add(previous)
 
-        zone_totals = {
-            zone: sum(worker_zones[item.id] == zone for item in ordered_workers)
-            for zone in zone_candidates
-        }
-        zone_ranks = {"NEAR_RESERVE": 0, "OUTER_PARKING": 0}
         for rank, worker in enumerate(ordered_workers):
-            zone = worker_zones[worker.id]
-            candidates = zone_candidates[zone]
-            zone_rank = zone_ranks[zone]
-            zone_ranks[zone] += 1
             if worker.id in assignments:
                 continue
+            candidates = tuple(cell for cell in primary_candidates if cell not in used)
             if not candidates:
-                # A near-reserve worker may safely fall back to an outer post,
-                # but an outer worker must never overflow into the near band:
-                # that would silently violate the four-Worker Core density
-                # limit precisely on partially explored maps.
-                candidates = outer_candidates if zone == "NEAR_RESERVE" else ()
+                candidates = tuple(cell for cell in fallback_candidates if cell not in used)
             if not candidates:
                 continue
-            desired = zone_rank * len(candidates) // max(1, zone_totals[zone])
+            desired = rank * len(candidates) // max(1, len(ordered_workers))
 
             def score(row: tuple[int, Position]):
                 index, cell = row
@@ -523,11 +458,7 @@ class WorkerPlanner:
                     cell,
                 )
 
-            available = (
-                (index, cell)
-                for index, cell in enumerate(candidates)
-                if cell not in used
-            )
+            available = enumerate(candidates)
             selected = min(available, key=score, default=None)
             if selected is None:
                 continue
@@ -540,14 +471,20 @@ class WorkerPlanner:
             worker_id: FullStorageParkingAssignment(
                 worker_id=worker_id,
                 position=target,
-                zone=worker_zones[worker_id],
+                zone=(
+                    "CARGO_STAGING"
+                    if manhattan(core, target)
+                    <= self.config.worker_full_storage_parking_max_radius
+                    else "CARGO_STAGING_FALLBACK"
+                ),
                 assigned_tick=(
                     previous.assigned_tick
                     if (
                         (previous := self.memory.worker_parking_assignments.get(worker_id))
                         is not None
                         and previous.position == target
-                        and previous.zone == worker_zones[worker_id]
+                        and previous.zone
+                        in {"CARGO_STAGING", "CARGO_STAGING_FALLBACK"}
                     )
                     else world.tick
                 ),
@@ -566,7 +503,7 @@ class WorkerPlanner:
     ) -> list[ActionIntent]:
         assert world.core is not None
         self.memory.unit_missions[worker.id] = MissionState(
-            UnitMission.HOME_GUARD,
+            UnitMission.FULL_STORAGE_STAGING,
             target,
             world.tick,
         )
@@ -575,11 +512,11 @@ class WorkerPlanner:
                 ActionIntent.simple(
                     worker.id,
                     IntentAction.WAIT,
-                    UnitMission.HOME_GUARD,
+                    UnitMission.FULL_STORAGE_STAGING,
                     68,
                     target_position=target,
-                    reason="FULL_STORAGE_HOME_GUARD_HOLD",
-                    metadata=(("guard_post", target),),
+                    reason="FULL_STORAGE_STAGING_HOLD",
+                    metadata=(("staging_post", target),),
                 )
             ]
         route = self._route(
@@ -603,16 +540,16 @@ class WorkerPlanner:
             intents = [
                 ActionIntent.move(
                     worker.id,
-                    UnitMission.HOME_GUARD,
+                    UnitMission.FULL_STORAGE_STAGING,
                     68,
                     route.first_direction,
                     route.first_position,
                     risk=self._risk(projection, route.first_position),
                     exclusive_destination=True,
                     tie_break=(route.distance,),
-                    reason="FULL_STORAGE_RETURN_TO_HOME_GUARD",
+                    reason="FULL_STORAGE_RETURN_TO_STAGING",
                     metadata=(
-                        ("guard_post", target),
+                        ("staging_post", target),
                         ("allow_protected", True),
                     ),
                 )
@@ -673,16 +610,16 @@ class WorkerPlanner:
             intents.append(
                 ActionIntent.move(
                     worker.id,
-                    UnitMission.HOME_GUARD,
+                    UnitMission.FULL_STORAGE_STAGING,
                     69,
                     direction,
                     destination,
                     risk=score[0] * 100 + score[1] * 10 + score[2],
                     exclusive_destination=True,
                     tie_break=score,
-                    reason="FULL_STORAGE_HOME_GUARD_FALLBACK",
+                    reason="FULL_STORAGE_STAGING_FALLBACK",
                     metadata=(
-                        ("guard_post", target),
+                        ("staging_post", target),
                         ("allow_protected", destination in service_cells),
                     ),
                 )
@@ -691,13 +628,13 @@ class WorkerPlanner:
             ActionIntent.simple(
                 worker.id,
                 IntentAction.WAIT,
-                UnitMission.HOME_GUARD,
+                UnitMission.FULL_STORAGE_STAGING,
                 71,
                 target_position=target,
                 reason=(
-                    "HOME_GUARD_CONGESTION_HOLD"
+                    "FULL_STORAGE_STAGING_CONGESTION_HOLD"
                     if options
-                    else "HOME_GUARD_NO_SAFE_STEP"
+                    else "FULL_STORAGE_STAGING_NO_SAFE_STEP"
                 ),
                 metadata=(("guard_post", target),),
             )
@@ -1154,7 +1091,11 @@ class WorkerPlanner:
             if expires_tick < world.tick:
                 self.memory.worker_resource_backoff.pop(key, None)
         resource_workers = tuple(
-            worker for worker in available if worker.position != world.core.position
+            worker
+            for worker in available
+            if worker.position != world.core.position
+            and manhattan(worker.position, world.core.position)
+            <= self.config.exploration_sector_radii[-1]
         )
         service_blocks = frozenset(
             cell
@@ -1502,10 +1443,17 @@ class WorkerPlanner:
                 index,
             )
             rows.append((score, direction, destination, gain, viability))
+        scout_state = self.memory.worker_scout_states.get(worker.id)
+        mission = (
+            UnitMission.RETURN_TO_SCOUT_BAND
+            if scout_state is not None
+            and scout_state.phase is WorkerScoutPhase.RETURN_TO_BAND
+            else UnitMission.EXPLORE
+        )
         intents = [
             ActionIntent.move(
                 worker.id,
-                UnitMission.EXPLORE,
+                mission,
                 69,
                 direction,
                 destination,
@@ -1555,16 +1503,27 @@ class WorkerPlanner:
             world.tick,
         ):
             return []
+        scout_state = self.memory.worker_scout_states.get(worker.id)
+        mission = (
+            UnitMission.RETURN_TO_SCOUT_BAND
+            if scout_state is not None
+            and scout_state.phase is WorkerScoutPhase.RETURN_TO_BAND
+            else UnitMission.EXPLORE
+        )
         intents = [
             ActionIntent.move(
                 worker.id,
-                UnitMission.EXPLORE,
+                mission,
                 70,
                 route.first_direction,
                 route.first_position,
                 risk=self._risk(projection, route.first_position),
                 tie_break=(-gain, route.distance),
-                reason="INFORMATION_GAIN",
+                reason=(
+                    "RETURN_TO_SCOUT_BAND"
+                    if mission is UnitMission.RETURN_TO_SCOUT_BAND
+                    else "INFORMATION_GAIN"
+                ),
                 metadata=(("information_gain", gain), ("goal", target))
                 + (() if route.viability is None else route.viability.metadata),
             ),
@@ -1622,13 +1581,17 @@ class WorkerPlanner:
         intents.extend(
             ActionIntent.move(
                 worker.id,
-                UnitMission.EXPLORE,
+                mission,
                 71,
                 direction,
                 destination,
                 risk=score[0] * 100 + score[1] * 10 + score[2],
                 tie_break=score,
-                reason="EXPLORATION_ALTERNATE_STEP",
+                reason=(
+                    "RETURN_TO_SCOUT_BAND_ALTERNATE"
+                    if mission is UnitMission.RETURN_TO_SCOUT_BAND
+                    else "EXPLORATION_ALTERNATE_STEP"
+                ),
                 metadata=(("information_gain", gain), ("goal", target))
                 + viability.metadata,
             )
@@ -1640,7 +1603,7 @@ class WorkerPlanner:
             ActionIntent.simple(
                 worker.id,
                 IntentAction.WAIT,
-                UnitMission.EXPLORE,
+                mission,
                 72,
                 target_position=target,
                 reason="EXPLORATION_MOVE_BLOCKED_THIS_TICK",
@@ -1691,7 +1654,7 @@ class WorkerPlanner:
         )
         previous = self.memory.worker_escape_states.get(worker.id)
 
-        active_zones = tuple(
+        current_zones = tuple(
             sorted(
                 (
                     zone
@@ -1705,9 +1668,9 @@ class WorkerPlanner:
             )
         )
         if previous is None:
-            active_zones = tuple(
+            current_zones = tuple(
                 zone
-                for zone in active_zones
+                for zone in current_zones
                 if not self._confirmation_observer_allowed(
                     world,
                     projection,
@@ -1715,10 +1678,28 @@ class WorkerPlanner:
                     zone,
                 )
             )
-        control_ids = tuple(zone.core_id for zone in active_zones)
-        control_centers = tuple(zone.center for zone in active_zones)
+        retained_zone_ids = {
+            zone.core_id for zone in current_zones
+        } | set(() if previous is None else previous.control_core_ids)
+        retained_zones = tuple(
+            sorted(
+                (
+                    zone
+                    for core_id in retained_zone_ids
+                    if (zone := self.memory.enemy_core_control_zones.get(core_id))
+                    is not None
+                    and (
+                        zone.expires_tick is None
+                        or zone.expires_tick >= world.tick
+                    )
+                ),
+                key=lambda zone: zone.core_id.bytes,
+            )
+        )
+        control_ids = tuple(zone.core_id for zone in retained_zones)
+        control_centers = tuple(zone.center for zone in retained_zones)
 
-        if active_zones:
+        if current_zones:
             mission = self.memory.unit_missions.get(worker.id)
             if mission is not None and mission.mission in {
                 UnitMission.HARVEST,
@@ -1727,7 +1708,7 @@ class WorkerPlanner:
                 if mission.target is not None:
                     expiry = max(
                         zone.last_seen_tick + self.config.enemy_core_control_ttl
-                        for zone in active_zones
+                        for zone in current_zones
                     )
                     self.memory.worker_resource_backoff[(worker.id, mission.target)] = max(
                         self.memory.worker_resource_backoff.get(
@@ -1840,7 +1821,7 @@ class WorkerPlanner:
                 control_centers=control_centers,
             )
 
-        if threats or active_zones:
+        if threats or current_zones:
             retained = {
                 threat_id
                 for threat_id in (() if previous is None else previous.threat_ids)
@@ -1852,7 +1833,7 @@ class WorkerPlanner:
                 "FLEEING"
                 if direct_threats
                 else "CORE_DISENGAGE"
-                if active_zones
+                if current_zones
                 else "FOG_RETREAT"
             )
             state = progressed_state(
@@ -2109,6 +2090,23 @@ class WorkerPlanner:
                 "DECREASES_CONSERVATIVE_SURVIVAL_DISTANCE",
             )
 
+        if state.control_centers:
+            currently_clear = all(
+                manhattan(worker.position, center)
+                > self.config.enemy_core_worker_clear_radius
+                for center in state.control_centers
+            )
+            if currently_clear:
+                rows = retain(
+                    rows,
+                    lambda row: all(
+                        manhattan(row.destination, center)
+                        > self.config.enemy_core_worker_clear_radius
+                        for center in state.control_centers
+                    ),
+                    "REENTERS_ENEMY_CORE_CONTROL_ZONE",
+                )
+
         # Recent history may break a tie, but it may never force a Worker
         # closer to an authoritative visible Vanguard threat.  When a
         # non-approaching option exists on the same safety frontier, discard
@@ -2133,8 +2131,17 @@ class WorkerPlanner:
             # blanket instruction to keep walking away from friendly cover.
             # Current/future attack cells and remembered corridors are priced
             # into one shared route, while genuinely lethal cells are blocked.
-            route_costs = dict(projection.route_costs_for(UnitType.WORKER))
+            control_blocked, route_costs = self.safety.navigation_layers(
+                projection,
+                tuple(
+                    zone
+                    for core_id in state.control_core_ids
+                    if (zone := self.memory.enemy_core_control_zones.get(core_id))
+                    is not None
+                ),
+            )
             lethal_cells = set(projection.hostile_occupied)
+            lethal_cells.update(control_blocked)
             for cell, threat in projection.threat_cells.items():
                 route_costs[cell] = (
                     route_costs.get(cell, 0)
@@ -3278,6 +3285,21 @@ class WorkerPlanner:
         scan_attempts = 0
         for worker in ordered:
             state = self.memory.worker_scout_states[worker.id]
+            outside_scout_band = (
+                manhattan(worker.position, world.core.position)
+                > self.config.exploration_sector_radii[-1]
+            )
+            if outside_scout_band and state.phase is not WorkerScoutPhase.RETURN_TO_BAND:
+                state = replace(
+                    state,
+                    phase=WorkerScoutPhase.RETURN_TO_BAND,
+                    target=None,
+                    assigned_tick=world.tick,
+                    best_route_cost=None,
+                    stalled_ticks=0,
+                )
+                self.memory.worker_scout_states[worker.id] = state
+                self.memory.unit_missions.pop(worker.id, None)
             mission = self.memory.unit_missions.get(worker.id)
             if (
                 state.target is None
@@ -3298,7 +3320,8 @@ class WorkerPlanner:
             )
             target_observed = (
                 state.target is not None
-                and last_visible.get(state.target) == world.tick
+                and worker.position == state.target
+                and worker.id not in self.memory.service_egress_worker_ids
             )
             looping = self._looping(worker.id)
             if looping or target_expired or target_observed:
@@ -3322,11 +3345,44 @@ class WorkerPlanner:
                 worker,
                 service,
             )
+            if outside_scout_band:
+                fallback = self._return_to_scout_band_assignment(
+                    world,
+                    projection,
+                    worker,
+                    state,
+                    claimed,
+                    blocked,
+                )
+                if fallback is not None:
+                    state, route = fallback
+                    self._commit_scout_assignment(
+                        world,
+                        worker,
+                        state,
+                        route,
+                        claimed,
+                        assignments,
+                        last_visible,
+                    )
+                else:
+                    self.memory.worker_scout_states[worker.id] = state
+                continue
             if (
                 state.target is not None
                 and state.target not in claimed
                 and self.memory.target_backoff_until.get(state.target, -1) < world.tick
             ):
+                if (
+                    worker.id in self.memory.service_egress_worker_ids
+                    and worker.position == state.target
+                ):
+                    # CLEAR_CORE/CLEAR_SERVICE_LANE is merely the first leg of
+                    # the already assigned scout mission.  Do not replace its
+                    # durable target while the service choreography is still
+                    # moving the Worker out of the protected cells.
+                    self.memory.worker_scout_states[worker.id] = state
+                    continue
                 use_local_segment = (
                     home_alert
                     or manhattan(worker.position, state.target)
@@ -3392,7 +3448,11 @@ class WorkerPlanner:
                 )
                 self.memory.unit_missions.pop(worker.id, None)
 
-            if not home_alert and scan_attempts < self.config.exploration_new_goal_budget:
+            if (
+                not outside_scout_band
+                and not home_alert
+                and scan_attempts < self.config.exploration_new_goal_budget
+            ):
                 scan_attempts += 1
                 distances, parents = weighted_distance_field(
                     world,
@@ -3415,7 +3475,13 @@ class WorkerPlanner:
                 )
                 rows = []
                 for candidate in candidates:
-                    if candidate in claimed:
+                    band_radius = self.config.exploration_sector_radii[state.stage]
+                    candidate_radius = manhattan(candidate, world.core.position)
+                    if (
+                        candidate in claimed
+                        or candidate_radius > self.config.exploration_sector_radii[-1]
+                        or abs(candidate_radius - band_radius) > 3
+                    ):
                         continue
                     route = route_from_field(
                         worker.position,
@@ -3515,12 +3581,40 @@ class WorkerPlanner:
                 self.memory.worker_scout_states[worker.id] = state
         return assignments
 
-    def _ensure_scout_states(self, workers, tick: int) -> None:
+    def _ensure_scout_states(
+        self,
+        workers,
+        tick: int,
+        core_position: Position,
+    ) -> None:
         used_slots: set[int] = set()
         next_slot = 0
+        band_count = len(self.config.exploration_sector_radii)
+        max_radius = self.config.exploration_sector_radii[-1]
         for worker in sorted(workers, key=lambda item: item.id.bytes):
             existing = self.memory.worker_scout_states.get(worker.id)
             if existing is not None and existing.slot not in used_slots:
+                stage = existing.slot % band_count
+                sector_index = (existing.slot // band_count) % 8
+                target = existing.target
+                if target is not None and manhattan(target, core_position) > max_radius:
+                    target = None
+                phase = existing.phase
+                if manhattan(worker.position, core_position) > max_radius:
+                    phase = WorkerScoutPhase.RETURN_TO_BAND
+                    target = None
+                elif phase is WorkerScoutPhase.RETURN_TO_BAND:
+                    phase = WorkerScoutPhase.SECTOR_SCOUT
+                self.memory.worker_scout_states[worker.id] = replace(
+                    existing,
+                    sector_index=sector_index,
+                    stage=stage,
+                    phase=phase,
+                    target=target,
+                    assigned_tick=(tick if target is None else existing.assigned_tick),
+                    best_route_cost=(None if target is None else existing.best_route_cost),
+                    stalled_ticks=(0 if target is None else existing.stalled_ticks),
+                )
                 used_slots.add(existing.slot)
                 continue
             while next_slot in used_slots:
@@ -3535,9 +3629,13 @@ class WorkerPlanner:
                 self.memory.worker_scout_states[worker.id] = WorkerScoutState(
                     worker_id=worker.id,
                     slot=next_slot,
-                    sector_index=next_slot % 8,
-                    stage=next_slot // 8,
-                    phase=WorkerScoutPhase.SECTOR_SCOUT,
+                    sector_index=(next_slot // band_count) % 8,
+                    stage=next_slot % band_count,
+                    phase=(
+                        WorkerScoutPhase.RETURN_TO_BAND
+                        if manhattan(worker.position, core_position) > max_radius
+                        else WorkerScoutPhase.SECTOR_SCOUT
+                    ),
                     target=target,
                     assigned_tick=tick if mission is None else mission.assigned_tick,
                 )
@@ -3545,8 +3643,13 @@ class WorkerPlanner:
                 self.memory.worker_scout_states[worker.id] = replace(
                     existing,
                     slot=next_slot,
-                    sector_index=next_slot % 8,
-                    stage=max(existing.stage, next_slot // 8),
+                    sector_index=(next_slot // band_count) % 8,
+                    stage=next_slot % band_count,
+                    phase=(
+                        WorkerScoutPhase.RETURN_TO_BAND
+                        if manhattan(worker.position, core_position) > max_radius
+                        else WorkerScoutPhase.SECTOR_SCOUT
+                    ),
                     target=None,
                     assigned_tick=tick,
                     best_route_cost=None,
@@ -3564,7 +3667,9 @@ class WorkerPlanner:
     ) -> WorkerScoutState:
         return replace(
             state,
-            stage=state.stage + int(advance),
+            # Stable scout slots rotate targets within one band.  Reaching a
+            # target never promotes the Worker to a larger radius.
+            stage=state.stage,
             target=None,
             assigned_tick=tick,
             best_route_cost=None,
@@ -3614,8 +3719,13 @@ class WorkerPlanner:
             return
         claimed.add(state.target)
         self.memory.worker_scout_states[worker.id] = state
+        mission = (
+            UnitMission.RETURN_TO_SCOUT_BAND
+            if state.phase is WorkerScoutPhase.RETURN_TO_BAND
+            else UnitMission.EXPLORE
+        )
         self.memory.unit_missions[worker.id] = MissionState(
-            UnitMission.EXPLORE,
+            mission,
             state.target,
             state.assigned_tick,
             failures=state.stalled_ticks,
@@ -3653,15 +3763,8 @@ class WorkerPlanner:
         # 60-cell rays per Worker only multiplied latency without improving
         # the chosen first step.
         for stage_offset in range(1):
-            stage = state.stage + stage_offset
-            if stage < len(self.config.exploration_sector_radii):
-                radius = self.config.exploration_sector_radii[stage]
-            else:
-                radius = (
-                    self.config.exploration_sector_radii[-1]
-                    + (stage - len(self.config.exploration_sector_radii) + 1)
-                    * self.config.exploration_sector_step
-                )
+            stage = state.stage % len(self.config.exploration_sector_radii)
+            radius = self.config.exploration_sector_radii[stage]
             candidates = sector_scout_candidates(
                 world,
                 world.core.destination or world.core.position,
@@ -3703,7 +3806,11 @@ class WorkerPlanner:
                     replace(
                         state,
                         stage=stage,
-                        phase=WorkerScoutPhase.SECTOR_SCOUT,
+                        phase=(
+                            WorkerScoutPhase.RETURN_TO_BAND
+                            if state.phase is WorkerScoutPhase.RETURN_TO_BAND
+                            else WorkerScoutPhase.SECTOR_SCOUT
+                        ),
                         target=candidate,
                         assigned_tick=world.tick,
                         best_route_cost=route.distance,
@@ -3714,6 +3821,70 @@ class WorkerPlanner:
                     route,
                 )
         return None
+
+    def _return_to_scout_band_assignment(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        worker: EntitySnapshot,
+        state: WorkerScoutState,
+        claimed: set[Position],
+        blocked: frozenset[Position],
+    ):
+        """Choose a proved route back to this Worker's fixed patrol layer."""
+
+        assert world.core is not None
+        radius = self.config.exploration_sector_radii[state.stage]
+        core = world.core.destination or world.core.position
+        candidates = tuple(
+            cell
+            for cell in manhattan_ring(core, radius)
+            if cell in world.known_passable
+            and cell not in blocked
+            and cell not in claimed
+        )
+        ordered = sorted(
+            candidates,
+            key=lambda cell: (
+                manhattan(worker.position, cell),
+                self.memory.congestion_counts.get(cell, 0),
+                cell,
+            ),
+        )
+        selected = next(
+            (
+                (target, route)
+                for target in ordered[:12]
+                if (
+                    route := self._alert_exploration_step(
+                        world,
+                        projection,
+                        worker,
+                        target,
+                        blocked,
+                    )
+                )
+                is not None
+                and route.first_direction is not None
+            ),
+            None,
+        )
+        if selected is None:
+            return None
+        target, route = selected
+        return (
+            replace(
+                state,
+                phase=WorkerScoutPhase.RETURN_TO_BAND,
+                target=target,
+                assigned_tick=world.tick,
+                best_route_cost=route.distance,
+                stalled_ticks=0,
+                backoff_until=0,
+                reachable_candidates=len(ordered),
+            ),
+            route,
+        )
 
     def _local_scout_assignment(
         self,
@@ -3917,8 +4088,12 @@ class WorkerPlanner:
             )
             if cell is not None
         }
+        control_blocked, costs = self.safety.navigation_layers(
+            projection,
+            tuple(self.memory.enemy_core_control_zones.values()),
+        )
         blocked = set(projection.hostile_occupied)
-        blocked.update(self._control_zone_cells())
+        blocked.update(control_blocked)
         blocked.update(protected)
         blocked.update(projection.immediate_damage)
         blocked.discard(actor.position)
@@ -3928,7 +4103,6 @@ class WorkerPlanner:
             and service.exit_cell is not None
         ):
             blocked.discard(service.exit_cell)
-        costs = self.safety.route_costs(projection)
         return frozenset(blocked), costs
 
     def _route(
@@ -3954,8 +4128,12 @@ class WorkerPlanner:
             )
             if cell is not None
         }
+        control_blocked, costs = self.safety.navigation_layers(
+            projection,
+            tuple(self.memory.enemy_core_control_zones.values()),
+        )
         blocked = set(projection.hostile_occupied)
-        blocked.update(self._control_zone_cells())
+        blocked.update(control_blocked)
         blocked.update(extra_blocked)
         if not logistics:
             blocked.update(protected - {actor.position, target})
@@ -3964,7 +4142,6 @@ class WorkerPlanner:
         # non-fatal-hit budget after two-step dead-end analysis.
         blocked.update(projection.immediate_damage)
         blocked.discard(actor.position)
-        costs = self.safety.route_costs(projection)
         route = weighted_route_to(
             world,
             actor.position,

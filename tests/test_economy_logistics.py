@@ -146,6 +146,59 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         self.assertEqual(task["mission"], "ESCAPE")
         self.assertIn(uid(99), tactic.memory.enemy_core_control_zones)
 
+    def test_enemy_core_clearing_keeps_zone_sticky_and_detours_toward_core(
+        self,
+    ) -> None:
+        """A Worker just outside the clear radius must not step back inside.
+
+        This is the minimal form of the live ``525edcc5`` two-cell cycle: the
+        first Tick forces the Worker out through the only outward exit, while
+        the next Tick offers a lateral route around the remembered enemy Core.
+        """
+
+        core = friendly_core(position=(0, -10))
+        worker_id = uid(1)
+        memory = TacticMemory(core_id=core.id, core_position=core.position)
+        memory.known_passable.update(
+            (x, y) for x in range(-4, 5) for y in range(-12, 13)
+        )
+        tactic = BalancedTactic(memory=memory)
+        first = make_turn(
+            tick=1,
+            core=core,
+            units=(unit(1, UnitType.WORKER, (0, 8), cargo=1),),
+            enemies=(enemy_core(99, (0, 0)),),
+            obstacle_cells=((-1, 8), (1, 8)),
+            resources=0,
+        )
+
+        tactic.choose_actions(first)
+
+        first_action = first.plan.unit_actions[worker_id]
+        self.assertIsInstance(first_action, MoveAction)
+        outside = add_direction((0, 8), first_action.direction)
+        self.assertEqual(outside, (0, 9))
+        second = make_turn(
+            tick=2,
+            core=core,
+            units=(unit(1, UnitType.WORKER, outside, cargo=1),),
+            obstacle_cells=((-1, 8), (1, 8)),
+            resources=0,
+        )
+
+        tactic.choose_actions(second)
+
+        second_action = second.plan.unit_actions[worker_id]
+        self.assertIsInstance(second_action, MoveAction)
+        destination = add_direction(outside, second_action.direction)
+        self.assertGreater(
+            manhattan(destination, (0, 0)),
+            tactic.config.enemy_core_worker_clear_radius,
+        )
+        lease = tactic.memory.worker_escape_states[worker_id]
+        self.assertEqual(lease.control_core_ids, (uid(99),))
+        self.assertEqual(lease.control_centers, ((0, 0),))
+
     def test_destroyed_enemy_core_releases_controlled_resource_backoff(self) -> None:
         core = friendly_core(position=(20, 0))
         hostile_core = enemy_core(99, (0, 0))
@@ -1028,7 +1081,7 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         self.assertIsInstance(action, MoveAction)
         self.assertEqual(action.direction, Direction.LEFT)
 
-    def test_full_storage_workers_leave_service_queue_for_distributed_home_guard(self) -> None:
+    def test_full_storage_workers_return_to_bounded_staging_band(self) -> None:
         workers = (
             unit(1, UnitType.WORKER, (0, 0), cargo=1),
             unit(2, UnitType.WORKER, (1, 0), cargo=1),
@@ -1062,7 +1115,9 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         cargo_ids = {str(worker.id) for worker in workers if worker.cargo > 0}
         cargo_tasks = [task for task in tasks if task["actor_id"] in cargo_ids]
         empty_tasks = [task for task in tasks if task["actor_id"] not in cargo_ids]
-        self.assertTrue(all(task["mission"] == "HOME_GUARD" for task in cargo_tasks))
+        self.assertTrue(
+            all(task["mission"] == "FULL_STORAGE_STAGING" for task in cargo_tasks)
+        )
         self.assertTrue(empty_tasks)
         self.assertTrue(all(task["mission"] == "EXPLORE" for task in empty_tasks))
         self.assertFalse(
@@ -1083,8 +1138,32 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         )
         self.assertEqual(len(set(posts.values())), len(posts))
         distances = sorted(manhattan((0, 0), post) for post in posts.values())
-        self.assertLessEqual(sum(distance <= 10 for distance in distances), 4)
-        self.assertTrue(all(8 <= distance <= 20 for distance in distances))
+        self.assertTrue(all(8 <= distance <= 12 for distance in distances))
+
+    def test_full_storage_staging_preserves_an_already_legal_carrier_position(
+        self,
+    ) -> None:
+        worker = unit(1, UnitType.WORKER, (8, 0), cargo=1)
+        memory = TacticMemory(opening_complete=True)
+        memory.known_passable.update(
+            (x, y)
+            for x in range(-12, 13)
+            for y in range(-12, 13)
+            if abs(x) + abs(y) <= 12
+        )
+        tactic = BalancedTactic(memory=memory)
+        turn = make_turn(units=(worker,), resources=10)
+
+        tactic.choose_actions(turn)
+
+        self.assertEqual(tactic.memory.worker_home_guard_targets[worker.id], (8, 0))
+        self.assertIsInstance(turn.plan.unit_actions[worker.id], WaitAction)
+        task = next(
+            row
+            for row in tactic.last_decision_trace["tasks"]
+            if row["actor_id"] == str(worker.id)
+        )
+        self.assertEqual(task["mission"], "FULL_STORAGE_STAGING")
 
     def test_remote_contact_does_not_displace_full_storage_home_guard(self) -> None:
         workers = tuple(
@@ -1129,31 +1208,29 @@ class EconomyAndLogisticsTests(unittest.TestCase):
             tactic.config.worker_full_storage_near_reserve_count,
         )
 
-    def test_full_storage_outer_workers_never_overflow_into_near_reserve(self) -> None:
+    def test_all_full_storage_carriers_receive_unique_posts_within_twelve(self) -> None:
         workers = tuple(
-            unit(index, UnitType.WORKER, (0, 0), cargo=1)
-            for index in range(1, 7)
+            unit(index, UnitType.WORKER, (index - 8, 0), cargo=1)
+            for index in range(1, 17)
         )
         memory = TacticMemory(opening_complete=True)
         memory.known_passable.update(
             (x, y)
-            for x in range(-10, 11)
-            for y in range(-10, 11)
-            if abs(x) + abs(y) <= 10
+            for x in range(-14, 15)
+            for y in range(-14, 15)
+            if abs(x) + abs(y) <= 14
         )
         tactic = BalancedTactic(memory=memory)
 
-        tactic.choose_actions(make_turn(units=workers, resources=30))
+        tactic.choose_actions(make_turn(units=workers, resources=80))
 
         posts = tactic.memory.worker_parking_assignments
-        self.assertLessEqual(
-            len(posts), tactic.config.worker_full_storage_near_reserve_count
-        )
-        self.assertTrue(all(post.zone == "NEAR_RESERVE" for post in posts.values()))
+        self.assertEqual(len(posts), len(workers))
+        self.assertEqual(len({post.position for post in posts.values()}), len(workers))
+        self.assertTrue(all(post.zone == "CARGO_STAGING" for post in posts.values()))
         self.assertTrue(
             all(
-                manhattan((0, 0), post.position)
-                in tactic.config.worker_full_storage_guard_radii
+                8 <= manhattan((0, 0), post.position) <= 12
                 for post in posts.values()
             )
         )
@@ -3088,7 +3165,7 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         self.assertEqual(assignments[str(workers[0].id)], (-7, 0))
         self.assertEqual(assignments[str(workers[1].id)], (7, 0))
 
-    def test_adjacent_visible_resource_preempts_exploration_when_return_field_is_capped(self) -> None:
+    def test_outside_band_worker_ignores_adjacent_resource_until_recalled(self) -> None:
         core = friendly_core(position=(0, 0))
         worker = unit(1, UnitType.WORKER, (59, 0))
         resource = (60, 0)
@@ -3121,11 +3198,14 @@ class EconomyAndLogisticsTests(unittest.TestCase):
             for item in tactic.last_decision_trace["tasks"]
             if item["actor_id"] == str(worker.id)
         )
-        self.assertEqual(task["mission"], UnitMission.HARVEST.value)
-        self.assertEqual(tuple(task["target"]), resource)
+        self.assertEqual(task["mission"], UnitMission.RETURN_TO_SCOUT_BAND.value)
         action = turn.plan.unit_actions[worker.id]
         self.assertIsInstance(action, MoveAction)
-        self.assertEqual(action.direction, Direction.RIGHT)
+        destination = add_direction(worker.position, action.direction)
+        self.assertLess(
+            manhattan(destination, core.position),
+            manhattan(worker.position, core.position),
+        )
 
     def test_reachable_resource_work_order_does_not_thrash_for_a_new_nearby_node(self) -> None:
         tactic = BalancedTactic()
@@ -3403,6 +3483,50 @@ class EconomyAndLogisticsTests(unittest.TestCase):
                 if item["actor_id"] == str(worker.id)
             ),
             "NO_REACHABLE_FRONTIER",
+        )
+
+    def test_far_persisted_scout_is_recalled_to_a_bounded_patrol_band(self) -> None:
+        core = friendly_core(position=(0, 0))
+        worker = unit(1, UnitType.WORKER, (40, 0))
+        memory = TacticMemory(
+            core_id=core.id,
+            core_position=core.position,
+            worker_scout_states={
+                worker.id: WorkerScoutState(
+                    worker_id=worker.id,
+                    slot=0,
+                    sector_index=0,
+                    stage=19,
+                    phase=WorkerScoutPhase.SECTOR_SCOUT,
+                    target=(80, 0),
+                    assigned_tick=1,
+                )
+            },
+        )
+        memory.known_passable.update(
+            (x, y) for x in range(-5, 91) for y in range(-5, 6)
+        )
+        tactic = BalancedTactic(memory=memory)
+        turn = make_turn(tick=2, core=core, units=(worker,), resources=0)
+
+        tactic.choose_actions(turn)
+
+        state = tactic.memory.worker_scout_states[worker.id]
+        task = next(
+            row
+            for row in tactic.last_decision_trace["tasks"]
+            if row["actor_id"] == str(worker.id)
+        )
+        self.assertIn(state.stage, range(3))
+        self.assertIsNotNone(state.target)
+        self.assertLessEqual(manhattan(core.position, state.target), 30)
+        self.assertEqual(task["mission"], "RETURN_TO_SCOUT_BAND")
+        action = turn.plan.unit_actions[worker.id]
+        self.assertIsInstance(action, MoveAction)
+        destination = add_direction(worker.position, action.direction)
+        self.assertLess(
+            manhattan(destination, core.position),
+            manhattan(worker.position, core.position),
         )
 
     def test_failed_precision_scan_does_not_starve_other_workers(self) -> None:

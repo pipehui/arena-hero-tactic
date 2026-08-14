@@ -120,10 +120,10 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
             self.assertIn(uid(900), restored.enemy_core_intel)
 
     def test_schema_versions_are_upgraded(self) -> None:
-        self.assertEqual(LOG_SCHEMA_VERSION, 44)
-        self.assertEqual(EXPLORATION_MEMORY_SCHEMA_VERSION, 14)
+        self.assertEqual(LOG_SCHEMA_VERSION, 45)
+        self.assertEqual(EXPLORATION_MEMORY_SCHEMA_VERSION, 15)
 
-    def test_schema_14_preserves_core_control_attempts_and_returning_raid(self) -> None:
+    def test_schema_15_preserves_core_control_attempts_and_returning_raid(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             target_id = uid(900)
             member_id = uid(1)
@@ -251,7 +251,7 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
             sector_index=3,
             stage=2,
             phase=WorkerScoutPhase.SECTOR_SCOUT,
-            target=(20, 20),
+            target=(20, 10),
             assigned_tick=91,
             best_route_cost=17,
             stalled_ticks=1,
@@ -276,7 +276,7 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
         self.assertEqual(restored.cargo_arrival_ticks, {})
         self.assertEqual(restored.threat_heat[(6, 7)].risk, 16)
         self.assertEqual(restored.threat_heat[(6, 7)].expires_tick, 130)
-        self.assertEqual(restored.worker_scout_states[uid(2)].target, (20, 20))
+        self.assertEqual(restored.worker_scout_states[uid(2)].target, (20, 10))
         self.assertEqual(restored.worker_scout_states[uid(2)].slot, 3)
         self.assertEqual(restored.enemy_tracks[uid(90)].position, (9, 8))
         self.assertEqual(restored.enemy_tracks[uid(90)].last_seen_tick, 100)
@@ -295,6 +295,38 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
             restored = ExplorationMemoryStore(directory).load()
 
         self.assertEqual(restored.threat_heat, {})
+
+    def test_schema_14_remote_scout_is_migrated_into_bounded_band(self) -> None:
+        worker_id = uid(2)
+        old = {
+            "schema_version": 14,
+            "saved_tick": 100,
+            "core_position": [0, 0],
+            "worker_scout_states": [
+                {
+                    "worker_id": str(worker_id),
+                    "slot": 5,
+                    "sector_index": 5,
+                    "stage": 23,
+                    "phase": "SECTOR_SCOUT",
+                    "target": [230, 0],
+                    "assigned_tick": 90,
+                    "stalled_ticks": 0,
+                    "backoff_until": 0,
+                    "reachable_candidates": 1,
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "balanced_tactic_memory.json"
+            path.write_text(json.dumps(old), encoding="utf-8")
+            restored = ExplorationMemoryStore(directory).load()
+
+        state = restored.worker_scout_states[worker_id]
+        self.assertEqual(state.stage, 2)
+        self.assertEqual(state.sector_index, 1)
+        self.assertIsNone(state.target)
+        self.assertEqual(state.phase, WorkerScoutPhase.SECTOR_SCOUT)
 
     def test_old_checkpoint_is_read_with_safe_defaults(self) -> None:
         old = {
@@ -506,7 +538,7 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
             text = logger.path.read_text(encoding="utf-8")
             first = json.loads(text.splitlines()[0])
 
-        self.assertEqual(first["schema_version"], 44)
+        self.assertEqual(first["schema_version"], 45)
         self.assertNotIn("hidden-token", text)
 
     def test_turn_log_contains_detached_schema_41_strategy(self) -> None:
@@ -531,10 +563,10 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
             logger.close(status="completed", last_tick=9)
             records = [json.loads(line) for line in logger.path.read_text(encoding="utf-8").splitlines()]
 
-        self.assertEqual(records[0]["schema_version"], 44)
+        self.assertEqual(records[0]["schema_version"], 45)
         record = next(item for item in records if item["record_type"] == "turn")
-        self.assertEqual(record["strategy"]["schema_version"], 44)
-        self.assertEqual(record["strategy"]["source_trace_schema"], 42)
+        self.assertEqual(record["strategy"]["schema_version"], 45)
+        self.assertEqual(record["strategy"]["source_trace_schema"], 43)
         self.assertNotIn("tasks", record["strategy"])
         self.assertIn("resolution", record["strategy"])
         decisions = record["strategy"]["decisions"]

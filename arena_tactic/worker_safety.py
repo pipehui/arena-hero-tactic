@@ -6,8 +6,8 @@ from uuid import UUID
 
 from arena_hero import Direction, Position, UnitType
 
-from .geometry import cardinal_neighbors, manhattan, unit_attack_cells
-from .models import EntitySnapshot, WorldModel
+from .geometry import cardinal_neighbors, diamond, manhattan, unit_attack_cells
+from .models import EnemyCoreControlZone, EntitySnapshot, WorldModel
 from .planning import move_viability, Route, weighted_route_to
 from .projection import TacticalMap
 
@@ -130,6 +130,26 @@ class WorkerSafetyEvaluator:
     @staticmethod
     def route_costs(projection: TacticalMap) -> dict[Position, int]:
         return dict(projection.route_costs_for(UnitType.WORKER))
+
+    @staticmethod
+    def navigation_layers(
+        projection: TacticalMap,
+        zones: tuple[EnemyCoreControlZone, ...],
+    ) -> tuple[frozenset[Position], dict[Position, int]]:
+        """Return the shared hard/soft Worker map around remembered enemy Cores."""
+
+        blocked: set[Position] = set()
+        costs = WorkerSafetyEvaluator.route_costs(projection)
+        for zone in zones:
+            blocked.update(diamond(zone.center, zone.exclusion_radius))
+            for cell in diamond(zone.center, zone.clear_radius):
+                distance = manhattan(cell, zone.center)
+                if distance <= zone.exclusion_radius:
+                    continue
+                costs[cell] = costs.get(cell, 0) + (
+                    zone.clear_radius - distance + 1
+                ) * 64
+        return frozenset(blocked), costs
 
     def forward_safe_exits(
         self,

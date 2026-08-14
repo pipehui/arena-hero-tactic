@@ -7,11 +7,12 @@ from uuid import UUID
 from arena_hero import Position
 
 from .config import TacticConfig
-from .geometry import diamond, manhattan
+from .geometry import manhattan
 from .models import EntitySnapshot, UnitMission, WorldModel
 from .planning import bfs_distances
 from .projection import TacticalMap
 from .state import TacticMemory
+from .worker_safety import WorkerSafetyEvaluator
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,20 +151,17 @@ class ResourceAllocator:
         if not workers or not projection.resources or world.core is None:
             return ResourceAllocation(())
 
-        enemy_core_zone = {
-            cell
-            for intel in world.remembered_enemy_cores
-            if world.tick - intel.last_seen_tick <= self.config.raid_intel_ttl
-            for cell in diamond(
-                intel.position,
-                self.config.enemy_core_worker_exclusion_radius,
-            )
-        }
+        enemy_core_zone, _ = WorkerSafetyEvaluator.navigation_layers(
+            projection,
+            tuple(self.memory.enemy_core_control_zones.values()),
+        )
+        max_radius = self.config.exploration_sector_radii[-1]
         resources = tuple(
             sorted(
                 resource.position
                 for resource in projection.resources
                 if resource.position not in enemy_core_zone
+                and manhattan(resource.position, world.core.position) <= max_radius
             )
         )
         if not resources:
@@ -244,6 +242,10 @@ class ResourceAllocator:
         return (
             projection.hostile_occupied
             | frozenset(projection.immediate_damage)
+            | WorkerSafetyEvaluator.navigation_layers(
+                projection,
+                tuple(self.memory.enemy_core_control_zones.values()),
+            )[0]
         )
 
     def _retain_work_orders(

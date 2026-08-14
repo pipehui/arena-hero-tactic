@@ -9,7 +9,7 @@ from uuid import UUID
 from arena_hero import CoreState, Position, UnitType
 
 from .config import DEFAULT_CONFIG, TacticConfig
-from .geometry import DIRECTION_ORDER, add_direction, cardinal_neighbors, diamond, vision_is_clear
+from .geometry import DIRECTION_ORDER, add_direction, cardinal_neighbors, diamond, manhattan, vision_is_clear
 from .projection import attack_cells
 from .rules import CORE_VISION_RADIUS, UNIT_VISION_RADIUS
 from .schema import EXPLORATION_MEMORY_SCHEMA_VERSION
@@ -533,12 +533,27 @@ class ExplorationMemoryStore:
                 last_scan_tick = raw.get("last_scan_tick")
                 if not isinstance(last_scan_tick, int) or isinstance(last_scan_tick, bool):
                     last_scan_tick = None
+                slot = integer_fields["slot"]
+                band_count = len(self.config.exploration_sector_radii)
+                stage = slot % band_count
+                sector_index = (slot // band_count) % 8
+                if (
+                    target is not None
+                    and memory.core_position is not None
+                    and manhattan(target, memory.core_position)
+                    > self.config.exploration_sector_radii[-1]
+                ):
+                    target = None
                 memory.worker_scout_states[worker_id] = WorkerScoutState(
                     worker_id=worker_id,
-                    slot=integer_fields["slot"],
-                    sector_index=integer_fields["sector_index"],
-                    stage=integer_fields["stage"],
-                    phase=phase,
+                    slot=slot,
+                    sector_index=sector_index,
+                    stage=stage,
+                    phase=(
+                        WorkerScoutPhase.SECTOR_SCOUT
+                        if schema < 15 or target is None
+                        else phase
+                    ),
                     target=target,
                     assigned_tick=integer_fields["assigned_tick"],
                     best_route_cost=best_route_cost,

@@ -35,7 +35,10 @@ class TacticConfig:
     exploration_target_backoff_ticks: int = 16
     exploration_scout_hold_ticks: int = 64
     exploration_stall_ticks: int = 3
-    exploration_sector_radii: tuple[int, ...] = (10, 20, 30, 40)
+    # Empty Workers refresh a useful home vision belt.  They are scouts, not
+    # disposable expedition units: their stable UUID slot never grows beyond
+    # the 30-cell outer band.
+    exploration_sector_radii: tuple[int, ...] = (20, 25, 30)
     exploration_sector_step: int = 10
     resource_memory_ttl: int = 256
     resource_assignment_persistence_bonus: int = 6
@@ -99,10 +102,10 @@ class TacticConfig:
     # across dedicated non-combat rings instead of joining the deposit lane.
     # A small hysteresis prevents one point of healing/repair from summoning
     # the entire workforce back to the Core entrance.
-    worker_full_storage_guard_radii: tuple[int, ...] = (8, 10)
+    worker_full_storage_guard_radii: tuple[int, ...] = (8, 9, 10, 11, 12)
     worker_full_storage_near_reserve_count: int = 4
-    worker_full_storage_parking_min_radius: int = 12
-    worker_full_storage_parking_max_radius: int = 20
+    worker_full_storage_parking_min_radius: int = 8
+    worker_full_storage_parking_max_radius: int = 12
     # During a home-defense alert, yield the single-occupancy combat area but
     # remain close enough for service.  Avoid the 5/10/15 combat patrol rings.
     worker_full_storage_combat_guard_radii: tuple[int, ...] = (14, 16)
@@ -366,11 +369,11 @@ class TacticConfig:
             raise ValueError("Worker home guard must stay outside Core service")
         if (
             self.worker_full_storage_parking_min_radius
-            <= self.worker_full_storage_guard_radii[-1]
+            > self.worker_full_storage_guard_radii[0]
             or self.worker_full_storage_parking_max_radius
-            < self.worker_full_storage_parking_min_radius
+            < self.worker_full_storage_guard_radii[-1]
         ):
-            raise ValueError("Worker parking must be ordered outside the near reserve")
+            raise ValueError("Worker staging must cover the configured home band")
         if (
             not self.worker_full_storage_combat_guard_radii
             or tuple(sorted(set(self.worker_full_storage_combat_guard_radii)))

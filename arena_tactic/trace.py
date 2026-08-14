@@ -481,6 +481,44 @@ class DecisionTraceBuilder:
             "NONE",
         )
         crisis = self.memory.crisis_force_baseline
+        core_position = None if world.core is None else world.core.position
+        scout_limit = self.config.exploration_sector_radii[-1]
+        staging_limit = self.config.worker_full_storage_parking_max_radius
+
+        def cycle_period(actor_id) -> int | None:
+            history = self.memory.position_history.get(actor_id, ())
+            for period in range(1, 5):
+                if (
+                    len(history) >= period * 2
+                    and history[-period * 2 : -period] == history[-period:]
+                ):
+                    if len(set(history[-period:])) > 1:
+                        return period
+            return None
+
+        empty_scouts_beyond = sum(
+            unit.unit_type is UnitType.WORKER
+            and unit.cargo == 0
+            and core_position is not None
+            and manhattan(unit.position, core_position) > scout_limit
+            for unit in world.friendlies
+        )
+        cargo_beyond_staging = sum(
+            unit.unit_type is UnitType.WORKER
+            and unit.cargo > 0
+            and core_position is not None
+            and manhattan(unit.position, core_position) > staging_limit
+            for unit in world.friendlies
+        )
+        worker_cycle_count = sum(
+            cycle_period(unit.id) is not None
+            for unit in world.friendlies
+            if unit.unit_type is UnitType.WORKER
+        )
+        cargo_stall_count = sum(
+            progress.stalled_ticks >= 2
+            for progress in self.memory.service_cargo_route_progress.values()
+        )
         return {
             "workers": workers,
             "worker_target": ceil(
@@ -543,6 +581,21 @@ class DecisionTraceBuilder:
             ],
             "storage_saturated": self.memory.storage_saturated,
             "storage_headroom": max(0, world.resource_capacity - world.resources),
+            "worker_bounds": {
+                "scout_radii": list(self.config.exploration_sector_radii),
+                "max_scout_radius": scout_limit,
+                "full_storage_staging": [
+                    self.config.worker_full_storage_parking_min_radius,
+                    staging_limit,
+                ],
+                "fallback_staging_max_radius": 14,
+            },
+            "worker_activity_metrics": {
+                "empty_scouts_beyond_30": empty_scouts_beyond,
+                "cargo_workers_beyond_12": cargo_beyond_staging,
+                "worker_periodic_cycles": worker_cycle_count,
+                "cargo_return_stalls": cargo_stall_count,
+            },
             "worker_home_guard_radii": list(
                 sorted(
                     {
@@ -557,6 +610,17 @@ class DecisionTraceBuilder:
                 {
                     "worker_id": str(worker_id),
                     "post": list(post),
+                    "worker_core_distance": (
+                        None
+                        if world.core is None
+                        or (unit := world.friendly(worker_id)) is None
+                        else manhattan(unit.position, world.core.position)
+                    ),
+                    "post_core_distance": (
+                        None
+                        if world.core is None
+                        else manhattan(post, world.core.position)
+                    ),
                     "zone": (
                         None
                         if (
@@ -657,8 +721,25 @@ class DecisionTraceBuilder:
                     "slot": state.slot,
                     "sector": state.sector_index,
                     "stage": state.stage,
+                    "patrol_radius": self.config.exploration_sector_radii[
+                        state.stage % len(self.config.exploration_sector_radii)
+                    ],
                     "mode": state.phase.value,
                     "target": None if state.target is None else list(state.target),
+                    "worker_core_distance": (
+                        None
+                        if world.core is None
+                        or (unit := world.friendly(worker_id)) is None
+                        else manhattan(unit.position, world.core.position)
+                    ),
+                    "target_core_distance": (
+                        None
+                        if world.core is None or state.target is None
+                        else manhattan(state.target, world.core.position)
+                    ),
+                    "return_to_band": (
+                        state.phase.value == "RETURN_TO_BAND"
+                    ),
                     "assigned_tick": state.assigned_tick,
                     "best_route_cost": state.best_route_cost,
                     "stalled_ticks": state.stalled_ticks,

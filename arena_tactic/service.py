@@ -19,6 +19,7 @@ from .models import (
     CoreSlotSchedule,
     CoreServiceWindow,
     CoreServiceQueue,
+    EnemyCoreControlZone,
     EntitySnapshot,
     IntentAction,
     PatientQueueEntry,
@@ -38,6 +39,7 @@ from .planning import (
 )
 from .rules import UNIT_MAX_HP
 from .state import TacticMemory
+from .worker_safety import WorkerSafetyEvaluator
 
 
 _SERVICE_MISSIONS = frozenset(
@@ -72,6 +74,7 @@ def cargo_return_route(
     node_limit: int,
     exit_cell: Position | None = None,
     direct_core: bool = False,
+    control_zones: tuple[EnemyCoreControlZone, ...] = (),
 ) -> CargoReturnReservation:
     """Build the one authoritative spatial route used by calendar and actor.
 
@@ -128,7 +131,12 @@ def cargo_return_route(
         )
 
     target = queue_cells[-1] if queue_cells else core_position
+    control_blocked, route_costs = WorkerSafetyEvaluator.navigation_layers(
+        projection,
+        tuple(control_zones),
+    )
     blocked = set(projection.hostile_occupied)
+    blocked.update(control_blocked)
     blocked.update(projection.immediate_damage)
     blocked.update({core_position, *queue_cells[:-1]})
     if exit_cell is not None:
@@ -141,7 +149,7 @@ def cargo_return_route(
         target,
         node_limit=node_limit,
         blocked=frozenset(blocked),
-        cell_costs=projection.route_costs_for(UnitType.WORKER),
+        cell_costs=route_costs,
     )
     if route is None:
         segment = weighted_progress_route(
@@ -150,7 +158,7 @@ def cargo_return_route(
             target,
             node_limit=node_limit,
             blocked=frozenset(blocked),
-            cell_costs=projection.route_costs_for(UnitType.WORKER),
+            cell_costs=route_costs,
         )
         if segment is not None:
             segment_route, waypoint = segment
@@ -207,6 +215,7 @@ def cargo_return_routes(
     node_limit: int,
     exit_cell: Position | None = None,
     direct_core_id: UUID | None = None,
+    control_zones: tuple[EnemyCoreControlZone, ...] = (),
 ) -> tuple[CargoReturnReservation, ...]:
     """Route a cargo wave through one shared danger-weighted return field.
 
@@ -216,7 +225,12 @@ def cargo_return_routes(
     """
 
     target = queue_cells[-1] if queue_cells else core_position
+    control_blocked, route_costs = WorkerSafetyEvaluator.navigation_layers(
+        projection,
+        tuple(control_zones),
+    )
     blocked = set(projection.hostile_occupied)
+    blocked.update(control_blocked)
     blocked.update(projection.immediate_damage)
     blocked.update({core_position, *queue_cells[:-1]})
     if exit_cell is not None:
@@ -227,7 +241,7 @@ def cargo_return_routes(
         target,
         node_limit=node_limit,
         blocked=frozenset(blocked),
-        cell_costs=projection.route_costs_for(UnitType.WORKER),
+        cell_costs=route_costs,
     )
 
     def shared_route(carrier: EntitySnapshot) -> CargoReturnReservation:
@@ -248,6 +262,7 @@ def cargo_return_routes(
                 node_limit=node_limit,
                 exit_cell=exit_cell,
                 direct_core=carrier.id == direct_core_id,
+                control_zones=control_zones,
             )
         parent = parents.get(carrier.position)
         if carrier.position not in distances or parent is None:
@@ -260,6 +275,7 @@ def cargo_return_routes(
                 node_limit=node_limit,
                 exit_cell=exit_cell,
                 direct_core=carrier.id == direct_core_id,
+                control_zones=control_zones,
             )
         first_position = parent[0]
         first_direction = _cardinal_direction(carrier.position, first_position)
@@ -283,6 +299,7 @@ def cargo_return_routes(
                 node_limit=node_limit,
                 exit_cell=exit_cell,
                 direct_core=carrier.id == direct_core_id,
+                control_zones=control_zones,
             )
         distance = steps + len(queue_cells)
         return CargoReturnReservation(
@@ -1022,6 +1039,7 @@ class CoreServicePlanner:
             node_limit=self.config.path_node_limit,
             exit_cell=exit_cell,
             direct_core_id=emergency_ready_id,
+            control_zones=tuple(self.memory.enemy_core_control_zones.values()),
         )
         drafts = self._reuse_segmented_return_leases(
             world,
@@ -2981,6 +2999,9 @@ class CoreServicePlanner:
                     path,
                     node_limit=self.config.path_node_limit,
                     exit_cell=candidate_exit,
+                    control_zones=tuple(
+                        self.memory.enemy_core_control_zones.values()
+                    ),
                 )
                 for carrier in carriers
             )

@@ -268,7 +268,11 @@ def _compact_economy(value: Any) -> dict[str, Any]:
                 for key in (
                     "worker_id",
                     "mode",
+                    "patrol_radius",
                     "target",
+                    "worker_core_distance",
+                    "target_core_distance",
+                    "return_to_band",
                     "stalled_ticks",
                     "action",
                     "reason",
