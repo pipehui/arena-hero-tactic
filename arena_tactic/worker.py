@@ -167,7 +167,7 @@ class WorkerPlanner:
         guarding: dict[UUID, Position] = {}
         if self.memory.storage_saturated:
             service_ids = set(service.depositors)
-            guard_workers = tuple(
+            guard_eligible = tuple(
                 worker
                 for worker in workers
                 if worker.id not in escaping and worker.id not in deconflicting
@@ -175,6 +175,34 @@ class WorkerPlanner:
                 and worker.id != world.beacon.carrier_id
                 and worker.id not in service_ids
             )
+            # Full storage means "stop harvesting", not "freeze the entire
+            # vision network".  Loaded Workers have no useful economic action
+            # until capacity opens, so they use the distributed parking rings.
+            # Only when fewer than four carriers exist do the closest empty
+            # Workers fill the near-home reserve; every other empty Worker
+            # keeps a danger-aware scout task.
+            carriers = tuple(
+                worker for worker in guard_eligible if worker.cargo > 0
+            )
+            reserve_slots = max(
+                0,
+                self.config.worker_full_storage_near_reserve_count
+                - len(carriers),
+            )
+            reserve_workers = tuple(
+                sorted(
+                    (
+                        worker
+                        for worker in guard_eligible
+                        if worker.cargo == 0
+                    ),
+                    key=lambda worker: (
+                        manhattan(worker.position, world.core.position),
+                        worker.id.bytes,
+                    ),
+                )[:reserve_slots]
+            )
+            guard_workers = carriers + reserve_workers
             guarding = self._home_guard_assignments(
                 world,
                 projection,
@@ -182,7 +210,25 @@ class WorkerPlanner:
                 guard_workers,
             )
             resource_assignments: dict[UUID, Position] = {}
-            exploration_assignments: dict[UUID, tuple[Position, Route, int]] = {}
+            exploring = tuple(
+                worker
+                for worker in guard_eligible
+                if worker.cargo == 0 and worker.id not in guarding
+            )
+            for worker in (*guard_workers, *exploring):
+                self.memory.worker_task_progress.pop(worker.id, None)
+                mission = self.memory.unit_missions.get(worker.id)
+                if mission is not None and mission.mission in {
+                    UnitMission.HARVEST,
+                    UnitMission.HOME_GUARD,
+                }:
+                    self.memory.unit_missions.pop(worker.id, None)
+            exploration_assignments = self._exploration_assignments(
+                world,
+                projection,
+                exploring,
+                service,
+            )
         else:
             self.memory.worker_home_guard_targets.clear()
             self.memory.worker_parking_assignments.clear()
@@ -225,6 +271,7 @@ class WorkerPlanner:
                     worker,
                     resource_assignments.get(worker.id),
                     exploration_assignments.get(worker.id),
+                    allow_harvest=not self.memory.storage_saturated,
                 )
             )
         return intents
@@ -393,9 +440,37 @@ class WorkerPlanner:
             self.config.worker_full_storage_near_reserve_count,
             len(ordered_workers),
         )
+        previous_near = tuple(
+            worker
+            for worker in ordered_workers
+            if (
+                previous := self.memory.worker_parking_assignments.get(worker.id)
+            ) is not None
+            and previous.zone == "NEAR_RESERVE"
+        )
+        near_workers = list(previous_near[:near_count])
+        if len(near_workers) < near_count:
+            near_ids = {worker.id for worker in near_workers}
+            near_workers.extend(
+                sorted(
+                    (
+                        worker
+                        for worker in ordered_workers
+                        if worker.id not in near_ids
+                    ),
+                    key=lambda worker: (
+                        worker.cargo == 0,
+                        manhattan(worker.position, core),
+                        worker.id.bytes,
+                    ),
+                )[: near_count - len(near_workers)]
+            )
+        near_ids = {worker.id for worker in near_workers}
         worker_zones = {
-            worker.id: ("NEAR_RESERVE" if rank < near_count else "OUTER_PARKING")
-            for rank, worker in enumerate(ordered_workers)
+            worker.id: (
+                "NEAR_RESERVE" if worker.id in near_ids else "OUTER_PARKING"
+            )
+            for worker in ordered_workers
         }
         zone_candidates = {
             "NEAR_RESERVE": near_candidates,
@@ -1117,6 +1192,8 @@ class WorkerPlanner:
         worker: EntitySnapshot,
         resource: Position | None,
         exploration: tuple[Position, Route, int] | None,
+        *,
+        allow_harvest: bool = True,
     ) -> list[ActionIntent]:
         assert world.core is not None
         if worker.cargo == 0 and worker.position == world.core.position:
@@ -1147,7 +1224,7 @@ class WorkerPlanner:
             )
         if worker.cargo > 0:
             return self._cargo(world, projection, worker, service)
-        if worker.position in world.visible_resources:
+        if allow_harvest and worker.position in world.visible_resources:
             self.memory.unit_missions[worker.id] = MissionState(
                 UnitMission.HARVEST,
                 worker.position,

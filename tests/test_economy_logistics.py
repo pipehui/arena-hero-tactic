@@ -911,7 +911,7 @@ class EconomyAndLogisticsTests(unittest.TestCase):
             unit(2, UnitType.WORKER, (1, 0), cargo=1),
             unit(3, UnitType.WORKER, (-1, 0), cargo=1),
             unit(4, UnitType.WORKER, (0, 1), cargo=1),
-            unit(5, UnitType.WORKER, (0, -1)),
+            unit(5, UnitType.WORKER, (5, 0)),
         )
         memory = TacticMemory(opening_complete=True)
         memory.known_passable.update(
@@ -921,7 +921,11 @@ class EconomyAndLogisticsTests(unittest.TestCase):
             if abs(x) + abs(y) <= 12
         )
         tactic = BalancedTactic(memory=memory)
-        turn = make_turn(units=workers, resources=25)
+        turn = make_turn(
+            units=workers,
+            resource_cells=((5, 0),),
+            resources=25,
+        )
 
         tactic.choose_actions(turn)
 
@@ -932,22 +936,29 @@ class EconomyAndLogisticsTests(unittest.TestCase):
             if task["actor_id"] in worker_ids
         ]
         self.assertTrue(tasks)
-        self.assertTrue(all(task["mission"] == "HOME_GUARD" for task in tasks))
+        cargo_ids = {str(worker.id) for worker in workers if worker.cargo > 0}
+        cargo_tasks = [task for task in tasks if task["actor_id"] in cargo_ids]
+        empty_tasks = [task for task in tasks if task["actor_id"] not in cargo_ids]
+        self.assertTrue(all(task["mission"] == "HOME_GUARD" for task in cargo_tasks))
+        self.assertTrue(empty_tasks)
+        self.assertTrue(all(task["mission"] == "EXPLORE" for task in empty_tasks))
         self.assertFalse(
             {
                 "RETURN_CARGO",
                 "DEPOSIT",
                 "HARVEST",
-                "EXPLORE",
             }
-            & {task["mission"] for task in tasks}
+            & {task["mission"] for task in cargo_tasks}
         )
         service = tactic.last_decision_trace["economy"]["service_queue"]
         self.assertEqual(service["admission_id"], None)
         self.assertEqual(service["depositors"], [])
         posts = tactic.memory.worker_home_guard_targets
-        self.assertEqual(set(posts), {worker.id for worker in workers})
-        self.assertEqual(len(set(posts.values())), len(workers))
+        self.assertEqual(
+            set(posts),
+            {worker.id for worker in workers if worker.cargo > 0},
+        )
+        self.assertEqual(len(set(posts.values())), len(posts))
         distances = sorted(manhattan((0, 0), post) for post in posts.values())
         self.assertLessEqual(sum(distance <= 10 for distance in distances), 4)
         self.assertTrue(all(8 <= distance <= 20 for distance in distances))
