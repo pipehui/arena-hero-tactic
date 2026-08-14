@@ -38,6 +38,7 @@ class UnitMission(str, Enum):
     HOME_DEFENSE = "HOME_DEFENSE"
     COUNTER_SIEGE = "COUNTER_SIEGE"
     RAID = "RAID"
+    RETURN_HOME = "RETURN_HOME"
     EXPLORE = "EXPLORE"
     PATROL = "PATROL"
     PRODUCTION = "PRODUCTION"
@@ -95,6 +96,13 @@ class VanguardIntent(str, Enum):
     RETREATING = "RETREATING"
     BLIND_SPOT_APPROACH = "BLIND_SPOT_APPROACH"
     UNCERTAIN = "UNCERTAIN"
+
+
+class UnitLossProvenance(str, Enum):
+    HOME_DEFENSE = "HOME_DEFENSE"
+    RAID = "RAID"
+    REMOTE = "REMOTE"
+    UNKNOWN = "UNKNOWN"
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +223,7 @@ class EnemyCoreControlZone:
     clear_radius: int
     last_seen_tick: int
     visible_now: bool
+    expires_tick: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -918,7 +927,7 @@ class MissionState:
 
 
 @dataclass(frozen=True, slots=True)
-class WorkerEscapeState:
+class WorkerSurvivalLease:
     phase: str
     threat_ids: tuple[UUID, ...]
     last_threat_tick: int
@@ -932,6 +941,47 @@ class WorkerEscapeState:
     waypoint_expires_tick: int | None = None
     waypoint_invalid_reason: str | None = None
     last_waypoint_distance: int | None = None
+    control_core_ids: tuple[UUID, ...] = ()
+    control_centers: tuple[Position, ...] = ()
+
+
+# Compatibility alias for callers and old tests that imported the split-state
+# name.  WorkerSurvivalLease is the single authoritative survival state.
+WorkerEscapeState = WorkerSurvivalLease
+
+
+@dataclass(frozen=True, slots=True)
+class RaidAttemptMemory:
+    core_id: UUID
+    failed_attempts: int = 0
+    last_failure_tick: int | None = None
+    last_failure_reason: str | None = None
+    last_failure_sighting_tick: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class HomeReturnMission:
+    actor_id: UUID
+    target: Position
+    assigned_tick: int
+    last_distance: int | None = None
+    stalled_ticks: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class CombatLossRecord:
+    actor_id: UUID
+    unit_type: UnitType
+    tick: int
+    provenance: UnitLossProvenance
+
+
+@dataclass(frozen=True, slots=True)
+class FullStorageParkingAssignment:
+    worker_id: UUID
+    position: Position
+    zone: str
+    assigned_tick: int
 
 
 @dataclass(frozen=True, slots=True)

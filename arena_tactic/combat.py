@@ -669,8 +669,18 @@ class CombatPlanner:
                     # its top prediction.  Otherwise spread opportunistic
                     # Rangers over distinct legal outcomes before duplicating
                     # an already-covered empty cell.
+                    reliable_worker_cell = self._worker_cell_is_reliable(
+                        world,
+                        mission,
+                    )
                     spread_rank = (
-                        0 if mission.confidence == "HIGH" else coverage[cell]
+                        0
+                        if mission.confidence == "HIGH"
+                        and (
+                            mission.target_type is not UnitType.WORKER
+                            or reliable_worker_cell
+                        )
+                        else coverage[cell]
                     )
                     options.append(
                         (
@@ -762,20 +772,53 @@ class CombatPlanner:
             state.available.add(ranger_id)
 
     @staticmethod
-    def _defer_single_worker_shot(world, mission, state) -> bool:
+    def _worker_cell_is_reliable(world, mission) -> bool:
+        if mission.target_type is not UnitType.WORKER:
+            return True
+        if len(mission.candidate_cells) <= 1:
+            return True
+        track = world.track(mission.target_id)
+        if track is None:
+            return False
+        samples = track.samples
+        stationary = 0
+        for index in range(len(samples) - 1, 0, -1):
+            if samples[index][1] != samples[index - 1][1]:
+                break
+            stationary += 1
+        return stationary >= 2 or any(
+            evidence in {"FORCED_CHANNEL", "CURRENT_ATTACK"}
+            for evidence in mission.evidence
+        )
+
+    @classmethod
+    def _defer_single_worker_shot(cls, world, mission, state) -> bool:
         if (
             mission.target_type is not UnitType.WORKER
             or mission.urgent
-            or mission.confidence == "HIGH"
-            or len(mission.candidate_cells) <= 1
+            or cls._worker_cell_is_reliable(world, mission)
         ):
             return False
-        healthy = [
-            ranger
-            for ranger in state.rangers
-            if ranger.hp * 2 > UNIT_MAX_HP[UnitType.RANGER]
-        ]
-        if len(healthy) != 1:
+        assigned = {
+            ranger_id
+            for ranger_id, _ in state.mission_assignments.get(
+                mission.target_id,
+                (),
+            )
+        }
+        locally_eligible = assigned | {
+            ranger_id
+            for ranger_id in state.available
+            if any(
+                ranger_line_is_clear(
+                    state.ranger_by_id[ranger_id].position,
+                    cell,
+                    world.known_obstacles,
+                )
+                for cell in mission.candidate_cells[:2]
+            )
+        }
+        if len(locally_eligible) >= 2:
             return False
         track = world.track(mission.target_id)
         return bool(

@@ -12,10 +12,11 @@ from .models import (
     CoreServiceQueue,
     EntitySnapshot,
     EnemyCoreControlZone,
+    FullStorageParkingAssignment,
     IntentAction,
     MissionState,
     UnitMission,
-    WorkerEscapeState,
+    WorkerSurvivalLease,
     WorkerDisengageLease,
     WorkerScoutPhase,
     WorkerScoutState,
@@ -184,6 +185,7 @@ class WorkerPlanner:
             exploration_assignments: dict[UUID, tuple[Position, Route, int]] = {}
         else:
             self.memory.worker_home_guard_targets.clear()
+            self.memory.worker_parking_assignments.clear()
             available = tuple(
                 worker
                 for worker in workers
@@ -309,13 +311,20 @@ class WorkerPlanner:
         service: CoreServiceQueue,
         workers: tuple[EntitySnapshot, ...],
     ) -> dict[UUID, Position]:
-        """Spread saturated-economy Workers near home without blocking it."""
+        """Park saturated-economy Workers without forming a Core wall.
+
+        Only four stable UUID slots use the 8/10 near reserve.  Every other
+        Worker receives an exclusive 12--20 sector post, keeping service and
+        combat geometry clear while still leaving the economy close enough to
+        resume immediately when storage has headroom.
+        """
 
         assert world.core is not None
         living = {worker.id for worker in workers}
         for worker_id in tuple(self.memory.worker_home_guard_targets):
             if worker_id not in living:
                 self.memory.worker_home_guard_targets.pop(worker_id, None)
+                self.memory.worker_parking_assignments.pop(worker_id, None)
         if not workers:
             return {}
 
@@ -337,79 +346,89 @@ class WorkerPlanner:
             for unit in world.friendlies
             if unit.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
         }
-        combat_guard = (
-            self.memory.home_defense_alert_until >= world.tick
-            or any(
-                enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
-                and manhattan(enemy.position, core)
-                <= self.config.home_engage_radius + 4
-                for enemy in world.enemies
+        formation_positions = set()
+        if self.memory.peaceful_formation_assignment is not None:
+            formation_positions.update(
+                self.memory.peaceful_formation_assignment.reserved_positions
+            )
+        for lease in self.memory.squad_formation_leases.values():
+            formation_positions.update((lease.anchor, lease.support))
+        for _, (cell, _, _) in self.memory.defense_reserve_leases.items():
+            formation_positions.add(cell)
+
+        def legal_cells(radii: tuple[int, ...]) -> tuple[Position, ...]:
+            return tuple(
+                cell
+                for radius in radii
+                for cell in manhattan_ring(core, radius)
+                if cell in world.known_passable
+                and cell not in world.known_obstacles
+                and cell not in projection.hostile_occupied
+                and cell not in service_cells
+                and cell not in combat_positions
+                and cell not in formation_positions
+                and projection.immediate_attackers(cell) == 0
+                and projection.future_attackers(cell) == 0
+                and projection.threat_heat.get(cell, 0) == 0
+            )
+
+        near_candidates = legal_cells(self.config.worker_full_storage_guard_radii)
+        outer_candidates = legal_cells(
+            tuple(
+                range(
+                    self.config.worker_full_storage_parking_min_radius,
+                    self.config.worker_full_storage_parking_max_radius + 1,
+                )
             )
         )
-        guard_radii = (
-            self.config.worker_full_storage_combat_guard_radii
-            if combat_guard
-            else self.config.worker_full_storage_guard_radii
-        )
-        candidates = tuple(
-            cell
-            for radius in guard_radii
-            for cell in manhattan_ring(core, radius)
-            if cell in world.known_passable
-            and cell not in world.known_obstacles
-            and cell not in projection.hostile_occupied
-            and cell not in service_cells
-            and cell not in combat_positions
-            and projection.immediate_attackers(cell) == 0
-        )
-        if len(candidates) < len(workers):
-            # Dense or heavily obstructed homes may not have enough legal posts
-            # on the preferred rings.  Expand only as far as needed, skipping
-            # the combat patrol rings so Workers remain near home without
-            # becoming part of the fighting formation.
-            preferred = set(guard_radii)
-            combat_rings = set(self.config.peaceful_squad_radii)
-            expanded = list(candidates)
-            seen = set(expanded)
-            outer = max(guard_radii)
-            for radius in range(outer + 1, outer + 9):
-                if radius in preferred or radius in combat_rings:
-                    continue
-                for cell in manhattan_ring(core, radius):
-                    if (
-                        cell in seen
-                        or cell not in world.known_passable
-                        or cell in world.known_obstacles
-                        or cell in projection.hostile_occupied
-                        or cell in service_cells
-                        or cell in combat_positions
-                        or projection.immediate_attackers(cell) > 0
-                    ):
-                        continue
-                    seen.add(cell)
-                    expanded.append(cell)
-                if len(expanded) >= len(workers):
-                    break
-            candidates = tuple(expanded)
-        if not candidates:
+        if not near_candidates and not outer_candidates:
             self.memory.worker_home_guard_targets.clear()
+            self.memory.worker_parking_assignments.clear()
             return {}
 
         ordered_workers = tuple(sorted(workers, key=lambda unit: unit.id.bytes))
         used: set[Position] = set()
         assignments: dict[UUID, Position] = {}
-        candidate_set = set(candidates)
+        near_count = min(
+            self.config.worker_full_storage_near_reserve_count,
+            len(ordered_workers),
+        )
+        worker_zones = {
+            worker.id: ("NEAR_RESERVE" if rank < near_count else "OUTER_PARKING")
+            for rank, worker in enumerate(ordered_workers)
+        }
+        zone_candidates = {
+            "NEAR_RESERVE": near_candidates,
+            "OUTER_PARKING": outer_candidates,
+        }
         for worker in ordered_workers:
             previous = self.memory.worker_home_guard_targets.get(worker.id)
-            if previous in candidate_set and previous not in used:
+            candidates = zone_candidates[worker_zones[worker.id]]
+            if previous in set(candidates) and previous not in used:
                 assignments[worker.id] = previous
                 used.add(previous)
 
-        count = len(ordered_workers)
+        zone_totals = {
+            zone: sum(worker_zones[item.id] == zone for item in ordered_workers)
+            for zone in zone_candidates
+        }
+        zone_ranks = {"NEAR_RESERVE": 0, "OUTER_PARKING": 0}
         for rank, worker in enumerate(ordered_workers):
+            zone = worker_zones[worker.id]
+            candidates = zone_candidates[zone]
+            zone_rank = zone_ranks[zone]
+            zone_ranks[zone] += 1
             if worker.id in assignments:
                 continue
-            desired = rank * len(candidates) // count
+            if not candidates:
+                # A near-reserve worker may safely fall back to an outer post,
+                # but an outer worker must never overflow into the near band:
+                # that would silently violate the four-Worker Core density
+                # limit precisely on partially explored maps.
+                candidates = outer_candidates if zone == "NEAR_RESERVE" else ()
+            if not candidates:
+                continue
+            desired = zone_rank * len(candidates) // max(1, zone_totals[zone])
 
             def score(row: tuple[int, Position]):
                 index, cell = row
@@ -433,11 +452,32 @@ class WorkerPlanner:
                 for index, cell in enumerate(candidates)
                 if cell not in used
             )
-            _, target = min(available, key=score, default=(0, worker.position))
+            selected = min(available, key=score, default=None)
+            if selected is None:
+                continue
+            _, target = selected
             assignments[worker.id] = target
             used.add(target)
 
         self.memory.worker_home_guard_targets = dict(assignments)
+        self.memory.worker_parking_assignments = {
+            worker_id: FullStorageParkingAssignment(
+                worker_id=worker_id,
+                position=target,
+                zone=worker_zones[worker_id],
+                assigned_tick=(
+                    previous.assigned_tick
+                    if (
+                        (previous := self.memory.worker_parking_assignments.get(worker_id))
+                        is not None
+                        and previous.position == target
+                        and previous.zone == worker_zones[worker_id]
+                    )
+                    else world.tick
+                ),
+            )
+            for worker_id, target in assignments.items()
+        }
         return assignments
 
     def _home_guard_intents(
@@ -599,24 +639,11 @@ class WorkerPlanner:
         intents: list[ActionIntent] = []
         escaping: set[UUID] = set()
         for worker in workers:
-            if projection.immediate_attackers(worker.position) >= worker.hp:
-                escape = self._update_escape(world, projection, worker)
-                if escape is not None:
-                    escaping.add(worker.id)
-                    intents.extend(
-                        self._escape_intents(world, projection, worker, escape)
-                    )
-                    continue
-            disengage = self._update_core_disengage(world, projection, worker)
-            if disengage is not None:
+            survival = self._update_escape(world, projection, worker)
+            if survival is not None:
                 escaping.add(worker.id)
                 intents.extend(
-                    self._core_disengage_intents(
-                        world,
-                        projection,
-                        worker,
-                        disengage,
-                    )
+                    self._escape_intents(world, projection, worker, survival)
                 )
                 continue
             if (
@@ -672,9 +699,10 @@ class WorkerPlanner:
                 clear_radius=self.config.enemy_core_worker_clear_radius,
                 last_seen_tick=intel.last_seen_tick,
                 visible_now=intel.id in visible_ids,
+                expires_tick=intel.last_seen_tick + self.config.enemy_core_control_ttl,
             )
             for intel in world.remembered_enemy_cores
-            if world.tick - intel.last_seen_tick <= self.config.raid_intel_ttl
+            if world.tick - intel.last_seen_tick <= self.config.enemy_core_control_ttl
         }
         valid_workers = {
             unit.id for unit in world.friendlies if unit.unit_type is UnitType.WORKER
@@ -741,11 +769,16 @@ class WorkerPlanner:
             self.config.home_force_floor,
             self.memory.home_force_high_water,
         )
-        long_range = (
-            manhattan(zone.center, world.core.position)
-            > self.config.raid_containment_radius
+        distance = manhattan(zone.center, world.core.position)
+        remote = distance > self.config.raid_confirmed_start_radius
+        attempt = self.memory.raid_attempts.get(zone.core_id)
+        required_pairs = (
+            self.config.raid_initial_pair_count
+            + (0 if attempt is None else attempt.failed_attempts)
+            * self.config.raid_escalation_pair_step
         )
-        if long_range:
+        required = required_pairs * 2
+        if remote:
             route = route_to(
                 world,
                 world.core.position,
@@ -754,10 +787,9 @@ class WorkerPlanner:
                 blocked=frozenset(enemy.position for enemy in world.enemies),
             )
             force_ready = (
-                len(healthy) - self.config.raid_long_range_min_members
-                >= home_target
-                and vanguards >= self.config.minimum_vanguards + 2
-                and rangers >= self.config.minimum_rangers + 2
+                len(healthy) - required >= home_target
+                and vanguards >= self.config.minimum_vanguards + required_pairs
+                and rangers >= self.config.minimum_rangers + required_pairs
             )
             route_ready = bool(
                 route is not None
@@ -765,7 +797,10 @@ class WorkerPlanner:
             )
         else:
             force_ready = (
-                len(healthy) - 2 >= home_target and vanguards >= 1 and rangers >= 1
+                len(healthy) - required
+                >= min(home_target, self.config.raid_peace_home_reserve)
+                and vanguards >= required_pairs
+                and rangers >= required_pairs
             )
             route_ready = True
         if (
@@ -1578,20 +1613,83 @@ class WorkerPlanner:
         )
         previous = self.memory.worker_escape_states.get(worker.id)
 
+        active_zones = tuple(
+            sorted(
+                (
+                    zone
+                    for zone in self.memory.enemy_core_control_zones.values()
+                    if manhattan(worker.position, zone.center) <= zone.clear_radius
+                ),
+                key=lambda zone: (
+                    manhattan(worker.position, zone.center),
+                    zone.core_id.bytes,
+                ),
+            )
+        )
+        if previous is None:
+            active_zones = tuple(
+                zone
+                for zone in active_zones
+                if not self._confirmation_observer_allowed(
+                    world,
+                    projection,
+                    worker,
+                    zone,
+                )
+            )
+        control_ids = tuple(zone.core_id for zone in active_zones)
+        control_centers = tuple(zone.center for zone in active_zones)
+
+        if active_zones:
+            mission = self.memory.unit_missions.get(worker.id)
+            if mission is not None and mission.mission in {
+                UnitMission.HARVEST,
+                UnitMission.EXPLORE,
+            }:
+                if mission.target is not None:
+                    expiry = max(
+                        zone.last_seen_tick + self.config.enemy_core_control_ttl
+                        for zone in active_zones
+                    )
+                    self.memory.worker_resource_backoff[(worker.id, mission.target)] = max(
+                        self.memory.worker_resource_backoff.get(
+                            (worker.id, mission.target),
+                            0,
+                        ),
+                        expiry,
+                    )
+                    self.memory.target_backoff_until[mission.target] = max(
+                        self.memory.target_backoff_until.get(mission.target, 0),
+                        expiry,
+                    )
+                self.memory.unit_missions.pop(worker.id, None)
+                self.memory.worker_task_progress.pop(worker.id, None)
+                scout = self.memory.worker_scout_states.get(worker.id)
+                if scout is not None:
+                    self.memory.worker_scout_states[worker.id] = replace(
+                        scout,
+                        target=None,
+                        assigned_tick=world.tick,
+                        best_route_cost=None,
+                        stalled_ticks=0,
+                    )
+
         def progressed_state(
             phase: str,
             threat_ids: tuple[UUID, ...],
             last_threat_tick: int,
             safe_ticks: int,
-        ) -> WorkerEscapeState:
-            minimum, _ = self._enemy_distances(
+        ) -> WorkerSurvivalLease:
+            minimum, _ = self._survival_distances(
                 projection,
                 worker.position,
                 threat_ids,
+                control_centers,
             )
             same_threats = (
                 previous is not None
                 and previous.threat_ids == threat_ids
+                and previous.control_core_ids == control_ids
             )
             improved = (
                 previous is None
@@ -1621,29 +1719,28 @@ class WorkerPlanner:
                 None if previous is None else previous.waypoint_expires_tick
             )
             invalid_reason = None
+            lease_mature = bool(
+                waypoint_assigned_tick is None
+                or world.tick - waypoint_assigned_tick
+                >= self.config.worker_escape_waypoint_lease_ticks
+            )
             if (
                 waypoint == worker.position
                 or not same_threats
-                or (
-                    waypoint_expires_tick is not None
-                    and world.tick > waypoint_expires_tick
-                )
-                or stalled >= self.config.worker_escape_replan_ticks
+                or lease_mature
+                and stalled >= self.config.worker_escape_replan_ticks
             ):
                 invalid_reason = (
                     "WAYPOINT_REACHED"
                     if waypoint == worker.position
                     else "THREAT_SET_CHANGED"
                     if not same_threats
-                    else "WAYPOINT_LEASE_EXPIRED"
-                    if waypoint_expires_tick is not None
-                    and world.tick > waypoint_expires_tick
                     else "WAYPOINT_ROUTE_STALLED"
                 )
                 waypoint = None
                 waypoint_assigned_tick = None
                 waypoint_expires_tick = None
-            return WorkerEscapeState(
+            return WorkerSurvivalLease(
                 phase=phase,
                 threat_ids=threat_ids,
                 last_threat_tick=last_threat_tick,
@@ -1661,9 +1758,11 @@ class WorkerPlanner:
                     if waypoint is None
                     else manhattan(worker.position, waypoint)
                 ),
+                control_core_ids=control_ids,
+                control_centers=control_centers,
             )
 
-        if threats:
+        if threats or active_zones:
             retained = {
                 threat_id
                 for threat_id in (() if previous is None else previous.threat_ids)
@@ -1671,10 +1770,17 @@ class WorkerPlanner:
                 and enemy.age <= self.config.enemy_track_ttl
             }
             retained.update(threats)
+            phase = (
+                "FLEEING"
+                if direct_threats
+                else "CORE_DISENGAGE"
+                if active_zones
+                else "FOG_RETREAT"
+            )
             state = progressed_state(
-                "FLEEING" if direct_threats else "GLOBAL_ALERT_RETREAT",
+                phase,
                 tuple(sorted(retained, key=lambda item: item.bytes)),
-                world.tick,
+                world.tick if threats else previous.last_threat_tick if previous else world.tick,
                 0,
             )
             self.memory.worker_escape_states[worker.id] = state
@@ -1719,7 +1825,12 @@ class WorkerPlanner:
             worker.hp,
             threat_ids=previous.threat_ids,
         )
-        safe_ticks = previous.safe_ticks + 1 if exits >= 2 else 0
+        outside_controls = all(
+            manhattan(worker.position, center)
+            > self.config.enemy_core_worker_clear_radius
+            for center in previous.control_centers
+        )
+        safe_ticks = previous.safe_ticks + 1 if exits >= 2 and outside_controls else 0
         if safe_ticks >= self.config.worker_escape_safe_ticks:
             self.memory.worker_escape_states.pop(worker.id, None)
             return None
@@ -1815,8 +1926,11 @@ class WorkerPlanner:
                 continue
             recent = self._recent_threat(projection, destination, state.threat_ids)
             heat = projection.worker_exposure(destination)[2]
-            minimum, total = self._enemy_distances(
-                projection, destination, state.threat_ids
+            minimum, total = self._survival_distances(
+                projection,
+                destination,
+                state.threat_ids,
+                state.control_centers,
             )
             visible_minimum, visible_total = self._visible_enemy_distances(
                 projection,
@@ -1836,6 +1950,7 @@ class WorkerPlanner:
                     worker.position,
                     worker.hp,
                     state.threat_ids,
+                    state.control_centers,
                 )
             )
             rows.append(
@@ -1895,6 +2010,15 @@ class WorkerPlanner:
             lambda row: row.future_attackers == 0,
             "NONZERO_FUTURE_EXPOSURE",
         )
+
+        if state.phase != "FLEEING" and state.last_min_enemy_distance is not None:
+            rows = retain(
+                rows,
+                lambda row: (
+                    row.minimum_enemy_distance >= state.last_min_enemy_distance
+                ),
+                "DECREASES_CONSERVATIVE_SURVIVAL_DISTANCE",
+            )
 
         # Recent history may break a tie, but it may never force a Worker
         # closer to an authoritative visible Vanguard threat.  When a
@@ -1984,10 +2108,6 @@ class WorkerPlanner:
             should_replan = (
                 waypoint is None
                 or state.stalled_ticks >= self.config.worker_escape_replan_ticks
-                or (
-                    state.waypoint_expires_tick is not None
-                    and world.tick > state.waypoint_expires_tick
-                )
             )
             if should_replan:
                 waypoint = first.waypoint
@@ -2146,6 +2266,7 @@ class WorkerPlanner:
         origin: Position,
         hp: int,
         threat_ids: tuple[UUID, ...],
+        control_centers: tuple[Position, ...] = (),
     ) -> tuple[Position, int, int, int]:
         """Choose a bounded, zero-controller egress waypoint for one first step."""
 
@@ -2162,7 +2283,12 @@ class WorkerPlanner:
         terminals: list[tuple[tuple[object, ...], Position, int, int, int]] = []
         while frontier and len(visited) <= self.config.worker_escape_plan_node_limit:
             cell, depth, max_immediate, max_future, accumulated_heat = frontier.pop(0)
-            minimum, total = self._enemy_distances(projection, cell, threat_ids)
+            minimum, total = self._survival_distances(
+                projection,
+                cell,
+                threat_ids,
+                control_centers,
+            )
             visible_minimum, visible_total = self._visible_enemy_distances(
                 projection,
                 cell,
@@ -2216,7 +2342,12 @@ class WorkerPlanner:
                     )
                 )
         if not terminals:
-            minimum, total = self._enemy_distances(projection, start, threat_ids)
+            minimum, total = self._survival_distances(
+                projection,
+                start,
+                threat_ids,
+                control_centers,
+            )
             return start, minimum, total, projection.worker_exposure(start)[2]
         _, waypoint, minimum, total, heat = min(terminals, key=lambda row: row[0])
         return waypoint, minimum, total, heat
@@ -2244,6 +2375,32 @@ class WorkerPlanner:
                 distances.append(
                     max(0, manhattan(position, enemy.observed_position) - enemy.age)
                 )
+        return min(distances, default=99), sum(distances)
+
+    @classmethod
+    def _survival_distances(
+        cls,
+        projection,
+        position: Position,
+        ids: tuple[UUID, ...],
+        control_centers: tuple[Position, ...],
+    ) -> tuple[int, int]:
+        """Return one conservative distance frontier for every survival cause.
+
+        Enemy tracks shrink with age while enemy-Core control zones remain
+        spatially exact.  Combining them prevents FOG_RETREAT and
+        CORE_DISENGAGE from alternately pulling a Worker back into the other
+        hazard.
+        """
+
+        distances: list[int] = []
+        for threat_id in ids:
+            enemy = projection.enemy(threat_id)
+            if enemy is not None:
+                distances.append(
+                    max(0, manhattan(position, enemy.observed_position) - enemy.age)
+                )
+        distances.extend(manhattan(position, center) for center in control_centers)
         return min(distances, default=99), sum(distances)
 
     @staticmethod

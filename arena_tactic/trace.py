@@ -515,6 +515,15 @@ class DecisionTraceBuilder:
                     ),
                 }
             ),
+            "combat_losses": [
+                {
+                    "actor_id": str(record.actor_id),
+                    "unit_type": record.unit_type.value,
+                    "tick": record.tick,
+                    "provenance": record.provenance.value,
+                }
+                for record in self.memory.recent_combat_losses
+            ],
             "storage_saturated": self.memory.storage_saturated,
             "storage_headroom": max(0, world.resource_capacity - world.resources),
             "worker_home_guard_radii": list(
@@ -531,6 +540,15 @@ class DecisionTraceBuilder:
                 {
                     "worker_id": str(worker_id),
                     "post": list(post),
+                    "zone": (
+                        None
+                        if (
+                            parking := self.memory.worker_parking_assignments.get(
+                                worker_id
+                            )
+                        ) is None
+                        else parking.zone
+                    ),
                     "action": (
                         None
                         if worker_id not in selected_by_actor
@@ -712,6 +730,12 @@ class DecisionTraceBuilder:
                     "waypoint_expires_tick": state.waypoint_expires_tick,
                     "waypoint_invalid_reason": state.waypoint_invalid_reason,
                     "last_waypoint_distance": state.last_waypoint_distance,
+                    "control_core_ids": [
+                        str(item) for item in state.control_core_ids
+                    ],
+                    "control_centers": [
+                        list(item) for item in state.control_centers
+                    ],
                 }
                 for worker_id, state in sorted(
                     self.memory.worker_escape_states.items(),
@@ -726,6 +750,7 @@ class DecisionTraceBuilder:
                     "clear_radius": zone.clear_radius,
                     "last_seen_tick": zone.last_seen_tick,
                     "visible_now": zone.visible_now,
+                    "expires_tick": zone.expires_tick,
                 }
                 for zone in sorted(
                     self.memory.enemy_core_control_zones.values(),
@@ -1213,6 +1238,37 @@ class DecisionTraceBuilder:
                     else list(self.memory.raid_last_position)
                 ),
                 "members": [str(item) for item in self.memory.raid_member_ids],
+                "return_reason": self.memory.raid_return_reason,
+                "handoff_targets": [
+                    {
+                        "actor_id": str(actor_id),
+                        "position": list(position),
+                    }
+                    for actor_id, position in sorted(
+                        self.memory.raid_handoff_targets.items(),
+                        key=lambda item: item[0].bytes,
+                    )
+                ],
+                "attempts": [
+                    {
+                        "target_id": str(target_id),
+                        "failed_attempts": attempt.failed_attempts,
+                        "last_failure_tick": attempt.last_failure_tick,
+                        "last_failure_reason": attempt.last_failure_reason,
+                        "last_failure_sighting_tick": (
+                            attempt.last_failure_sighting_tick
+                        ),
+                        "next_pair_count": (
+                            self.config.raid_initial_pair_count
+                            + attempt.failed_attempts
+                            * self.config.raid_escalation_pair_step
+                        ),
+                    }
+                    for target_id, attempt in sorted(
+                        self.memory.raid_attempts.items(),
+                        key=lambda item: item[0].bytes,
+                    )
+                ],
                 "return_handoffs": [
                     {
                         "actor_id": str(intent.actor_id),
@@ -1493,6 +1549,15 @@ class DecisionTraceBuilder:
                 for candidate in evacuation.candidate_evaluations
             ],
             "recent_combat_loss_ticks": list(self.memory.recent_combat_loss_ticks),
+            "recent_combat_losses": [
+                {
+                    "actor_id": str(record.actor_id),
+                    "unit_type": record.unit_type.value,
+                    "tick": record.tick,
+                    "provenance": record.provenance.value,
+                }
+                for record in self.memory.recent_combat_losses
+            ],
             "strategic_relocation_pending": self.memory.strategic_relocation_pending,
             "strategic_relocation_safe_ticks": self.memory.strategic_relocation_safe_ticks,
             "strategic_relocation_goal": (

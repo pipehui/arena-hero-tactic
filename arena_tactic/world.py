@@ -18,6 +18,7 @@ from .geometry import (
 )
 from .models import (
     BeaconSnapshot,
+    CombatLossRecord,
     CoreSnapshot,
     EnemyCoreSnapshot,
     EnemyTrack,
@@ -30,6 +31,7 @@ from .models import (
     ResourceIntel,
     ThreatHeatCell,
     UnitMission,
+    UnitLossProvenance,
     VisionSource,
 )
 from .state import TacticMemory
@@ -247,12 +249,19 @@ def _sync_events(
                 memory.counter_siege_reserve_ids = ()
                 memory.counter_siege_phase = "IDLE"
             if memory.raid_target_id == event.target_id:
+                members = memory.raid_member_ids
                 memory.raid_target_id = None
                 memory.raid_last_seen_tick = None
-                memory.raid_last_position = None
-                memory.raid_member_ids = ()
-                memory.raid_phase = "IDLE"
-                memory.raid_long_range_campaign = None
+                memory.raid_phase = "RETURNING" if members else "IDLE"
+                memory.raid_return_reason = "TARGET_DESTROYED"
+                memory.raid_handoff_targets.clear()
+                if memory.raid_long_range_campaign is not None:
+                    memory.raid_long_range_campaign = replace(
+                        memory.raid_long_range_campaign,
+                        phase="RETURNING",
+                        member_ids=members,
+                    )
+            memory.raid_attempts.pop(event.target_id, None)
         elif event.event_type == "HARVEST_SUCCEEDED":
             if event.position is not None:
                 memory.resource_harvest_count[event.position] += 1
@@ -412,24 +421,92 @@ def _sync_friendly_memory(
 ) -> None:
 
     living_ids = {unit.id for unit in turn.units}
-    current_combat_ids = {
-        unit.id
+    current_combat = {
+        unit.id: unit.unit_type
         for unit in turn.units
         if unit.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
     }
+    current_combat_ids = set(current_combat)
     if memory.last_tick is not None:
         losses = memory.last_combat_unit_ids - current_combat_ids
         if losses:
-            memory.recent_combat_loss_ticks = (
-                *memory.recent_combat_loss_ticks,
-                *(turn.tick for _ in losses),
+            records: list[CombatLossRecord] = []
+            for unit_id in sorted(losses, key=lambda item: item.bytes):
+                unit_type = memory.last_combat_unit_types.get(unit_id)
+                if unit_type not in {UnitType.VANGUARD, UnitType.RANGER}:
+                    continue
+                mission = memory.unit_missions.get(unit_id)
+                last_position = memory.last_positions.get(unit_id)
+                if unit_id in memory.raid_member_ids or (
+                    mission is not None
+                    and mission.mission in {UnitMission.RAID, UnitMission.COUNTER_SIEGE}
+                ):
+                    provenance = UnitLossProvenance.RAID
+                elif (
+                    last_position is not None
+                    and turn.core is not None
+                    and manhattan(last_position, turn.core.position)
+                    <= config.home_warning_radius
+                    and (
+                        manhattan(last_position, turn.core.position)
+                        <= config.home_engage_radius
+                        or memory.home_defense_alert_until >= turn.tick - 1
+                        or mission is not None
+                        and mission.mission
+                        in {UnitMission.HOME_DEFENSE, UnitMission.ATTACK}
+                    )
+                ):
+                    provenance = UnitLossProvenance.HOME_DEFENSE
+                elif last_position is not None:
+                    provenance = UnitLossProvenance.REMOTE
+                else:
+                    provenance = UnitLossProvenance.UNKNOWN
+                records.append(
+                    CombatLossRecord(unit_id, unit_type, turn.tick, provenance)
+                )
+                if (
+                    provenance is not UnitLossProvenance.HOME_DEFENSE
+                    and memory.crisis_force_baseline is not None
+                    and memory.crisis_force_baseline.phase in {"ACTIVE", "REBUILD"}
+                ):
+                    baseline = memory.crisis_force_baseline
+                    memory.crisis_force_baseline = replace(
+                        baseline,
+                        vanguards=max(
+                            0,
+                            baseline.vanguards
+                            - int(unit_type is UnitType.VANGUARD),
+                        ),
+                        rangers=max(
+                            0,
+                            baseline.rangers - int(unit_type is UnitType.RANGER),
+                        ),
+                    )
+            memory.recent_combat_losses = (
+                *memory.recent_combat_losses,
+                *records,
             )
+            home_losses = sum(
+                record.provenance is UnitLossProvenance.HOME_DEFENSE
+                for record in records
+            )
+            if home_losses:
+                memory.recent_combat_loss_ticks = (
+                    *memory.recent_combat_loss_ticks,
+                    *(turn.tick for _ in range(home_losses)),
+                )
     memory.recent_combat_loss_ticks = tuple(
         tick
         for tick in memory.recent_combat_loss_ticks
         if turn.tick - tick < 8
     )
+    memory.recent_combat_losses = tuple(
+        record
+        for record in memory.recent_combat_losses
+        if turn.tick - record.tick < 64
+    )
     memory.last_combat_unit_ids = current_combat_ids
+    memory.last_combat_unit_types = current_combat
     for unit_id in tuple(memory.unit_missions):
         if unit_id not in living_ids:
             memory.unit_missions.pop(unit_id, None)
@@ -449,6 +526,9 @@ def _sync_friendly_memory(
     for unit_id in tuple(memory.worker_task_progress):
         if unit_id not in living_ids:
             memory.worker_task_progress.pop(unit_id, None)
+    for unit_id in tuple(memory.home_return_missions):
+        if unit_id not in living_ids:
+            memory.home_return_missions.pop(unit_id, None)
     for key in tuple(memory.worker_resource_backoff):
         if key[0] not in living_ids:
             memory.worker_resource_backoff.pop(key, None)
@@ -544,14 +624,23 @@ def _sync_enemy_memory(
             last_seen_tick=turn.tick,
             sighting_count=sightings,
         )
+    visible_core_ids = {core.id for core in visible_enemy_cores}
     for core_id, intel in tuple(memory.enemy_core_intel.items()):
         active_long_range = (
             memory.raid_long_range_campaign is not None
             and memory.raid_long_range_campaign.target_id == core_id
             and turn.tick <= memory.raid_long_range_campaign.search_deadline_tick
         )
-        if turn.tick - intel.last_seen_tick > config.raid_intel_ttl and not active_long_range:
+        reobserved_absent = bool(
+            core_id not in visible_core_ids
+            and memory.cell_last_visible.get(intel.position) == turn.tick
+        )
+        if reobserved_absent or (
+            turn.tick - intel.last_seen_tick > config.enemy_core_control_ttl
+            and not active_long_range
+        ):
             memory.enemy_core_intel.pop(core_id, None)
+            memory.enemy_core_control_zones.pop(core_id, None)
     if turn.core is not None:
         nearby_combat = [
             enemy

@@ -40,7 +40,13 @@ from arena_tactic.persistence import (
     EXPLORATION_MEMORY_SCHEMA_VERSION,
     ExplorationMemoryStore,
 )
-from arena_tactic.models import EnemyCoreIntel, EnemyTrack, LongRangeRaidCampaign
+from arena_tactic.models import (
+    EnemyCoreControlZone,
+    EnemyCoreIntel,
+    EnemyTrack,
+    LongRangeRaidCampaign,
+    RaidAttemptMemory,
+)
 from arena_tactic.runtime import InstanceAlreadyRunning, SingleInstanceLock
 from replay_log import LOG_SCHEMA_VERSION, ReplayLogger
 from tests.helpers import friendly_core, make_turn, uid, unit
@@ -114,8 +120,55 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
             self.assertIn(uid(900), restored.enemy_core_intel)
 
     def test_schema_versions_are_upgraded(self) -> None:
-        self.assertEqual(LOG_SCHEMA_VERSION, 43)
-        self.assertEqual(EXPLORATION_MEMORY_SCHEMA_VERSION, 13)
+        self.assertEqual(LOG_SCHEMA_VERSION, 44)
+        self.assertEqual(EXPLORATION_MEMORY_SCHEMA_VERSION, 14)
+
+    def test_schema_14_preserves_core_control_attempts_and_returning_raid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target_id = uid(900)
+            member_id = uid(1)
+            memory = TacticMemory(core_id=uid(10_000), core_position=(0, 0))
+            memory.enemy_core_intel[target_id] = EnemyCoreIntel(
+                id=target_id,
+                position=(33, 0),
+                hp=5,
+                shield=5,
+                state=CoreState.NORMAL,
+                destination=None,
+                last_seen_tick=100,
+                sighting_count=3,
+            )
+            memory.enemy_core_control_zones[target_id] = EnemyCoreControlZone(
+                core_id=target_id,
+                center=(33, 0),
+                exclusion_radius=6,
+                clear_radius=8,
+                last_seen_tick=100,
+                visible_now=False,
+                expires_tick=612,
+            )
+            memory.raid_attempts[target_id] = RaidAttemptMemory(
+                core_id=target_id,
+                failed_attempts=1,
+                last_failure_tick=105,
+                last_failure_reason="MEMBER_LOW_HP",
+                last_failure_sighting_tick=100,
+            )
+            memory.raid_member_ids = (member_id,)
+            memory.raid_phase = "RETURNING"
+            memory.raid_return_reason = "TARGET_DESTROYED"
+            memory.raid_handoff_targets[member_id] = (12, 0)
+            store = ExplorationMemoryStore(directory, save_interval_ticks=1)
+
+            self.assertTrue(store.save(memory, tick=110, force=True))
+            restored = ExplorationMemoryStore(directory).load()
+
+            self.assertIn(target_id, restored.enemy_core_control_zones)
+            self.assertEqual(restored.raid_attempts[target_id].failed_attempts, 1)
+            self.assertEqual(restored.raid_phase, "RETURNING")
+            self.assertEqual(restored.raid_target_id, None)
+            self.assertEqual(restored.raid_member_ids, (member_id,))
+            self.assertEqual(restored.raid_handoff_targets[member_id], (12, 0))
 
     def test_main_translates_sigterm_into_a_graceful_service_stop(self) -> None:
         previous_handler = object()
@@ -453,7 +506,7 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
             text = logger.path.read_text(encoding="utf-8")
             first = json.loads(text.splitlines()[0])
 
-        self.assertEqual(first["schema_version"], 43)
+        self.assertEqual(first["schema_version"], 44)
         self.assertNotIn("hidden-token", text)
 
     def test_turn_log_contains_detached_schema_41_strategy(self) -> None:
@@ -478,10 +531,10 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
             logger.close(status="completed", last_tick=9)
             records = [json.loads(line) for line in logger.path.read_text(encoding="utf-8").splitlines()]
 
-        self.assertEqual(records[0]["schema_version"], 43)
+        self.assertEqual(records[0]["schema_version"], 44)
         record = next(item for item in records if item["record_type"] == "turn")
-        self.assertEqual(record["strategy"]["schema_version"], 43)
-        self.assertEqual(record["strategy"]["source_trace_schema"], 41)
+        self.assertEqual(record["strategy"]["schema_version"], 44)
+        self.assertEqual(record["strategy"]["source_trace_schema"], 42)
         self.assertNotIn("tasks", record["strategy"])
         self.assertIn("resolution", record["strategy"])
         decisions = record["strategy"]["decisions"]

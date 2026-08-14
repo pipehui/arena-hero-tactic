@@ -42,6 +42,7 @@ class TacticConfig:
     congestion_decay_ticks: int = 64
     enemy_track_ttl: int = 6
     enemy_core_occupancy_memory_ttl: int = 8
+    enemy_core_control_ttl: int = 512
     danger_envelope_ttl: int = 6
     threat_heat_visible_risk: int = 8
     threat_heat_visible_ttl: int = 24
@@ -93,7 +94,10 @@ class TacticConfig:
     # across dedicated non-combat rings instead of joining the deposit lane.
     # A small hysteresis prevents one point of healing/repair from summoning
     # the entire workforce back to the Core entrance.
-    worker_full_storage_guard_radii: tuple[int, ...] = (6, 8)
+    worker_full_storage_guard_radii: tuple[int, ...] = (8, 10)
+    worker_full_storage_near_reserve_count: int = 4
+    worker_full_storage_parking_min_radius: int = 12
+    worker_full_storage_parking_max_radius: int = 20
     # During a home-defense alert, yield the single-occupancy combat area but
     # remain close enough for service.  Avoid the 5/10/15 combat patrol rings.
     worker_full_storage_combat_guard_radii: tuple[int, ...] = (14, 16)
@@ -168,6 +172,10 @@ class TacticConfig:
     raid_long_range_max_route: int = 80
     raid_long_range_search_reserve_ticks: int = 16
     raid_long_range_max_campaign_ticks: int = 96
+    raid_initial_pair_count: int = 2
+    raid_escalation_pair_step: int = 1
+    home_return_radius: int = 18
+    home_return_handoff_radius: int = 12
     beacon_acquire_radius: int = 12
     beacon_min_workers: int = 4
     beacon_guard_radius: int = 2
@@ -191,6 +199,7 @@ class TacticConfig:
             self.congestion_decay_ticks,
             self.enemy_track_ttl,
             self.enemy_core_occupancy_memory_ttl,
+            self.enemy_core_control_ttl,
             self.danger_envelope_ttl,
             self.threat_heat_visible_risk,
             self.threat_heat_visible_ttl,
@@ -230,6 +239,9 @@ class TacticConfig:
             self.enemy_core_worker_clear_radius,
             self.worker_full_storage_release_space,
             self.worker_full_storage_replenishers,
+            self.worker_full_storage_near_reserve_count,
+            self.worker_full_storage_parking_min_radius,
+            self.worker_full_storage_parking_max_radius,
             self.home_warning_radius,
             self.home_defense_hold_ticks,
             self.home_engage_radius,
@@ -290,6 +302,10 @@ class TacticConfig:
             self.raid_long_range_max_route,
             self.raid_long_range_search_reserve_ticks,
             self.raid_long_range_max_campaign_ticks,
+            self.raid_initial_pair_count,
+            self.raid_escalation_pair_step,
+            self.home_return_radius,
+            self.home_return_handoff_radius,
             self.beacon_acquire_radius,
             self.beacon_min_workers,
             self.beacon_guard_radius,
@@ -322,6 +338,8 @@ class TacticConfig:
             raise ValueError("escape clearance must exceed its trigger radius")
         if self.enemy_core_worker_clear_radius <= self.enemy_core_worker_exclusion_radius:
             raise ValueError("enemy Core clearance must exceed its exclusion radius")
+        if self.enemy_core_control_ttl <= self.raid_intel_ttl:
+            raise ValueError("enemy Core control memory must outlive raid intel")
         if self.worker_escape_plan_node_limit < self.worker_escape_plan_depth:
             raise ValueError("escape planning nodes must cover its depth")
         if self.worker_escape_max_loop_period * 2 > self.loop_history_length:
@@ -335,8 +353,13 @@ class TacticConfig:
             raise ValueError("Worker home-guard radii must be unique and ordered")
         if self.worker_full_storage_guard_radii[0] <= self.service_lane_depth + 2:
             raise ValueError("Worker home guard must stay outside Core service")
-        if set(self.worker_full_storage_guard_radii) & set(self.peaceful_squad_radii):
-            raise ValueError("Worker home guard must not overlap combat patrol rings")
+        if (
+            self.worker_full_storage_parking_min_radius
+            <= self.worker_full_storage_guard_radii[-1]
+            or self.worker_full_storage_parking_max_radius
+            < self.worker_full_storage_parking_min_radius
+        ):
+            raise ValueError("Worker parking must be ordered outside the near reserve")
         if (
             not self.worker_full_storage_combat_guard_radii
             or tuple(sorted(set(self.worker_full_storage_combat_guard_radii)))
@@ -391,6 +414,8 @@ class TacticConfig:
             raise ValueError("long-range route budget must cover its start radius")
         if self.raid_long_range_max_campaign_ticks < 64:
             raise ValueError("long-range campaign must preserve a useful search window")
+        if self.home_return_handoff_radius >= self.home_return_radius:
+            raise ValueError("home handoff must be inside the return trigger")
         if (
             not self.peaceful_squad_radii
             or tuple(sorted(set(self.peaceful_squad_radii)))

@@ -22,13 +22,14 @@ from arena_tactic import (
     BalancedTactic,
     FormationMoveFeedback,
     IntentResolver,
+    RaidAttemptMemory,
     ScreeningGroupState,
     TacticMemory,
     UnitMission,
     build_tactical_map,
 )
 from arena_tactic.geometry import manhattan_ring, ranger_firing_positions, ranger_line_is_clear
-from arena_tactic.models import ShotFeedback, SquadState
+from arena_tactic.models import EnemyCoreIntel, ShotFeedback, SquadState
 from arena_tactic.world import build_world_model
 from tests.helpers import enemy_core, friendly_core, make_turn, uid, unit
 
@@ -53,6 +54,16 @@ class CombatDefenseTests(unittest.TestCase):
         tactic.choose_actions(turn)
 
         self.assertNotIsInstance(turn.plan.unit_actions[member.id], WaitAction)
+        self.assertIn(member.id, tactic.memory.raid_member_ids)
+        handoff = tactic.memory.raid_handoff_targets[member.id]
+        tactic.choose_actions(
+            make_turn(
+                tick=2,
+                core=core,
+                units=(unit(1, UnitType.RANGER, handoff),),
+                resources=0,
+            )
+        )
         self.assertNotIn(member.id, tactic.memory.raid_member_ids)
 
     def test_single_ranger_does_not_blind_fire_at_moving_nonurgent_worker(self) -> None:
@@ -91,6 +102,54 @@ class CombatDefenseTests(unittest.TestCase):
             ],
             str(uid(100)),
         )
+
+    def test_only_locally_eligible_ranger_defers_uncertain_worker_shot(self) -> None:
+        core = friendly_core(position=(20, 20))
+        local = unit(1, UnitType.RANGER, (0, 0))
+        remote = unit(2, UnitType.RANGER, (30, 30))
+        tactic = BalancedTactic(memory=TacticMemory(opening_complete=True))
+        tactic.choose_actions(
+            make_turn(
+                tick=1,
+                core=core,
+                units=(local, remote),
+                enemies=(unit(100, UnitType.WORKER, (3, 0), controlled=False),),
+                resources=0,
+            )
+        )
+        turn = make_turn(
+            tick=2,
+            core=core,
+            units=(local, remote),
+            enemies=(unit(100, UnitType.WORKER, (2, 0), controlled=False),),
+            resources=0,
+        )
+
+        tactic.choose_actions(turn)
+
+        self.assertNotIsInstance(turn.plan.unit_actions[local.id], ShootAction)
+
+    def test_blocked_wounded_ranger_uses_last_stand_fire(self) -> None:
+        core = friendly_core(position=(0, 5))
+        patient = unit(1, UnitType.RANGER, (0, 0), hp=1)
+        blockers = (
+            unit(2, UnitType.VANGUARD, (-1, 0)),
+            unit(3, UnitType.RANGER, (-1, 0)),
+        )
+        enemy = unit(100, UnitType.RANGER, (2, 0), controlled=False)
+        turn = make_turn(
+            core=core,
+            units=(patient, *blockers),
+            enemies=(enemy,),
+            obstacle_cells=((0, -1), (0, 1)),
+            resources=2,
+        )
+
+        BalancedTactic(memory=TacticMemory(opening_complete=True)).choose_actions(turn)
+
+        action = turn.plan.unit_actions[patient.id]
+        self.assertIsInstance(action, ShootAction)
+        self.assertEqual(action.expected_cell, enemy.position)
 
     def test_confirmed_distance_fifty_core_launches_surplus_two_by_two_raid(self) -> None:
         core = friendly_core(position=(0, 0))
@@ -175,6 +234,194 @@ class CombatDefenseTests(unittest.TestCase):
         self.assertIsNone(tactic.memory.raid_long_range_campaign)
         self.assertEqual(tactic.memory.raid_phase, "IDLE")
 
+    def test_confirmed_distance_thirty_three_core_closes_raid_gap(self) -> None:
+        core = friendly_core(position=(0, 0))
+        vanguards = tuple(
+            unit(100 + index, UnitType.VANGUARD, (-index, 1))
+            for index in range(8)
+        )
+        rangers = tuple(
+            unit(200 + index, UnitType.RANGER, (-index, -1))
+            for index in range(8)
+        )
+        memory = TacticMemory(
+            core_id=core.id,
+            core_position=core.position,
+            opening_complete=True,
+            home_force_high_water=12,
+        )
+        memory.known_passable.update(
+            (x, y) for x in range(-10, 35) for y in range(-3, 4)
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        for tick in (1, 2):
+            tactic.choose_actions(
+                make_turn(
+                    tick=tick,
+                    core=core,
+                    units=(*vanguards, *rangers),
+                    enemies=(enemy_core(999, (33, 0)),),
+                    resources=0,
+                )
+            )
+
+        self.assertNotEqual(tactic.memory.raid_phase, "IDLE")
+        self.assertEqual(len(tactic.memory.raid_member_ids), 4)
+
+    def test_destroyed_raid_core_transitions_survivors_to_returning(self) -> None:
+        core = friendly_core(position=(0, 0))
+        member = unit(1, UnitType.RANGER, (30, 0))
+        target = enemy_core(999, (31, 0), shield=0)
+        memory = TacticMemory(
+            core_id=core.id,
+            core_position=core.position,
+            opening_complete=True,
+            raid_target_id=target.id,
+            raid_last_seen_tick=1,
+            raid_last_position=target.position,
+            raid_member_ids=(member.id,),
+            raid_phase="SIEGING",
+        )
+        memory.known_passable.update(
+            (x, y) for x in range(-2, 33) for y in range(-2, 3)
+        )
+        tactic = BalancedTactic(memory=memory)
+        tactic.choose_actions(
+            make_turn(
+                tick=1,
+                core=core,
+                units=(member,),
+                enemies=(target,),
+                resources=0,
+            )
+        )
+        destroyed = ResolutionEvent(
+            event_id=uid(901),
+            tick=2,
+            event_type="DESTRUCTION_PARTICIPATION",
+            target_id=target.id,
+            reason_code="CORE",
+        )
+        turn = make_turn(
+            tick=2,
+            core=core,
+            units=(member,),
+            events=(destroyed,),
+            resources=0,
+        )
+
+        tactic.choose_actions(turn)
+
+        self.assertEqual(tactic.memory.raid_phase, "RETURNING")
+        self.assertIn(member.id, tactic.memory.raid_member_ids)
+        self.assertIsInstance(turn.plan.unit_actions[member.id], MoveAction)
+
+    def test_failed_raid_requires_new_sighting_and_escalates_to_three_pairs(self) -> None:
+        core = friendly_core(position=(0, 0))
+        target = enemy_core(999, (33, 0))
+        combatants = tuple(
+            [
+                unit(100 + index, UnitType.VANGUARD, (-index, 1))
+                for index in range(10)
+            ]
+            + [
+                unit(200 + index, UnitType.RANGER, (-index, -1))
+                for index in range(10)
+            ]
+        )
+        memory = TacticMemory(
+            core_id=core.id,
+            core_position=core.position,
+            opening_complete=True,
+            home_force_high_water=12,
+        )
+        memory.known_passable.update(
+            (x, y) for x in range(-12, 35) for y in range(-3, 4)
+        )
+        memory.enemy_core_intel[target.id] = EnemyCoreIntel(
+            id=target.id,
+            position=target.position,
+            hp=target.hp,
+            shield=target.shield,
+            state=target.state,
+            destination=target.destination,
+            last_seen_tick=1,
+            sighting_count=2,
+        )
+        memory.raid_attempts[target.id] = RaidAttemptMemory(
+            core_id=target.id,
+            failed_attempts=1,
+            last_failure_tick=1,
+            last_failure_reason="MEMBER_LOW_HP",
+            last_failure_sighting_tick=1,
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(
+            make_turn(
+                tick=2,
+                core=core,
+                units=combatants,
+                enemies=(target,),
+                resources=0,
+            )
+        )
+
+        self.assertEqual(len(tactic.memory.raid_member_ids), 6)
+        member_types = Counter(
+            next(unit_view.unit_type for unit_view in combatants if unit_view.id == actor_id)
+            for actor_id in tactic.memory.raid_member_ids
+        )
+        self.assertEqual(member_types[UnitType.VANGUARD], 3)
+        self.assertEqual(member_types[UnitType.RANGER], 3)
+
+    def test_stranded_healthy_combatant_returns_before_peaceful_pairing(self) -> None:
+        core = friendly_core(position=(0, 0))
+        ranger = unit(1, UnitType.RANGER, (30, 0))
+        memory = TacticMemory(
+            core_id=core.id,
+            core_position=core.position,
+            opening_complete=True,
+        )
+        memory.known_passable.update(
+            (x, y) for x in range(-2, 32) for y in range(-2, 3)
+        )
+        tactic = BalancedTactic(memory=memory)
+        turn = make_turn(core=core, units=(ranger,), resources=0)
+
+        tactic.choose_actions(turn)
+
+        task = next(
+            row
+            for row in tactic.last_decision_trace["tasks"]
+            if row["actor_id"] == str(ranger.id)
+        )
+        self.assertEqual(task["mission"], "RETURN_HOME")
+        self.assertIsInstance(turn.plan.unit_actions[ranger.id], MoveAction)
+
+    def test_stranded_combatant_without_known_handoff_does_not_join_patrol(self) -> None:
+        core = friendly_core(position=(0, 0))
+        ranger = unit(1, UnitType.RANGER, (30, 0))
+        memory = TacticMemory(
+            core_id=core.id,
+            core_position=core.position,
+            opening_complete=True,
+            known_passable={(30, 0)},
+        )
+        tactic = BalancedTactic(memory=memory)
+        turn = make_turn(core=core, units=(ranger,), resources=0)
+
+        tactic.choose_actions(turn)
+
+        task = next(
+            row
+            for row in tactic.last_decision_trace["tasks"]
+            if row["actor_id"] == str(ranger.id)
+        )
+        self.assertEqual(task["mission"], "RETURN_HOME")
+        self.assertEqual(task["reason"], "RETURN_HOME_NO_HANDOFF")
+
     def test_two_cell_reversal_prefers_the_stable_next_turning_point(self) -> None:
         ranger = unit(1, UnitType.RANGER, (3, 0))
         tactic = BalancedTactic()
@@ -199,8 +446,7 @@ class CombatDefenseTests(unittest.TestCase):
         tactic.choose_actions(turn)
 
         action = turn.plan.unit_actions[ranger.id]
-        self.assertIsInstance(action, ShootAction)
-        self.assertEqual(action.expected_cell, (1, 0))
+        self.assertNotIsInstance(action, ShootAction)
 
     def test_nonurgent_low_rank_shot_yields_to_top_candidate_stance(self) -> None:
         ranger = unit(1, UnitType.RANGER, (11, -3))
@@ -273,8 +519,7 @@ class CombatDefenseTests(unittest.TestCase):
         tactic.choose_actions(turn)
 
         action = turn.plan.unit_actions[ranger.id]
-        self.assertIsInstance(action, ShootAction)
-        self.assertNotEqual(action.expected_cell, (1, 0))
+        self.assertNotIsInstance(action, ShootAction)
 
     def test_single_current_observation_does_not_release_miss_suppression(self) -> None:
         ranger = unit(1, UnitType.RANGER, (3, 0))
@@ -402,7 +647,7 @@ class CombatDefenseTests(unittest.TestCase):
             if squad.support_target is not None
         ]
         self.assertEqual(len(supports), len(set(supports)))
-        self.assertEqual(tactic.last_decision_trace["schema_version"], 41)
+        self.assertEqual(tactic.last_decision_trace["schema_version"], 42)
         formation = tactic.last_decision_trace["combat"]["formation"]
         assigned_supports = [
             tuple(bundle["support"])

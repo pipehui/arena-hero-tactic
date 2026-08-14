@@ -215,6 +215,11 @@ class DecisionKernel:
             projection,
             context.protected_positions,
         )
+        raid_intents = self.raids.intents(
+            world,
+            projection,
+            context.protected_positions,
+        )
 
         intents: list[ActionIntent] = []
         intents.extend(core_intents)
@@ -244,16 +249,25 @@ class DecisionKernel:
                 projection,
                 context.protected_positions,
                 home_combat_assignment.assigned_vanguard_ids
-                | frozenset(counter_siege.member_ids),
+                | frozenset(counter_siege.member_ids)
+                | frozenset(
+                    intent.actor_id
+                    for intent in fire_intents
+                    if intent.actor_id is not None
+                    and intent.action is not IntentAction.MOVE
+                )
+                | frozenset(
+                    intent.actor_id
+                    for intent in (
+                        *recovery_intents,
+                        *counter_siege_intents,
+                        *raid_intents,
+                    )
+                    if intent.actor_id is not None
+                ),
             )
         )
-        intents.extend(
-            self.raids.intents(
-                world,
-                projection,
-                context.protected_positions,
-            )
-        )
+        intents.extend(raid_intents)
         production_intents, production_candidates = self.production.intents(
             world,
             projection,

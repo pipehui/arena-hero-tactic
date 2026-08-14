@@ -22,6 +22,7 @@ from .models import (
     ActionIntent,
     EntitySnapshot,
     FormationMoveFeedback,
+    HomeReturnMission,
     IntentAction,
     IntentResolution,
     PairingCooldown,
@@ -66,7 +67,7 @@ class DefensePlanner:
         world: WorldModel,
         projection: TacticalMap,
         protected: frozenset[Position],
-        assigned_vanguard_ids: frozenset[UUID] = frozenset(),
+        assigned_actor_ids: frozenset[UUID] = frozenset(),
     ) -> list[ActionIntent]:
         if world.core is None:
             return []
@@ -79,7 +80,28 @@ class DefensePlanner:
             unit
             for unit in living_combatants
             if unit.hp * 2 > UNIT_MAX_HP[unit.unit_type]
+            and unit.id not in self.memory.raid_member_ids
+            and unit.id not in self.memory.counter_siege_member_ids
+            and unit.id != world.beacon.carrier_id
         )
+        active_screen_ids = {
+            actor_id
+            for group in self.memory.screening_groups.values()
+            if group.phase != "HOME_HANDOFF"
+            for actor_id in (*group.vanguard_ids, *group.ranger_ids)
+        }
+        return_intents, returning_ids = self._home_return_intents(
+            world,
+            projection,
+            tuple(
+                unit
+                for unit in healthy
+                if unit.id not in assigned_actor_ids
+                and unit.id not in active_screen_ids
+            ),
+            protected,
+        )
+        healthy = tuple(unit for unit in healthy if unit.id not in returning_ids)
         visible_by_id = {enemy.id: enemy for enemy in world.enemies}
         warning_intel = tuple(
             enemy
@@ -126,7 +148,12 @@ class DefensePlanner:
         self._sync_squads(
             world,
             projection,
-            healthy,
+            tuple(
+                unit
+                for unit in healthy
+                if unit.id not in assigned_actor_ids
+                and unit.id not in active_screen_ids
+            ),
             protected,
         )
         screening_intents = self._screening_intents(
@@ -146,9 +173,10 @@ class DefensePlanner:
                 unit
                 for unit in healthy
                 if unit.id not in screening_ids
-                and unit.id not in assigned_vanguard_ids
+                and unit.id not in assigned_actor_ids
             )
             return [
+                *return_intents,
                 *screening_intents,
                 *self._sector_defense(
                     world,
@@ -170,18 +198,191 @@ class DefensePlanner:
                 unit
                 for unit in healthy
                 if unit.id not in screening_ids
-                and unit.id not in assigned_vanguard_ids
+                and unit.id not in assigned_actor_ids
             )
             return [
+                *return_intents,
                 *screening_intents,
                 *self._peaceful_patrol(world, projection, home_pool, protected),
             ]
-        return self._peaceful_patrol(
-            world,
-            projection,
-            tuple(unit for unit in healthy if unit.id not in assigned_vanguard_ids),
-            protected,
-        )
+        return [
+            *return_intents,
+            *self._peaceful_patrol(
+                world,
+                projection,
+                tuple(unit for unit in healthy if unit.id not in assigned_actor_ids),
+                protected,
+            ),
+        ]
+
+    def _home_return_intents(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        healthy: tuple[EntitySnapshot, ...],
+        protected: frozenset[Position],
+    ) -> tuple[list[ActionIntent], frozenset[UUID]]:
+        """Return stranded healthy combatants before peaceful pairing."""
+
+        assert world.core is not None
+        living = {unit.id for unit in healthy}
+        for actor_id in tuple(self.memory.home_return_missions):
+            if actor_id not in living:
+                self.memory.home_return_missions.pop(actor_id, None)
+        reserved = {
+            mission.target
+            for mission in self.memory.home_return_missions.values()
+        }
+        intents: list[ActionIntent] = []
+        returning: set[UUID] = set()
+        occupied = dict(world.occupied_cells)
+        for unit in sorted(healthy, key=lambda item: item.id.bytes):
+            distance_home = manhattan(unit.position, world.core.position)
+            mission = self.memory.home_return_missions.get(unit.id)
+            if mission is None and distance_home <= self.config.home_return_radius:
+                continue
+            if distance_home <= self.config.home_return_handoff_radius:
+                self.memory.home_return_missions.pop(unit.id, None)
+                continue
+            returning.add(unit.id)
+            target = None if mission is None else mission.target
+            if (
+                target is None
+                or target not in world.known_passable
+                or target in world.known_obstacles
+                or target in projection.hostile_occupied
+                or target in protected
+            ):
+                if target is not None:
+                    reserved.discard(target)
+                candidates = []
+                for cell in manhattan_ring(
+                    world.core.position,
+                    self.config.home_return_handoff_radius,
+                ):
+                    if (
+                        cell not in world.known_passable
+                        or cell in world.known_obstacles
+                        or cell in projection.hostile_occupied
+                        or cell in protected
+                        or cell in reserved
+                    ):
+                        continue
+                    route = route_to(
+                        world,
+                        unit.position,
+                        cell,
+                        node_limit=self.config.path_node_limit,
+                        blocked=frozenset(
+                            (projection.hostile_occupied | protected | reserved)
+                            - {unit.position, cell}
+                        ),
+                    )
+                    if route is not None:
+                        candidates.append((route.distance, cell, route))
+                if not candidates:
+                    intents.append(
+                        ActionIntent.simple(
+                            unit.id,
+                            IntentAction.WAIT,
+                            UnitMission.RETURN_HOME,
+                            57,
+                            reason="RETURN_HOME_NO_HANDOFF",
+                        )
+                    )
+                    continue
+                _, target, route = min(candidates, key=lambda row: (row[0], row[1]))
+                mission = HomeReturnMission(
+                    actor_id=unit.id,
+                    target=target,
+                    assigned_tick=world.tick,
+                    last_distance=route.distance,
+                )
+                self.memory.home_return_missions[unit.id] = mission
+                reserved.add(target)
+            else:
+                route = route_to(
+                    world,
+                    unit.position,
+                    target,
+                    node_limit=self.config.path_node_limit,
+                    blocked=frozenset(
+                        (projection.hostile_occupied | protected | reserved)
+                        - {unit.position, target}
+                    ),
+                )
+                if route is None:
+                    self.memory.home_return_missions.pop(unit.id, None)
+                    intents.append(
+                        ActionIntent.simple(
+                            unit.id,
+                            IntentAction.WAIT,
+                            UnitMission.RETURN_HOME,
+                            57,
+                            reason="RETURN_HOME_ROUTE_REPLAN",
+                        )
+                    )
+                    continue
+                stalled = (
+                    mission.stalled_ticks + 1
+                    if mission.last_distance is not None
+                    and route.distance >= mission.last_distance
+                    else 0
+                )
+                mission = replace(
+                    mission,
+                    last_distance=route.distance,
+                    stalled_ticks=stalled,
+                )
+                self.memory.home_return_missions[unit.id] = mission
+                if stalled >= 2:
+                    self.memory.home_return_missions.pop(unit.id, None)
+                    intents.append(
+                        ActionIntent.simple(
+                            unit.id,
+                            IntentAction.WAIT,
+                            UnitMission.RETURN_HOME,
+                            57,
+                            reason="RETURN_HOME_STALLED_REPLAN",
+                        )
+                    )
+                    continue
+            route = route_to(
+                world,
+                unit.position,
+                target,
+                node_limit=self.config.path_node_limit,
+                blocked=frozenset(
+                    (projection.hostile_occupied | protected) - {unit.position, target}
+                ),
+            )
+            if route is None or route.first_direction is None:
+                intents.append(
+                    ActionIntent.simple(
+                        unit.id,
+                        IntentAction.WAIT,
+                        UnitMission.RETURN_HOME,
+                        57,
+                        reason="RETURN_HOME_NO_SAFE_STEP",
+                    )
+                )
+                continue
+            immediate, future, remembered = projection.exposure(route.first_position)
+            intents.append(
+                ActionIntent.move(
+                    unit.id,
+                    UnitMission.RETURN_HOME,
+                    56,
+                    route.first_direction,
+                    route.first_position,
+                    risk=immediate * 100 + future * 10 + remembered,
+                    exclusive_destination=True,
+                    tie_break=(route.distance, unit.id.bytes),
+                    reason="STRANDED_COMBAT_RETURN_HOME",
+                    metadata=(("home_handoff", target),),
+                )
+            )
+        return intents, frozenset(returning)
 
     def _requires_home_pool(self, world: WorldModel, enemy) -> bool:
         """Keep outer contacts local unless they can reach the home fight soon."""

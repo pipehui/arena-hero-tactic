@@ -20,6 +20,7 @@ from .models import (
     EntitySnapshot,
     HomeCounterSiegeDecision,
     IntentAction,
+    RaidAttemptMemory,
     UnitMission,
     WorldModel,
     LongRangeRaidCampaign,
@@ -61,12 +62,21 @@ class RaidPlanner:
         )
         target = self._active_target(world)
 
-        if self.memory.raid_phase != "IDLE":
+        if self.memory.raid_phase not in {"IDLE", "RETURNING"}:
             self._update_long_range_progress(world, members)
             interruption = self._interruption_reason(world, members, target, home_threat)
             if interruption is not None:
+                if target is not None and interruption in {
+                    "MEMBER_LOW_HP",
+                    "MEMBER_LOST",
+                    "ENEMY_REINFORCED",
+                    "LONG_RANGE_NO_PROGRESS",
+                    "LONG_RANGE_CAMPAIGN_EXPIRED",
+                }:
+                    self._record_failed_attempt(target, interruption, world.tick)
                 self.memory.raid_phase = "RETURNING"
                 self.memory.raid_interrupted_tick = world.tick
+                self.memory.raid_return_reason = interruption
         if self.memory.raid_phase == "RETURNING":
             return self._return_intents(world, projection, members, protected)
 
@@ -88,6 +98,8 @@ class RaidPlanner:
             self.memory.raid_member_ids = tuple(unit.id for unit in selected)
             self.memory.raid_phase = "ASSEMBLING"
             self.memory.raid_containment_mode = containment
+            self.memory.raid_return_reason = None
+            self.memory.raid_handoff_targets.clear()
             if self._is_long_range_target(world, target):
                 route_eta = self._known_route_eta(world, target.position)
                 if route_eta is None:
@@ -473,6 +485,13 @@ class RaidPlanner:
                     and intel.sighting_count >= self.config.raid_confirmed_sightings
                 )
                 or (
+                    self.config.raid_confirmed_start_radius
+                    < manhattan(intel.position, world.core.position)
+                    <= self.config.raid_containment_radius
+                    and intel.sighting_count >= self.config.raid_confirmed_sightings
+                    and self._known_route_eta(world, intel.position) is not None
+                )
+                or (
                     self.config.raid_containment_radius
                     < manhattan(intel.position, world.core.position)
                     <= self.config.raid_long_range_start_radius
@@ -483,6 +502,11 @@ class RaidPlanner:
             and (
                 self.memory.raid_interrupted_tick is None
                 or intel.last_seen_tick > self.memory.raid_interrupted_tick
+            )
+            and (
+                (attempt := self.memory.raid_attempts.get(intel.id)) is None
+                or attempt.last_failure_sighting_tick is None
+                or intel.last_seen_tick > attempt.last_failure_sighting_tick
             )
         ]
         return min(
@@ -581,6 +605,12 @@ class RaidPlanner:
     ) -> tuple[EntitySnapshot, ...]:
         if long_range is None:
             long_range = self._is_long_range_target(world, target)
+        distance = (
+            0
+            if world.core is None
+            else manhattan(target.position, world.core.position)
+        )
+        remote = distance > self.config.raid_confirmed_start_radius
         healthy = tuple(
             unit
             for unit in world.friendlies
@@ -593,20 +623,22 @@ class RaidPlanner:
         )
         home_target = max(self.config.home_force_floor, self.memory.home_force_high_water)
         home_reserve = (
-            min(home_target, self.config.raid_peace_home_reserve)
-            if containment and not long_range
-            else home_target
+            home_target
+            if remote
+            else min(home_target, self.config.raid_peace_home_reserve)
         )
         surplus = max(0, len(healthy) - home_reserve)
         guards = self._visible_guards(world, target.position)
+        attempt = self.memory.raid_attempts.get(target.id)
+        required_pairs = (
+            self.config.raid_initial_pair_count
+            + (0 if attempt is None else attempt.failed_attempts)
+            * self.config.raid_escalation_pair_step
+        )
         required = max(
-            (
-                self.config.raid_long_range_min_members
-                if long_range
-                else self.config.raid_min_siege_members
-                if containment
-                else 2
-            ),
+            required_pairs * 2,
+            self.config.raid_long_range_min_members if long_range else 0,
+            self.config.raid_min_siege_members if containment else 0,
             guards + self.config.raid_force_margin,
         )
         if surplus < required:
@@ -621,9 +653,14 @@ class RaidPlanner:
         )
         if not vanguards or not rangers:
             return ()
-        selected = [vanguards.pop(0), rangers.pop(0)]
-        selected_vanguards = 1
-        selected_rangers = 1
+        if len(vanguards) < required_pairs or len(rangers) < required_pairs:
+            return ()
+        selected = [
+            *(vanguards.pop(0) for _ in range(required_pairs)),
+            *(rangers.pop(0) for _ in range(required_pairs)),
+        ]
+        selected_vanguards = required_pairs
+        selected_rangers = required_pairs
         while len(selected) < required and (vanguards or rangers):
             if not vanguards:
                 chosen = rangers.pop(0)
@@ -653,8 +690,8 @@ class RaidPlanner:
                     chosen = rangers.pop(0)
                     selected_rangers += 1
             selected.append(chosen)
-        if long_range:
-            if selected_vanguards < 2 or selected_rangers < 2:
+        if remote:
+            if selected_vanguards < required_pairs or selected_rangers < required_pairs:
                 return ()
             remaining_vanguards = sum(
                 unit.unit_type is UnitType.VANGUARD for unit in healthy
@@ -669,6 +706,21 @@ class RaidPlanner:
             ):
                 return ()
         return tuple(selected)
+
+    def _record_failed_attempt(
+        self,
+        target: EnemyCoreIntel,
+        reason: str,
+        tick: int,
+    ) -> None:
+        previous = self.memory.raid_attempts.get(target.id)
+        self.memory.raid_attempts[target.id] = RaidAttemptMemory(
+            core_id=target.id,
+            failed_attempts=(0 if previous is None else previous.failed_attempts) + 1,
+            last_failure_tick=tick,
+            last_failure_reason=reason,
+            last_failure_sighting_tick=target.last_seen_tick,
+        )
 
     def _interruption_reason(self, world, members, target, home_threat):
         if home_threat:
@@ -926,35 +978,57 @@ class RaidPlanner:
         assert world.core is not None
         intents: list[ActionIntent] = []
         continuing: list[UUID] = []
-        reserved_handoffs: set[Position] = set()
+        living_ids = {unit.id for unit in members}
+        for member_id in tuple(self.memory.raid_handoff_targets):
+            if member_id not in living_ids:
+                self.memory.raid_handoff_targets.pop(member_id, None)
+        reserved_handoffs: set[Position] = set(
+            self.memory.raid_handoff_targets.values()
+        )
         for unit in sorted(members, key=lambda item: item.id.bytes):
             # A casualty is no longer formation-dependent.  The unified Core
             # service planner immediately owns its RECOVER trip, so a healthy
             # expedition partner can never pin it at the home boundary.
             if unit.hp < UNIT_MAX_HP[unit.unit_type]:
+                self.memory.raid_handoff_targets.pop(unit.id, None)
                 continue
-            if manhattan(unit.position, world.core.position) <= self.config.home_engage_radius:
-                intents.extend(
-                    self._handoff_intents(
-                        world,
-                        projection,
-                        unit,
-                        protected,
-                        reserved_handoffs,
-                    )
-                )
-                continue
-            continuing.append(unit.id)
-            intents.extend(
-                self._move(
+            handoff = self.memory.raid_handoff_targets.get(unit.id)
+            if handoff is None or not self._handoff_valid(
+                world,
+                projection,
+                handoff,
+                protected,
+                reserved_handoffs - {handoff},
+            ):
+                if handoff is not None:
+                    reserved_handoffs.discard(handoff)
+                handoff = self._choose_handoff(
                     world,
                     projection,
                     unit,
-                    world.core.position,
                     protected,
-                    "RAID_RETURN",
+                    reserved_handoffs,
                 )
-            )
+                if handoff is not None:
+                    self.memory.raid_handoff_targets[unit.id] = handoff
+                    reserved_handoffs.add(handoff)
+            if handoff is not None and unit.position == handoff:
+                self.memory.raid_handoff_targets.pop(unit.id, None)
+                continue
+            continuing.append(unit.id)
+            if handoff is None:
+                intents.append(self._wait(unit, "RAID_RETURN_NO_HANDOFF"))
+            else:
+                intents.extend(
+                    self._move(
+                        world,
+                        projection,
+                        unit,
+                        handoff,
+                        protected,
+                        "RAID_RETURN_HANDOFF",
+                    )
+                )
         self.memory.raid_member_ids = tuple(continuing)
         if self.memory.raid_long_range_campaign is not None:
             self.memory.raid_long_range_campaign = replace(
@@ -965,6 +1039,61 @@ class RaidPlanner:
         if not continuing:
             self._clear()
         return intents
+
+    def _handoff_valid(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        position: Position,
+        protected: frozenset[Position],
+        reserved: set[Position],
+    ) -> bool:
+        return bool(
+            world.core is not None
+            and manhattan(position, world.core.position)
+            == self.config.home_return_handoff_radius
+            and position in world.known_passable
+            and position not in world.known_obstacles
+            and position not in projection.hostile_occupied
+            and position not in protected
+            and position not in reserved
+            and projection.immediate_attackers(position) == 0
+        )
+
+    def _choose_handoff(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        unit: EntitySnapshot,
+        protected: frozenset[Position],
+        reserved: set[Position],
+    ) -> Position | None:
+        assert world.core is not None
+        blocked = frozenset((projection.hostile_occupied | protected | reserved) - {unit.position})
+        rows = []
+        for cell in manhattan_ring(
+            world.core.position,
+            self.config.home_return_handoff_radius,
+        ):
+            if not self._handoff_valid(
+                world,
+                projection,
+                cell,
+                protected,
+                reserved,
+            ):
+                continue
+            route = route_to(
+                world,
+                unit.position,
+                cell,
+                node_limit=self.config.path_node_limit,
+                blocked=blocked - {cell},
+            )
+            if route is None:
+                continue
+            rows.append((route.distance, cell))
+        return min(rows, default=(0, None))[1]
 
     def _handoff_intents(
         self,
@@ -1115,3 +1244,6 @@ class RaidPlanner:
         self.memory.raid_phase = "IDLE"
         self.memory.raid_containment_mode = False
         self.memory.raid_long_range_campaign = None
+        self.memory.raid_interrupted_tick = None
+        self.memory.raid_return_reason = None
+        self.memory.raid_handoff_targets.clear()

@@ -16,9 +16,11 @@ from .schema import EXPLORATION_MEMORY_SCHEMA_VERSION
 from .state import TacticMemory
 from .models import (
     CrisisForceBaseline,
+    EnemyCoreControlZone,
     EnemyCoreIntel,
     EnemyTrack,
     LongRangeRaidCampaign,
+    RaidAttemptMemory,
     ThreatHeatCell,
     WorkerScoutPhase,
     WorkerScoutState,
@@ -119,8 +121,9 @@ class ExplorationMemoryStore:
                     and memory.raid_long_range_campaign.target_id == core_id
                     and latest <= memory.raid_long_range_campaign.search_deadline_tick
                 )
-                if latest - intel.last_seen_tick > self.config.raid_intel_ttl and not active_long_range:
+                if latest - intel.last_seen_tick > self.config.enemy_core_control_ttl and not active_long_range:
                     memory.enemy_core_intel.pop(core_id, None)
+                    memory.enemy_core_control_zones.pop(core_id, None)
         self.restored_through_tick = latest
         self.restored_visit_count = sum(memory.visit_counts.values())
         self._last_saved_tick = saved_tick
@@ -194,11 +197,26 @@ class ExplorationMemoryStore:
                     key=lambda item: item[0].bytes,
                 )
                 if (
-                    tick - intel.last_seen_tick <= self.config.raid_intel_ttl
+                    tick - intel.last_seen_tick <= self.config.enemy_core_control_ttl
                     or memory.raid_long_range_campaign is not None
                     and memory.raid_long_range_campaign.target_id == core_id
                     and tick <= memory.raid_long_range_campaign.search_deadline_tick
                 )
+            ],
+            "enemy_core_control_zones": [
+                {
+                    "core_id": str(core_id),
+                    "center": list(zone.center),
+                    "exclusion_radius": zone.exclusion_radius,
+                    "clear_radius": zone.clear_radius,
+                    "last_seen_tick": zone.last_seen_tick,
+                    "expires_tick": zone.expires_tick,
+                }
+                for core_id, zone in sorted(
+                    memory.enemy_core_control_zones.items(),
+                    key=lambda item: item[0].bytes,
+                )
+                if zone.expires_tick is None or tick <= zone.expires_tick
             ],
             "worker_scout_states": [
                 {
@@ -250,6 +268,48 @@ class ExplorationMemoryStore:
                     "last_position": list(memory.raid_long_range_campaign.last_position),
                     "last_group_distance": memory.raid_long_range_campaign.last_group_distance,
                     "no_progress_ticks": memory.raid_long_range_campaign.no_progress_ticks,
+                }
+            ),
+            "raid_attempts": [
+                {
+                    "core_id": str(core_id),
+                    "failed_attempts": attempt.failed_attempts,
+                    "last_failure_tick": attempt.last_failure_tick,
+                    "last_failure_reason": attempt.last_failure_reason,
+                    "last_failure_sighting_tick": attempt.last_failure_sighting_tick,
+                }
+                for core_id, attempt in sorted(
+                    memory.raid_attempts.items(),
+                    key=lambda item: item[0].bytes,
+                )
+            ],
+            "raid_state": (
+                None
+                if memory.raid_phase == "IDLE" and not memory.raid_member_ids
+                else {
+                    "target_id": (
+                        None
+                        if memory.raid_target_id is None
+                        else str(memory.raid_target_id)
+                    ),
+                    "last_seen_tick": memory.raid_last_seen_tick,
+                    "last_position": (
+                        None
+                        if memory.raid_last_position is None
+                        else list(memory.raid_last_position)
+                    ),
+                    "member_ids": [str(item) for item in memory.raid_member_ids],
+                    "phase": memory.raid_phase,
+                    "interrupted_tick": memory.raid_interrupted_tick,
+                    "containment_mode": memory.raid_containment_mode,
+                    "return_reason": memory.raid_return_reason,
+                    "handoff_targets": [
+                        [str(actor_id), list(position)]
+                        for actor_id, position in sorted(
+                            memory.raid_handoff_targets.items(),
+                            key=lambda item: item[0].bytes,
+                        )
+                    ],
                 }
             ),
             "strategic_relocation_pending": memory.strategic_relocation_pending,
@@ -585,6 +645,110 @@ class ExplorationMemoryStore:
                     memory.raid_member_ids = member_ids
                     memory.raid_phase = phase
                     memory.raid_last_position = last_position
+        if schema >= 14:
+            for raw in payload.get("enemy_core_control_zones", []):
+                if not isinstance(raw, dict):
+                    continue
+                core_id = _uuid(raw.get("core_id"))
+                center = _position(raw.get("center"))
+                exclusion = raw.get("exclusion_radius")
+                clear = raw.get("clear_radius")
+                last_seen = raw.get("last_seen_tick")
+                expires = raw.get("expires_tick")
+                if (
+                    core_id is None
+                    or center is None
+                    or any(
+                        not isinstance(value, int) or isinstance(value, bool)
+                        for value in (exclusion, clear, last_seen)
+                    )
+                    or exclusion < 0
+                    or clear <= exclusion
+                    or (
+                        expires is not None
+                        and (
+                            not isinstance(expires, int)
+                            or isinstance(expires, bool)
+                            or expires < last_seen
+                        )
+                    )
+                ):
+                    continue
+                memory.enemy_core_control_zones[core_id] = EnemyCoreControlZone(
+                    core_id=core_id,
+                    center=center,
+                    exclusion_radius=exclusion,
+                    clear_radius=clear,
+                    last_seen_tick=last_seen,
+                    visible_now=False,
+                    expires_tick=expires,
+                )
+            for raw in payload.get("raid_attempts", []):
+                if not isinstance(raw, dict):
+                    continue
+                core_id = _uuid(raw.get("core_id"))
+                failed = raw.get("failed_attempts")
+                failure_tick = raw.get("last_failure_tick")
+                failure_reason = raw.get("last_failure_reason")
+                sighting_tick = raw.get("last_failure_sighting_tick")
+                if (
+                    core_id is None
+                    or not isinstance(failed, int)
+                    or isinstance(failed, bool)
+                    or failed < 0
+                    or any(
+                        value is not None
+                        and (not isinstance(value, int) or isinstance(value, bool))
+                        for value in (failure_tick, sighting_tick)
+                    )
+                    or failure_reason is not None
+                    and not isinstance(failure_reason, str)
+                ):
+                    continue
+                memory.raid_attempts[core_id] = RaidAttemptMemory(
+                    core_id=core_id,
+                    failed_attempts=failed,
+                    last_failure_tick=failure_tick,
+                    last_failure_reason=failure_reason,
+                    last_failure_sighting_tick=sighting_tick,
+                )
+            raw_raid = payload.get("raid_state")
+            if isinstance(raw_raid, dict):
+                target_id = _uuid(raw_raid.get("target_id"))
+                member_ids = tuple(
+                    actor_id
+                    for value in raw_raid.get("member_ids", [])
+                    if (actor_id := _uuid(value)) is not None
+                )
+                phase = raw_raid.get("phase")
+                last_seen_tick = raw_raid.get("last_seen_tick")
+                interrupted_tick = raw_raid.get("interrupted_tick")
+                if (
+                    isinstance(phase, str)
+                    and all(
+                        value is None
+                        or isinstance(value, int) and not isinstance(value, bool)
+                        for value in (last_seen_tick, interrupted_tick)
+                    )
+                ):
+                    memory.raid_target_id = target_id
+                    memory.raid_last_seen_tick = last_seen_tick
+                    memory.raid_last_position = _position(raw_raid.get("last_position"))
+                    memory.raid_member_ids = member_ids
+                    memory.raid_phase = phase
+                    memory.raid_interrupted_tick = interrupted_tick
+                    memory.raid_containment_mode = bool(
+                        raw_raid.get("containment_mode", False)
+                    )
+                    reason = raw_raid.get("return_reason")
+                    memory.raid_return_reason = reason if isinstance(reason, str) else None
+                    for row in raw_raid.get("handoff_targets", []):
+                        if not isinstance(row, (list, tuple)) or len(row) < 2:
+                            continue
+                        actor_id = _uuid(row[0])
+                        position = _position(row[1])
+                        if actor_id is not None and position is not None:
+                            memory.raid_handoff_targets[actor_id] = position
         memory.opening_complete = bool(payload.get("opening_complete", False))
         memory.strategic_relocation_pending = bool(
             payload.get("strategic_relocation_pending", False)
@@ -776,10 +940,11 @@ class ExplorationMemoryStore:
                 and tick <= memory.raid_long_range_campaign.search_deadline_tick
             )
             if (
-                tick - intel.last_seen_tick > self.config.raid_intel_ttl
+                tick - intel.last_seen_tick > self.config.enemy_core_control_ttl
                 and not active_long_range
             ):
                 memory.enemy_core_intel.pop(core_id, None)
+                memory.enemy_core_control_zones.pop(core_id, None)
         memory.last_tick = tick
 
     def _learn_logged_threat_heat(

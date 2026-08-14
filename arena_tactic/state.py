@@ -4,9 +4,10 @@ from collections import Counter
 from dataclasses import dataclass, field
 from uuid import UUID
 
-from arena_hero import Position
+from arena_hero import Position, UnitType
 
 from .models import (
+    CombatLossRecord,
     EnemyTrack,
     EnemyCoreIntel,
     EnemyCoreControlZone,
@@ -25,6 +26,8 @@ from .models import (
     SquadRendezvousLease,
     SquadFormationLease,
     FormationMoveFeedback,
+    FullStorageParkingAssignment,
+    HomeReturnMission,
     SquadState,
     WorkerEscapeState,
     WorkerDisengageLease,
@@ -41,6 +44,7 @@ from .models import (
     SegmentedReturnLease,
     ThreatHeatCell,
     LongRangeRaidCampaign,
+    RaidAttemptMemory,
     VanguardInterceptLease,
 )
 
@@ -142,6 +146,9 @@ class TacticMemory:
     )
     storage_saturated: bool = False
     worker_home_guard_targets: dict[UUID, Position] = field(default_factory=dict)
+    worker_parking_assignments: dict[UUID, FullStorageParkingAssignment] = field(
+        default_factory=dict
+    )
 
     opening_complete: bool = False
     home_force_high_water: int = 12
@@ -150,6 +157,8 @@ class TacticMemory:
     home_defense_alert_until: int = 0
     last_combat_unit_ids: set[UUID] = field(default_factory=set)
     recent_combat_loss_ticks: tuple[int, ...] = ()
+    recent_combat_losses: tuple[CombatLossRecord, ...] = ()
+    last_combat_unit_types: dict[UUID, UnitType] = field(default_factory=dict)
     crisis_force_baseline: CrisisForceBaseline | None = None
 
     evacuation_active: bool = False
@@ -207,6 +216,10 @@ class TacticMemory:
     raid_interrupted_tick: int | None = None
     raid_containment_mode: bool = False
     raid_long_range_campaign: LongRangeRaidCampaign | None = None
+    raid_attempts: dict[UUID, RaidAttemptMemory] = field(default_factory=dict)
+    raid_return_reason: str | None = None
+    raid_handoff_targets: dict[UUID, Position] = field(default_factory=dict)
+    home_return_missions: dict[UUID, HomeReturnMission] = field(default_factory=dict)
     counter_siege_target_id: UUID | None = None
     counter_siege_last_seen_tick: int | None = None
     counter_siege_last_position: Position | None = None
@@ -267,6 +280,7 @@ class TacticMemory:
         self.service_transit_routes.clear()
         self.storage_saturated = False
         self.worker_home_guard_targets.clear()
+        self.worker_parking_assignments.clear()
         self.opening_complete = False
         self.home_force_high_water = 12
         self.hostile_force_ids.clear()
@@ -274,6 +288,8 @@ class TacticMemory:
         self.home_defense_alert_until = 0
         self.last_combat_unit_ids.clear()
         self.recent_combat_loss_ticks = ()
+        self.recent_combat_losses = ()
+        self.last_combat_unit_types.clear()
         self.crisis_force_baseline = None
         self.evacuation_active = False
         self.evacuation_started_tick = None
@@ -306,6 +322,10 @@ class TacticMemory:
         self.raid_interrupted_tick = None
         self.raid_containment_mode = False
         self.raid_long_range_campaign = None
+        self.raid_attempts.clear()
+        self.raid_return_reason = None
+        self.raid_handoff_targets.clear()
+        self.home_return_missions.clear()
         self.counter_siege_target_id = None
         self.counter_siege_last_seen_tick = None
         self.counter_siege_last_position = None

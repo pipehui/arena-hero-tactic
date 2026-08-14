@@ -98,13 +98,7 @@ class ProductionPlanner:
         chosen: UnitType | None = None
         reinforcement_order: tuple[UnitType, ...] = ()
         reason = "TARGETS_MET"
-        stockpile_gate_closed = (
-            world.population >= self.config.population_stockpile_threshold
-            and world.resources != world.resource_capacity
-        )
-        if stockpile_gate_closed:
-            reason = "WAIT_FOR_FULL_STORAGE"
-        if not stockpile_gate_closed and not self.memory.opening_complete:
+        if not self.memory.opening_complete:
             if urgent_defense:
                 chosen = UnitType.VANGUARD
                 reason = "OPENING_THREAT_INTERRUPT"
@@ -120,8 +114,7 @@ class ProductionPlanner:
             else:
                 self.memory.opening_complete = True
         if (
-            not stockpile_gate_closed
-            and self.memory.opening_complete
+            self.memory.opening_complete
             and chosen is None
         ):
             rebuild_vanguard_gap = max(0, baseline.vanguards - vanguards)
@@ -168,19 +161,12 @@ class ProductionPlanner:
                 chosen = reinforcement_order[0]
                 reason = "EMERGENCY_HOME_FORCE"
             elif world.population >= self.config.population_stockpile_threshold:
-                if world.resources != world.resource_capacity:
-                    reason = "WAIT_FOR_FULL_STORAGE"
-                elif projection.occupied_cells.get(world.core.position, 0) >= 2:
-                    reason = "WAIT_FOR_CORE_SLOT"
-                else:
-                    chosen, reinforcement_order = self._full_storage_choice(
-                        world,
-                        workers,
-                        vanguards,
-                        rangers,
-                        next_worker_target,
-                    )
-                    reason = "FULL_STORAGE_BALANCE"
+                # At high population the marginal unit is too expensive to
+                # repay itself during a normal session.  Peaceful deficits
+                # caused by raids or remote losses intentionally do not spend
+                # the reserve; only the explicit crisis/rebuild branches above
+                # may produce here.
+                reason = "HIGH_POP_STOCKPILE"
             elif world.population < self.config.worker_only_population_threshold:
                 if workers < next_worker_target:
                     chosen = UnitType.WORKER
