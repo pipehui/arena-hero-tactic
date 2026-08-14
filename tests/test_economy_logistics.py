@@ -223,6 +223,9 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         before = max(0, manhattan((-1, 0), (2, 0)) - 1)
         after = max(0, manhattan(destination, (2, 0)) - 1)
         self.assertGreaterEqual(after, before)
+        # The hidden Vanguard lies on the direct road to Core.  Retreat should
+        # route around it laterally, not keep marching straight away from home.
+        self.assertEqual(destination[0], -1)
 
     def test_fog_retreat_does_not_wait_when_only_survivable_steps_are_homeward(
         self,
@@ -295,6 +298,53 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         self.assertEqual(
             tactic.memory.worker_escape_states[worker_id].last_threat_tick,
             107396,
+        )
+
+    def test_fog_retreat_prefers_core_when_last_seen_enemy_is_behind(self) -> None:
+        core = friendly_core(position=(10, 0))
+        worker_id = uid(1)
+        memory = TacticMemory(core_id=core.id, core_position=core.position)
+        memory.known_passable.update(
+            (x, y)
+            for x in range(-8, 13)
+            for y in range(-6, 7)
+        )
+        tactic = BalancedTactic(memory=memory)
+        visible = make_turn(
+            tick=1,
+            core=core,
+            units=(unit(1, UnitType.WORKER, (0, 0)),),
+            enemies=(
+                unit(100, UnitType.RANGER, (-3, 0), controlled=False),
+            ),
+            resources=0,
+        )
+
+        tactic.choose_actions(visible)
+
+        first = visible.plan.unit_actions[worker_id]
+        self.assertIsInstance(first, MoveAction)
+        position = add_direction((0, 0), first.direction)
+        self.assertEqual(position, (1, 0))
+        fogged = make_turn(
+            tick=2,
+            core=core,
+            units=(unit(1, UnitType.WORKER, position),),
+            resources=0,
+        )
+
+        tactic.choose_actions(fogged)
+
+        action = fogged.plan.unit_actions[worker_id]
+        self.assertIsInstance(action, MoveAction)
+        destination = add_direction(position, action.direction)
+        self.assertLess(
+            manhattan(destination, core.position),
+            manhattan(position, core.position),
+        )
+        self.assertGreaterEqual(
+            manhattan(destination, (-3, 0)),
+            manhattan(position, (-3, 0)),
         )
 
     def test_escape_loop_keeps_a_valid_waypoint_lease(self) -> None:

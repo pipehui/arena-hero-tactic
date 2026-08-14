@@ -32,6 +32,7 @@ from .planning import (
     route_from_field,
     sector_scout_candidates,
     weighted_distance_field,
+    weighted_progress_route,
     weighted_route_to,
     route_to,
 )
@@ -2122,70 +2123,88 @@ class WorkerPlanner:
                 "APPROACHES_VISIBLE_VANGUARD",
             )
 
-        if state.phase != "FLEEING":
-            current_home_distance = manhattan(
+        core_target = world.core.destination or world.core.position
+        current_home_distance = manhattan(worker.position, core_target)
+        core_retreat_first_step = None
+        core_retreat_route_mode = None
+        if state.phase != "FLEEING" and rows:
+            # Core remains the strategic retreat target after contact is lost.
+            # Threat evidence changes the *route* home; it must not turn into a
+            # blanket instruction to keep walking away from friendly cover.
+            # Current/future attack cells and remembered corridors are priced
+            # into one shared route, while genuinely lethal cells are blocked.
+            route_costs = dict(projection.route_costs_for(UnitType.WORKER))
+            lethal_cells = set(projection.hostile_occupied)
+            for cell, threat in projection.threat_cells.items():
+                route_costs[cell] = (
+                    route_costs.get(cell, 0)
+                    + threat.immediate_attackers * 100
+                    + threat.future_attackers * 20
+                )
+                if threat.immediate_attackers >= worker.hp:
+                    lethal_cells.add(cell)
+            lethal_cells.discard(worker.position)
+            lethal_cells.discard(core_target)
+            core_route = weighted_route_to(
+                world,
                 worker.position,
-                world.core.destination or world.core.position,
+                core_target,
+                node_limit=self.config.path_node_limit,
+                blocked=frozenset(lethal_cells),
+                cell_costs=route_costs,
             )
-            def safe_fog_homeward(row: _EscapeCandidate) -> bool:
-                return (
-                    row.immediate_attackers == 0
-                    and row.future_attackers == 0
-                    and row.survival_terminals > 0
-                    and row.forward_exits > 0
+            if core_route is not None and core_route.first_position is not None:
+                core_retreat_first_step = core_route.first_position
+                core_retreat_route_mode = "FULL"
+            else:
+                segment = weighted_progress_route(
+                    world,
+                    worker.position,
+                    core_target,
+                    node_limit=self.config.path_node_limit,
+                    blocked=frozenset(lethal_cells),
+                    cell_costs=route_costs,
+                )
+                if segment is not None:
+                    core_retreat_first_step = segment[0].first_position
+                    core_retreat_route_mode = "SEGMENT"
+
+            routed = [
+                row
+                for row in rows
+                if row.destination == core_retreat_first_step
+            ]
+            if routed:
+                filter_rejections["NOT_THREAT_AWARE_CORE_ROUTE"] = (
+                    filter_rejections.get("NOT_THREAT_AWARE_CORE_ROUTE", 0)
+                    + len(rows)
+                    - len(routed)
+                )
+                rows = routed
+            else:
+                # If the complete route's first step was removed by the local
+                # survival frontier, prefer a safe direct improvement.  When an
+                # enemy actually blocks that direction this set is empty and
+                # the normal escape score chooses a lateral detour; it does not
+                # mechanically force further outward movement.
+                homeward_survivable = [
+                    row
+                    for row in rows
+                    if manhattan(row.destination, core_target)
+                    < current_home_distance
                     and (
                         state.last_min_enemy_distance is None
                         or row.minimum_enemy_distance
                         >= state.last_min_enemy_distance
                     )
-                    and all(
-                        row.destination not in enemy.movement_corridor
-                        and row.destination not in enemy.future_attack_cells
-                        for threat_id in state.threat_ids
-                        if (enemy := projection.enemy(threat_id)) is not None
-                    )
-                )
-
-            homeward_survivable = [
-                row
-                for row in rows
-                if manhattan(
-                    row.destination,
-                    world.core.destination or world.core.position,
-                )
-                < current_home_distance
-                and safe_fog_homeward(row)
-            ]
-            if homeward_survivable:
-                filter_rejections["NOT_SAFE_HOMEWARD_PROGRESS"] = (
-                    filter_rejections.get("NOT_SAFE_HOMEWARD_PROGRESS", 0)
-                    + len(rows)
-                    - len(homeward_survivable)
-                )
-                rows = homeward_survivable
-            else:
-                # Prefer lateral/outward motion while the fog envelope still
-                # covers every route home.  Do not, however, turn that
-                # preference into an artificial trap: when every surviving
-                # continuation is homeward, moving along one of those proved
-                # non-fatal paths is strictly safer than waiting for the
-                # hidden attacker to close the distance.
-                non_homeward = [
-                    row
-                    for row in rows
-                    if manhattan(
-                        row.destination,
-                        world.core.destination or world.core.position,
-                    )
-                    >= current_home_distance
                 ]
-                if non_homeward:
-                    filter_rejections["FOG_HOMEWARD_SAFETY_GATE"] = (
-                        filter_rejections.get("FOG_HOMEWARD_SAFETY_GATE", 0)
+                if homeward_survivable:
+                    filter_rejections["NOT_SAFE_CORE_PROGRESS"] = (
+                        filter_rejections.get("NOT_SAFE_CORE_PROGRESS", 0)
                         + len(rows)
-                        - len(non_homeward)
+                        - len(homeward_survivable)
                     )
-                    rows = non_homeward
+                    rows = homeward_survivable
 
         ordered = sorted(rows, key=lambda row: row.score)
         if ordered:
@@ -2271,15 +2290,13 @@ class WorkerPlanner:
                     (
                         "fog_homeward_allowed",
                         state.phase == "FLEEING"
-                        or (
-                            manhattan(
-                                row.destination,
-                                world.core.destination or world.core.position,
-                            )
-                            >= current_home_distance
-                            or safe_fog_homeward(row)
-                        ),
+                        or row.destination == core_retreat_first_step
+                        or manhattan(row.destination, core_target)
+                        < current_home_distance,
                     ),
+                    ("core_retreat_target", core_target),
+                    ("core_retreat_first_step", core_retreat_first_step),
+                    ("core_retreat_route_mode", core_retreat_route_mode),
                     ("escape_route_version", state.route_version),
                     (
                         "escape_filter_rejections",
