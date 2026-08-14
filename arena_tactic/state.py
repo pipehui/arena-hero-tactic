@@ -45,6 +45,10 @@ from .models import (
     ThreatHeatCell,
     LongRangeRaidCampaign,
     RaidAttemptMemory,
+    RaidConfirmationLease,
+    RaidDistanceBand,
+    RaidReconMission,
+    SiegeApproachPlan,
     VanguardInterceptLease,
 )
 
@@ -217,6 +221,10 @@ class TacticMemory:
     raid_containment_mode: bool = False
     raid_long_range_campaign: LongRangeRaidCampaign | None = None
     raid_attempts: dict[UUID, RaidAttemptMemory] = field(default_factory=dict)
+    raid_confirmation_lease: RaidConfirmationLease | None = None
+    raid_recon_mission: RaidReconMission | None = None
+    raid_distance_band: RaidDistanceBand | None = None
+    raid_siege_approach: SiegeApproachPlan | None = None
     raid_return_reason: str | None = None
     raid_handoff_targets: dict[UUID, Position] = field(default_factory=dict)
     home_return_missions: dict[UUID, HomeReturnMission] = field(default_factory=dict)
@@ -322,6 +330,10 @@ class TacticMemory:
         self.raid_interrupted_tick = None
         self.raid_containment_mode = False
         self.raid_long_range_campaign = None
+        self.raid_confirmation_lease = None
+        self.raid_recon_mission = None
+        self.raid_distance_band = None
+        self.raid_siege_approach = None
         self.raid_attempts.clear()
         self.raid_return_reason = None
         self.raid_handoff_targets.clear()

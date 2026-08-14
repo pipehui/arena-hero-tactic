@@ -23,6 +23,20 @@ class WorkerScoutPhase(str, Enum):
     RETURN_TO_BAND = "RETURN_TO_BAND"
 
 
+class EnemyCoreControlLevel(str, Enum):
+    """How remembered hostile-Core geometry may influence Worker movement."""
+
+    HARD = "HARD"
+    SOFT = "SOFT"
+    STRATEGIC = "STRATEGIC"
+
+
+class RaidDistanceBand(str, Enum):
+    NEAR = "NEAR"
+    EXTENDED = "EXTENDED"
+    LONG_RANGE = "LONG_RANGE"
+
+
 class UnitMission(str, Enum):
     CORE_SURVIVAL = "CORE_SURVIVAL"
     DEPOSIT = "DEPOSIT"
@@ -216,6 +230,14 @@ class EnemyCoreIntel:
     destination: Position | None
     last_seen_tick: int
     sighting_count: int
+    lifetime_sightings: int = 1
+    confirmation_sightings: int = 1
+    confirmation_window_start_tick: int | None = None
+
+
+# Public name for the split strategic/current intelligence record introduced
+# by checkpoint schema 16.  Keep EnemyCoreIntel as the compatibility spelling.
+EnemyCoreIntelState = EnemyCoreIntel
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +249,44 @@ class EnemyCoreControlZone:
     last_seen_tick: int
     visible_now: bool
     expires_tick: int | None = None
+    control_level: EnemyCoreControlLevel = EnemyCoreControlLevel.HARD
+
+
+@dataclass(frozen=True, slots=True)
+class BoundedScoutAssignment:
+    worker_id: UUID
+    radius: int
+    sector_index: int
+    target: Position | None
+
+
+@dataclass(frozen=True, slots=True)
+class RaidConfirmationLease:
+    target_id: UUID
+    observer_id: UUID
+    first_seen_tick: int
+    expires_tick: int
+
+
+@dataclass(frozen=True, slots=True)
+class RaidReconMission:
+    target_id: UUID
+    member_ids: tuple[UUID, ...]
+    last_position: Position
+    started_tick: int
+    last_seen_tick: int
+    no_progress_ticks: int = 0
+    last_group_distance: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SiegeApproachPlan:
+    target_id: UUID
+    target_position: Position
+    distance_band: RaidDistanceBand
+    vanguard_positions: tuple[Position, ...]
+    ranger_positions: tuple[Position, ...]
+    route_eta: int
 
 
 @dataclass(frozen=True, slots=True)

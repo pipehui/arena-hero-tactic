@@ -12,6 +12,7 @@ from .models import (
     CoreServiceQueue,
     EntitySnapshot,
     EnemyCoreControlZone,
+    EnemyCoreControlLevel,
     FullStorageParkingAssignment,
     IntentAction,
     MissionState,
@@ -22,6 +23,7 @@ from .models import (
     WorkerScoutState,
     WorkerTaskProgress,
     WorldModel,
+    RaidDistanceBand,
 )
 from .planning import (
     MoveViability,
@@ -35,6 +37,7 @@ from .planning import (
     weighted_progress_route,
     weighted_route_to,
     route_to,
+    siege_approach_plan,
 )
 from .projection import TacticalMap
 from .resource_allocator import ResourceAllocator
@@ -713,6 +716,15 @@ class WorkerPlanner:
                 last_seen_tick=intel.last_seen_tick,
                 visible_now=intel.id in visible_ids,
                 expires_tick=intel.last_seen_tick + self.config.enemy_core_control_ttl,
+                control_level=(
+                    EnemyCoreControlLevel.HARD
+                    if world.tick - intel.last_seen_tick
+                    <= self.config.enemy_core_hard_control_ticks
+                    else EnemyCoreControlLevel.SOFT
+                    if world.tick - intel.last_seen_tick
+                    <= self.config.enemy_core_soft_control_ticks
+                    else EnemyCoreControlLevel.STRATEGIC
+                ),
             )
             for intel in world.remembered_enemy_cores
             if world.tick - intel.last_seen_tick <= self.config.enemy_core_control_ttl
@@ -721,13 +733,19 @@ class WorkerPlanner:
             unit.id for unit in world.friendlies if unit.unit_type is UnitType.WORKER
         }
         for worker_id, lease in tuple(self.memory.worker_disengage_leases.items()):
-            if worker_id not in valid_workers or lease.core_id not in self.memory.enemy_core_control_zones:
+            zone = self.memory.enemy_core_control_zones.get(lease.core_id)
+            if (
+                worker_id not in valid_workers
+                or zone is None
+                or zone.control_level is not EnemyCoreControlLevel.HARD
+            ):
                 self.memory.worker_disengage_leases.pop(worker_id, None)
 
     def _control_zone_cells(self) -> frozenset[Position]:
         cells: set[Position] = set()
         for zone in self.memory.enemy_core_control_zones.values():
-            cells.update(diamond(zone.center, zone.exclusion_radius))
+            if zone.control_level is EnemyCoreControlLevel.HARD:
+                cells.update(diamond(zone.center, zone.exclusion_radius))
         return frozenset(cells)
 
     def _confirmation_observer_allowed(
@@ -792,22 +810,25 @@ class WorkerPlanner:
         )
         required = required_pairs * 2
         if remote:
-            route = route_to(
+            band = (
+                RaidDistanceBand.LONG_RANGE
+                if distance > self.config.raid_containment_radius
+                else RaidDistanceBand.EXTENDED
+            )
+            approach = siege_approach_plan(
                 world,
-                world.core.position,
+                zone.core_id,
                 zone.center,
+                band=band,
                 node_limit=self.config.path_node_limit,
-                blocked=frozenset(enemy.position for enemy in world.enemies),
+                max_route=self.config.raid_long_range_max_route,
             )
             force_ready = (
                 len(healthy) - required >= home_target
                 and vanguards >= self.config.minimum_vanguards + required_pairs
                 and rangers >= self.config.minimum_rangers + required_pairs
             )
-            route_ready = bool(
-                route is not None
-                and route.distance <= self.config.raid_long_range_max_route
-            )
+            route_ready = approach is not None
         else:
             force_ready = (
                 len(healthy) - required
@@ -842,12 +863,15 @@ class WorkerPlanner:
         previous = self.memory.worker_disengage_leases.get(worker.id)
         zones = self.memory.enemy_core_control_zones
         zone = None if previous is None else zones.get(previous.core_id)
+        if zone is not None and zone.control_level is not EnemyCoreControlLevel.HARD:
+            zone = None
         if zone is None:
             zone = min(
                 (
                     candidate
                     for candidate in zones.values()
-                    if manhattan(worker.position, candidate.center)
+                    if candidate.control_level is EnemyCoreControlLevel.HARD
+                    and manhattan(worker.position, candidate.center)
                     <= candidate.exclusion_radius
                 ),
                 key=lambda item: (manhattan(worker.position, item.center), item.core_id.bytes),
@@ -856,9 +880,10 @@ class WorkerPlanner:
         if zone is None:
             self.memory.worker_disengage_leases.pop(worker.id, None)
             return None
-        if previous is None and self._confirmation_observer_allowed(
+        if self._confirmation_observer_allowed(
             world, projection, worker, zone
         ):
+            self.memory.worker_disengage_leases.pop(worker.id, None)
             return None
 
         distance = manhattan(worker.position, zone.center)
@@ -1659,7 +1684,8 @@ class WorkerPlanner:
                 (
                     zone
                     for zone in self.memory.enemy_core_control_zones.values()
-                    if manhattan(worker.position, zone.center) <= zone.clear_radius
+                    if zone.control_level is EnemyCoreControlLevel.HARD
+                    and manhattan(worker.position, zone.center) <= zone.clear_radius
                 ),
                 key=lambda zone: (
                     manhattan(worker.position, zone.center),
@@ -1667,20 +1693,28 @@ class WorkerPlanner:
                 ),
             )
         )
-        if previous is None:
-            current_zones = tuple(
-                zone
-                for zone in current_zones
-                if not self._confirmation_observer_allowed(
-                    world,
-                    projection,
-                    worker,
-                    zone,
-                )
+        confirmation_zone_ids = frozenset(
+            zone.core_id
+            for zone in current_zones
+            if self._confirmation_observer_allowed(
+                world,
+                projection,
+                worker,
+                zone,
             )
+        )
+        current_zones = tuple(
+            zone
+            for zone in current_zones
+            if zone.core_id not in confirmation_zone_ids
+        )
         retained_zone_ids = {
             zone.core_id for zone in current_zones
-        } | set(() if previous is None else previous.control_core_ids)
+        } | (
+            set()
+            if previous is None
+            else set(previous.control_core_ids) - set(confirmation_zone_ids)
+        )
         retained_zones = tuple(
             sorted(
                 (
@@ -1688,6 +1722,7 @@ class WorkerPlanner:
                     for core_id in retained_zone_ids
                     if (zone := self.memory.enemy_core_control_zones.get(core_id))
                     is not None
+                    and zone.control_level is EnemyCoreControlLevel.HARD
                     and (
                         zone.expires_tick is None
                         or zone.expires_tick >= world.tick
@@ -1699,6 +1734,20 @@ class WorkerPlanner:
         control_ids = tuple(zone.core_id for zone in retained_zones)
         control_centers = tuple(zone.center for zone in retained_zones)
 
+        # A remembered Core stops being an operational escape constraint once
+        # its hard 16-Tick control window expires.  Strategic intelligence is
+        # retained for recon/raid planning, but must not keep an otherwise
+        # safe Worker in CLEARING for hundreds of Ticks.
+        if (
+            previous is not None
+            and previous.control_core_ids
+            and not control_ids
+            and not threats
+            and not previous.threat_ids
+        ):
+            self.memory.worker_escape_states.pop(worker.id, None)
+            return None
+
         if current_zones:
             mission = self.memory.unit_missions.get(worker.id)
             if mission is not None and mission.mission in {
@@ -1707,7 +1756,7 @@ class WorkerPlanner:
             }:
                 if mission.target is not None:
                     expiry = max(
-                        zone.last_seen_tick + self.config.enemy_core_control_ttl
+                        zone.last_seen_tick + self.config.enemy_core_soft_control_ticks
                         for zone in current_zones
                     )
                     self.memory.worker_resource_backoff[(worker.id, mission.target)] = max(

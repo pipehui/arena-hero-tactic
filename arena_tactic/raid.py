@@ -24,8 +24,12 @@ from .models import (
     UnitMission,
     WorldModel,
     LongRangeRaidCampaign,
+    RaidConfirmationLease,
+    RaidDistanceBand,
+    RaidReconMission,
+    SiegeApproachPlan,
 )
-from .planning import move_viability, route_to
+from .planning import move_viability, route_to, siege_approach_plan
 from .projection import TacticalMap
 from .rules import UNIT_MAX_HP
 from .state import TacticMemory
@@ -61,6 +65,30 @@ class RaidPlanner:
             if member_id in living
         )
         target = self._active_target(world)
+        if target is not None and self.memory.raid_phase not in {"IDLE", "RETURNING"}:
+            self.memory.raid_distance_band = self._distance_band(world, target)
+            if (
+                self.memory.raid_siege_approach is None
+                or self.memory.raid_siege_approach.target_id != target.id
+                or self.memory.raid_siege_approach.target_position != target.position
+            ):
+                self.memory.raid_siege_approach = self._siege_approach(world, target)
+
+        if self.memory.raid_phase == "RECON":
+            recon_result = self._recon_active_intents(
+                world,
+                projection,
+                members,
+                target,
+                home_threat,
+                protected,
+            )
+            if recon_result is not None:
+                return recon_result
+            # A current two-Tick confirmation promotes the reconnaissance
+            # contact into the normal 2V+2R launch path below.
+            members = ()
+            target = None
 
         if self.memory.raid_phase not in {"IDLE", "RETURNING"}:
             self._update_long_range_progress(world, members)
@@ -84,10 +112,18 @@ class RaidPlanner:
             containment = self._containment_active(world)
             target = self._choose_target(world, projection, home_threat, containment)
             if target is None:
-                return self._confirmation_intents(
+                confirmation = self._confirmation_intents(
                     world,
                     projection,
                     home_threat,
+                )
+                if confirmation:
+                    return confirmation
+                return self._start_recon_intents(
+                    world,
+                    projection,
+                    home_threat,
+                    protected,
                 )
             selected = self._select_members(world, target, containment=containment)
             if not selected:
@@ -98,10 +134,14 @@ class RaidPlanner:
             self.memory.raid_member_ids = tuple(unit.id for unit in selected)
             self.memory.raid_phase = "ASSEMBLING"
             self.memory.raid_containment_mode = containment
+            self.memory.raid_distance_band = self._distance_band(world, target)
+            self.memory.raid_siege_approach = self._siege_approach(world, target)
             self.memory.raid_return_reason = None
+            self.memory.raid_confirmation_lease = None
+            self.memory.raid_recon_mission = None
             self.memory.raid_handoff_targets.clear()
-            if self._is_long_range_target(world, target):
-                route_eta = self._known_route_eta(world, target.position)
+            if self.memory.raid_distance_band is RaidDistanceBand.LONG_RANGE:
+                route_eta = self._known_route_eta(world, target)
                 if route_eta is None:
                     self._clear()
                     return []
@@ -132,6 +172,7 @@ class RaidPlanner:
             self.memory.raid_last_seen_tick = world.tick
             self.memory.raid_last_position = visible.position
             target = self.memory.enemy_core_intel[target.id]
+            self.memory.raid_siege_approach = self._siege_approach(world, target)
             if self.memory.raid_long_range_campaign is not None:
                 self.memory.raid_long_range_campaign = replace(
                     self.memory.raid_long_range_campaign,
@@ -489,14 +530,14 @@ class RaidPlanner:
                     < manhattan(intel.position, world.core.position)
                     <= self.config.raid_containment_radius
                     and intel.sighting_count >= self.config.raid_confirmed_sightings
-                    and self._known_route_eta(world, intel.position) is not None
+                    and self._known_route_eta(world, intel) is not None
                 )
                 or (
                     self.config.raid_containment_radius
                     < manhattan(intel.position, world.core.position)
                     <= self.config.raid_long_range_start_radius
                     and intel.sighting_count >= self.config.raid_confirmed_sightings
-                    and self._known_route_eta(world, intel.position) is not None
+                    and self._known_route_eta(world, intel) is not None
                 )
             )
             and (
@@ -553,7 +594,7 @@ class RaidPlanner:
                 )
                 and (
                     not self._is_long_range_target(world, intel)
-                    or self._known_route_eta(world, intel.position) is not None
+                    or self._known_route_eta(world, intel) is not None
                 )
             ),
             key=lambda intel: (
@@ -563,6 +604,9 @@ class RaidPlanner:
             default=None,
         )
         if candidate is None:
+            lease = self.memory.raid_confirmation_lease
+            if lease is not None and lease.expires_tick < world.tick:
+                self.memory.raid_confirmation_lease = None
             return []
         observer = min(
             (
@@ -583,6 +627,18 @@ class RaidPlanner:
         )
         if observer is None:
             return []
+        self.memory.raid_confirmation_lease = RaidConfirmationLease(
+            target_id=candidate.id,
+            observer_id=observer.id,
+            first_seen_tick=(
+                candidate.confirmation_window_start_tick
+                or candidate.last_seen_tick
+            ),
+            expires_tick=(
+                (candidate.confirmation_window_start_tick or candidate.last_seen_tick)
+                + self.config.raid_confirmation_window_ticks
+            ),
+        )
         return [
             ActionIntent.simple(
                 observer.id,
@@ -707,6 +763,218 @@ class RaidPlanner:
                 return ()
         return tuple(selected)
 
+    def _start_recon_intents(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        home_threat: bool,
+        protected: frozenset[Position],
+    ) -> list[ActionIntent]:
+        """Send only one mixed pair to refresh stale strategic Core intel."""
+
+        if home_threat or world.core is None:
+            return []
+        visible_ids = {core.id for core in world.enemy_cores}
+        candidates = []
+        for intel in self.memory.enemy_core_intel.values():
+            distance = manhattan(intel.position, world.core.position)
+            age = world.tick - intel.last_seen_tick
+            if (
+                not self.config.raid_start_radius < distance
+                <= self.config.raid_long_range_start_radius
+                or age > self.config.enemy_core_control_ttl
+                or (
+                    intel.id in visible_ids
+                    and intel.confirmation_sightings
+                    >= self.config.raid_confirmed_sightings
+                )
+            ):
+                continue
+            approach = self._siege_approach(world, intel)
+            if approach is None:
+                continue
+            candidates.append((age, distance, intel.id.bytes, intel, approach))
+        if not candidates:
+            return []
+        _, _, _, target, approach = min(candidates)
+        members = self._select_recon_members(world, target)
+        if not members:
+            return []
+        self.memory.raid_target_id = target.id
+        self.memory.raid_last_seen_tick = target.last_seen_tick
+        self.memory.raid_last_position = target.position
+        self.memory.raid_member_ids = tuple(unit.id for unit in members)
+        self.memory.raid_phase = "RECON"
+        self.memory.raid_distance_band = approach.distance_band
+        self.memory.raid_siege_approach = approach
+        self.memory.raid_recon_mission = RaidReconMission(
+            target_id=target.id,
+            member_ids=tuple(unit.id for unit in members),
+            last_position=target.position,
+            started_tick=world.tick,
+            last_seen_tick=target.last_seen_tick,
+            last_group_distance=sum(
+                manhattan(unit.position, target.position) for unit in members
+            ),
+        )
+        return self._recon_move_intents(
+            world,
+            projection,
+            members,
+            target.position,
+            protected,
+        )
+
+    def _select_recon_members(
+        self,
+        world: WorldModel,
+        target: EnemyCoreIntel,
+    ) -> tuple[EntitySnapshot, ...]:
+        assert world.core is not None
+        healthy = tuple(
+            unit
+            for unit in world.friendlies
+            if unit.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+            and unit.hp * 2 > UNIT_MAX_HP[unit.unit_type]
+            and unit.id != world.beacon.carrier_id
+            and manhattan(unit.position, world.core.position)
+            <= self.config.home_pursuit_radius
+        )
+        home_target = max(self.config.home_force_floor, self.memory.home_force_high_water)
+        vanguards = sorted(
+            (unit for unit in healthy if unit.unit_type is UnitType.VANGUARD),
+            key=lambda unit: (manhattan(unit.position, target.position), unit.id.bytes),
+        )
+        rangers = sorted(
+            (unit for unit in healthy if unit.unit_type is UnitType.RANGER),
+            key=lambda unit: (manhattan(unit.position, target.position), unit.id.bytes),
+        )
+        if (
+            len(healthy) - 2 < home_target
+            or len(vanguards) <= self.config.minimum_vanguards
+            or len(rangers) <= self.config.minimum_rangers
+        ):
+            return ()
+        return vanguards[0], rangers[0]
+
+    def _recon_active_intents(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        members: tuple[EntitySnapshot, ...],
+        target: EnemyCoreIntel | None,
+        home_threat: bool,
+        protected: frozenset[Position],
+    ) -> list[ActionIntent] | None:
+        mission = self.memory.raid_recon_mission
+        if mission is None:
+            self.memory.raid_phase = "IDLE"
+            self.memory.raid_member_ids = ()
+            return None
+        visible = target is not None and any(
+            core.id == target.id for core in world.enemy_cores
+        )
+        if (
+            visible
+            and target is not None
+            and target.confirmation_sightings >= self.config.raid_confirmed_sightings
+        ):
+            self.memory.raid_phase = "IDLE"
+            self.memory.raid_member_ids = ()
+            self.memory.raid_recon_mission = None
+            return None
+        if (
+            home_threat
+            or target is None
+            or len(members) != len(mission.member_ids)
+            or any(unit.hp * 2 <= UNIT_MAX_HP[unit.unit_type] for unit in members)
+            or mission.no_progress_ticks >= 4
+        ):
+            self.memory.raid_phase = "RETURNING"
+            self.memory.raid_return_reason = (
+                "RECON_HOME_THREAT"
+                if home_threat
+                else "RECON_TARGET_CLEARED"
+                if target is None
+                else "RECON_MEMBER_UNAVAILABLE"
+                if len(members) != len(mission.member_ids)
+                else "RECON_MEMBER_LOW_HP"
+                if any(unit.hp * 2 <= UNIT_MAX_HP[unit.unit_type] for unit in members)
+                else "RECON_NO_PROGRESS"
+            )
+            return self._return_intents(world, projection, members, protected)
+        group_distance = sum(
+            manhattan(unit.position, target.position) for unit in members
+        )
+        no_progress = (
+            0
+            if mission.last_group_distance is None
+            or group_distance < mission.last_group_distance
+            else mission.no_progress_ticks + 1
+        )
+        self.memory.raid_recon_mission = replace(
+            mission,
+            last_position=target.position,
+            last_seen_tick=target.last_seen_tick,
+            no_progress_ticks=no_progress,
+            last_group_distance=group_distance,
+        )
+        return self._recon_move_intents(
+            world,
+            projection,
+            members,
+            target.position,
+            protected,
+        )
+
+    def _recon_move_intents(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        members: tuple[EntitySnapshot, ...],
+        target: Position,
+        protected: frozenset[Position],
+    ) -> list[ActionIntent]:
+        intents: list[ActionIntent] = []
+        blocked = frozenset(enemy.position for enemy in world.enemies) | {target}
+        for unit in members:
+            radius = 4 if unit.unit_type is UnitType.VANGUARD else 5
+            rows = []
+            for cell in manhattan_ring(target, radius):
+                if (
+                    cell not in world.known_passable
+                    or cell in world.known_obstacles
+                    or cell in blocked
+                    or cell in protected
+                ):
+                    continue
+                route = route_to(
+                    world,
+                    unit.position,
+                    cell,
+                    node_limit=self.config.path_node_limit,
+                    blocked=blocked - {unit.position, cell},
+                )
+                if route is not None:
+                    rows.append((route.distance, cell))
+            destination = min(rows, default=(0, None))[1]
+            if destination is None:
+                intents.append(self._wait(unit, "RAID_RECON_NO_OBSERVATION_ROUTE"))
+            elif destination == unit.position:
+                intents.append(self._wait(unit, "RAID_RECON_OBSERVE"))
+            else:
+                intents.extend(
+                    self._move(
+                        world,
+                        projection,
+                        unit,
+                        destination,
+                        protected,
+                        "RAID_RECON_ADVANCE",
+                    )
+                )
+        return intents
+
     def _record_failed_attempt(
         self,
         target: EnemyCoreIntel,
@@ -728,11 +996,12 @@ class RaidPlanner:
         if target is None:
             return "TARGET_INTEL_EXPIRED"
         campaign = self.memory.raid_long_range_campaign
+        band = self.memory.raid_distance_band
         continue_radius = (
             self.config.raid_long_range_continue_radius
-            if campaign is not None
+            if band is RaidDistanceBand.LONG_RANGE or campaign is not None
             else self.config.raid_containment_continue_radius
-            if self.memory.raid_containment_mode
+            if band is RaidDistanceBand.EXTENDED or self.memory.raid_containment_mode
             else self.config.raid_continue_radius
         )
         if world.core is None or manhattan(target.position, world.core.position) > continue_radius:
@@ -763,23 +1032,40 @@ class RaidPlanner:
             <= self.config.raid_long_range_start_radius
         )
 
+    def _distance_band(
+        self,
+        world: WorldModel,
+        target: EnemyCoreIntel,
+    ) -> RaidDistanceBand:
+        assert world.core is not None
+        distance = manhattan(target.position, world.core.position)
+        if distance <= self.config.raid_confirmed_start_radius:
+            return RaidDistanceBand.NEAR
+        if distance <= self.config.raid_containment_radius:
+            return RaidDistanceBand.EXTENDED
+        return RaidDistanceBand.LONG_RANGE
+
+    def _siege_approach(
+        self,
+        world: WorldModel,
+        target: EnemyCoreIntel,
+    ) -> SiegeApproachPlan | None:
+        return siege_approach_plan(
+            world,
+            target.id,
+            target.position,
+            band=self._distance_band(world, target),
+            node_limit=self.config.path_node_limit,
+            max_route=self.config.raid_long_range_max_route,
+        )
+
     def _known_route_eta(
         self,
         world: WorldModel,
-        target: Position,
+        target: EnemyCoreIntel,
     ) -> int | None:
-        if world.core is None:
-            return None
-        route = route_to(
-            world,
-            world.core.position,
-            target,
-            node_limit=self.config.path_node_limit,
-            blocked=frozenset(enemy.position for enemy in world.enemies),
-        )
-        if route is None or route.distance > self.config.raid_long_range_max_route:
-            return None
-        return route.distance
+        approach = self._siege_approach(world, target)
+        return None if approach is None else approach.route_eta
 
     def _update_long_range_progress(
         self,
@@ -879,7 +1165,29 @@ class RaidPlanner:
                 else:
                     intents.append(self._wait(unit, "RAID_FORMATION_HOLD"))
                 continue
-            intents.extend(self._move(world, projection, unit, target, protected, "RAID_ADVANCE"))
+            approach = self.memory.raid_siege_approach
+            destinations = (
+                ()
+                if approach is None
+                else approach.ranger_positions
+                if unit.unit_type is UnitType.RANGER
+                else approach.vanguard_positions
+            )
+            advance_target = min(
+                destinations,
+                key=lambda cell: (manhattan(unit.position, cell), cell),
+                default=target,
+            )
+            intents.extend(
+                self._move(
+                    world,
+                    projection,
+                    unit,
+                    advance_target,
+                    protected,
+                    "RAID_ADVANCE",
+                )
+            )
         return intents
 
     def _siege_intents(self, world, projection, members, target, target_id, protected):
@@ -1244,6 +1552,10 @@ class RaidPlanner:
         self.memory.raid_phase = "IDLE"
         self.memory.raid_containment_mode = False
         self.memory.raid_long_range_campaign = None
+        self.memory.raid_confirmation_lease = None
+        self.memory.raid_recon_mission = None
+        self.memory.raid_distance_band = None
+        self.memory.raid_siege_approach = None
         self.memory.raid_interrupted_tick = None
         self.memory.raid_return_reason = None
         self.memory.raid_handoff_targets.clear()

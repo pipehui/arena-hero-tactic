@@ -7,7 +7,12 @@ from uuid import UUID
 from arena_hero import Direction, Position, UnitType
 
 from .geometry import cardinal_neighbors, diamond, manhattan, unit_attack_cells
-from .models import EnemyCoreControlZone, EntitySnapshot, WorldModel
+from .models import (
+    EnemyCoreControlLevel,
+    EnemyCoreControlZone,
+    EntitySnapshot,
+    WorldModel,
+)
 from .planning import move_viability, Route, weighted_route_to
 from .projection import TacticalMap
 
@@ -141,7 +146,10 @@ class WorkerSafetyEvaluator:
         blocked: set[Position] = set()
         costs = WorkerSafetyEvaluator.route_costs(projection)
         for zone in zones:
-            blocked.update(diamond(zone.center, zone.exclusion_radius))
+            if zone.control_level is EnemyCoreControlLevel.STRATEGIC:
+                continue
+            if zone.control_level is EnemyCoreControlLevel.HARD:
+                blocked.update(diamond(zone.center, zone.exclusion_radius))
             for cell in diamond(zone.center, zone.clear_radius):
                 distance = manhattan(cell, zone.center)
                 if distance <= zone.exclusion_radius:

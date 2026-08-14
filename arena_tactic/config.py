@@ -46,6 +46,9 @@ class TacticConfig:
     enemy_track_ttl: int = 6
     enemy_core_occupancy_memory_ttl: int = 8
     enemy_core_control_ttl: int = 512
+    enemy_core_hard_control_ticks: int = 16
+    enemy_core_soft_control_ticks: int = 64
+    raid_confirmation_window_ticks: int = 4
     danger_envelope_ttl: int = 6
     threat_heat_visible_risk: int = 8
     threat_heat_visible_ttl: int = 24
@@ -208,6 +211,9 @@ class TacticConfig:
             self.enemy_track_ttl,
             self.enemy_core_occupancy_memory_ttl,
             self.enemy_core_control_ttl,
+            self.enemy_core_hard_control_ticks,
+            self.enemy_core_soft_control_ticks,
+            self.raid_confirmation_window_ticks,
             self.danger_envelope_ttl,
             self.threat_heat_visible_risk,
             self.threat_heat_visible_ttl,
@@ -354,6 +360,12 @@ class TacticConfig:
             raise ValueError("enemy Core clearance must exceed its exclusion radius")
         if self.enemy_core_control_ttl <= self.raid_intel_ttl:
             raise ValueError("enemy Core control memory must outlive raid intel")
+        if not (
+            self.enemy_core_hard_control_ticks
+            < self.enemy_core_soft_control_ticks
+            < self.enemy_core_control_ttl
+        ):
+            raise ValueError("enemy Core control ages must be strictly increasing")
         if self.worker_escape_plan_node_limit < self.worker_escape_plan_depth:
             raise ValueError("escape planning nodes must cover its depth")
         if self.worker_escape_max_loop_period * 2 > self.loop_history_length:

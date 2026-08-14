@@ -17,10 +17,15 @@ from .state import TacticMemory
 from .models import (
     CrisisForceBaseline,
     EnemyCoreControlZone,
+    EnemyCoreControlLevel,
     EnemyCoreIntel,
     EnemyTrack,
     LongRangeRaidCampaign,
     RaidAttemptMemory,
+    RaidConfirmationLease,
+    RaidDistanceBand,
+    RaidReconMission,
+    SiegeApproachPlan,
     ThreatHeatCell,
     WorkerScoutPhase,
     WorkerScoutState,
@@ -191,6 +196,11 @@ class ExplorationMemoryStore:
                     ),
                     "last_seen_tick": intel.last_seen_tick,
                     "sighting_count": intel.sighting_count,
+                    "lifetime_sightings": intel.lifetime_sightings,
+                    "confirmation_sightings": intel.confirmation_sightings,
+                    "confirmation_window_start_tick": (
+                        intel.confirmation_window_start_tick
+                    ),
                 }
                 for core_id, intel in sorted(
                     memory.enemy_core_intel.items(),
@@ -211,6 +221,7 @@ class ExplorationMemoryStore:
                     "clear_radius": zone.clear_radius,
                     "last_seen_tick": zone.last_seen_tick,
                     "expires_tick": zone.expires_tick,
+                    "control_level": zone.control_level.value,
                 }
                 for core_id, zone in sorted(
                     memory.enemy_core_control_zones.items(),
@@ -285,7 +296,10 @@ class ExplorationMemoryStore:
             ],
             "raid_state": (
                 None
-                if memory.raid_phase == "IDLE" and not memory.raid_member_ids
+                if memory.raid_phase == "IDLE"
+                and not memory.raid_member_ids
+                and memory.raid_confirmation_lease is None
+                and memory.raid_recon_mission is None
                 else {
                     "target_id": (
                         None
@@ -302,6 +316,61 @@ class ExplorationMemoryStore:
                     "phase": memory.raid_phase,
                     "interrupted_tick": memory.raid_interrupted_tick,
                     "containment_mode": memory.raid_containment_mode,
+                    "distance_band": (
+                        None
+                        if memory.raid_distance_band is None
+                        else memory.raid_distance_band.value
+                    ),
+                    "siege_approach": (
+                        None
+                        if memory.raid_siege_approach is None
+                        else {
+                            "target_id": str(memory.raid_siege_approach.target_id),
+                            "target_position": list(
+                                memory.raid_siege_approach.target_position
+                            ),
+                            "distance_band": (
+                                memory.raid_siege_approach.distance_band.value
+                            ),
+                            "vanguard_positions": [
+                                list(cell)
+                                for cell in memory.raid_siege_approach.vanguard_positions
+                            ],
+                            "ranger_positions": [
+                                list(cell)
+                                for cell in memory.raid_siege_approach.ranger_positions
+                            ],
+                            "route_eta": memory.raid_siege_approach.route_eta,
+                        }
+                    ),
+                    "confirmation_lease": (
+                        None
+                        if memory.raid_confirmation_lease is None
+                        else {
+                            "target_id": str(memory.raid_confirmation_lease.target_id),
+                            "observer_id": str(memory.raid_confirmation_lease.observer_id),
+                            "first_seen_tick": memory.raid_confirmation_lease.first_seen_tick,
+                            "expires_tick": memory.raid_confirmation_lease.expires_tick,
+                        }
+                    ),
+                    "recon_mission": (
+                        None
+                        if memory.raid_recon_mission is None
+                        else {
+                            "target_id": str(memory.raid_recon_mission.target_id),
+                            "member_ids": [
+                                str(item)
+                                for item in memory.raid_recon_mission.member_ids
+                            ],
+                            "last_position": list(memory.raid_recon_mission.last_position),
+                            "started_tick": memory.raid_recon_mission.started_tick,
+                            "last_seen_tick": memory.raid_recon_mission.last_seen_tick,
+                            "no_progress_ticks": memory.raid_recon_mission.no_progress_ticks,
+                            "last_group_distance": (
+                                memory.raid_recon_mission.last_group_distance
+                            ),
+                        }
+                    ),
                     "return_reason": memory.raid_return_reason,
                     "handoff_targets": [
                         [str(actor_id), list(position)]
@@ -490,6 +559,21 @@ class ExplorationMemoryStore:
                     destination=destination,
                     last_seen_tick=last_seen_tick,
                     sighting_count=sighting_count,
+                    lifetime_sightings=(
+                        raw.get("lifetime_sightings")
+                        if isinstance(raw.get("lifetime_sightings"), int)
+                        else sighting_count
+                    ),
+                    confirmation_sightings=(
+                        raw.get("confirmation_sightings")
+                        if isinstance(raw.get("confirmation_sightings"), int)
+                        else sighting_count
+                    ),
+                    confirmation_window_start_tick=(
+                        raw.get("confirmation_window_start_tick")
+                        if isinstance(raw.get("confirmation_window_start_tick"), int)
+                        else last_seen_tick
+                    ),
                 )
 
         if schema >= 10:
@@ -697,6 +781,13 @@ class ExplorationMemoryStore:
                     last_seen_tick=last_seen,
                     visible_now=False,
                     expires_tick=expires,
+                    control_level=(
+                        EnemyCoreControlLevel(raw.get("control_level"))
+                        if schema >= 16
+                        and raw.get("control_level")
+                        in {item.value for item in EnemyCoreControlLevel}
+                        else EnemyCoreControlLevel.HARD
+                    ),
                 )
             for raw in payload.get("raid_attempts", []):
                 if not isinstance(raw, dict):
@@ -755,6 +846,107 @@ class ExplorationMemoryStore:
                     memory.raid_containment_mode = bool(
                         raw_raid.get("containment_mode", False)
                     )
+                    if schema >= 16:
+                        try:
+                            memory.raid_distance_band = RaidDistanceBand(
+                                raw_raid.get("distance_band")
+                            )
+                        except (TypeError, ValueError):
+                            memory.raid_distance_band = None
+                        raw_approach = raw_raid.get("siege_approach")
+                        if isinstance(raw_approach, dict):
+                            approach_target_id = _uuid(raw_approach.get("target_id"))
+                            approach_position = _position(
+                                raw_approach.get("target_position")
+                            )
+                            try:
+                                approach_band = RaidDistanceBand(
+                                    raw_approach.get("distance_band")
+                                )
+                            except (TypeError, ValueError):
+                                approach_band = None
+                            vanguard_positions = tuple(
+                                cell
+                                for value in raw_approach.get("vanguard_positions", [])
+                                if (cell := _position(value)) is not None
+                            )
+                            ranger_positions = tuple(
+                                cell
+                                for value in raw_approach.get("ranger_positions", [])
+                                if (cell := _position(value)) is not None
+                            )
+                            route_eta = raw_approach.get("route_eta")
+                            if (
+                                approach_target_id is not None
+                                and approach_position is not None
+                                and approach_band is not None
+                                and vanguard_positions
+                                and ranger_positions
+                                and isinstance(route_eta, int)
+                                and route_eta >= 0
+                            ):
+                                memory.raid_siege_approach = SiegeApproachPlan(
+                                    target_id=approach_target_id,
+                                    target_position=approach_position,
+                                    distance_band=approach_band,
+                                    vanguard_positions=vanguard_positions,
+                                    ranger_positions=ranger_positions,
+                                    route_eta=route_eta,
+                                )
+                        raw_confirmation = raw_raid.get("confirmation_lease")
+                        if isinstance(raw_confirmation, dict):
+                            confirmation_target = _uuid(raw_confirmation.get("target_id"))
+                            observer_id = _uuid(raw_confirmation.get("observer_id"))
+                            first_seen = raw_confirmation.get("first_seen_tick")
+                            expires_tick = raw_confirmation.get("expires_tick")
+                            if (
+                                confirmation_target is not None
+                                and observer_id is not None
+                                and isinstance(first_seen, int)
+                                and isinstance(expires_tick, int)
+                            ):
+                                memory.raid_confirmation_lease = RaidConfirmationLease(
+                                    target_id=confirmation_target,
+                                    observer_id=observer_id,
+                                    first_seen_tick=first_seen,
+                                    expires_tick=expires_tick,
+                                )
+                        raw_recon = raw_raid.get("recon_mission")
+                        if isinstance(raw_recon, dict):
+                            recon_target = _uuid(raw_recon.get("target_id"))
+                            recon_members = tuple(
+                                actor_id
+                                for value in raw_recon.get("member_ids", [])
+                                if (actor_id := _uuid(value)) is not None
+                            )
+                            recon_position = _position(raw_recon.get("last_position"))
+                            started = raw_recon.get("started_tick")
+                            seen = raw_recon.get("last_seen_tick")
+                            no_progress = raw_recon.get("no_progress_ticks", 0)
+                            last_group_distance = raw_recon.get("last_group_distance")
+                            if (
+                                recon_target is not None
+                                and recon_members
+                                and recon_position is not None
+                                and all(
+                                    isinstance(value, int)
+                                    for value in (started, seen, no_progress)
+                                )
+                                and (
+                                    last_group_distance is None
+                                    or isinstance(last_group_distance, int)
+                                    and last_group_distance >= 0
+                                )
+                            ):
+                                memory.raid_recon_mission = RaidReconMission(
+                                    target_id=recon_target,
+                                    member_ids=recon_members,
+                                    last_position=recon_position,
+                                    started_tick=started,
+                                    last_seen_tick=seen,
+                                    no_progress_ticks=no_progress,
+                                    last_group_distance=last_group_distance,
+                                )
                     reason = raw_raid.get("return_reason")
                     memory.raid_return_reason = reason if isinstance(reason, str) else None
                     for row in raw_raid.get("handoff_targets", []):
@@ -867,14 +1059,22 @@ class ExplorationMemoryStore:
                 ):
                     continue
                 previous = memory.enemy_core_intel.get(core_id)
-                sightings = 1
-                if (
+                unique_sighting = previous is None or tick > previous.last_seen_tick
+                within_window = bool(
                     previous is not None
-                    and tick - previous.last_seen_tick <= self.config.raid_intel_ttl
-                ):
-                    sightings = previous.sighting_count + int(
-                        tick > previous.last_seen_tick
-                    )
+                    and tick - previous.last_seen_tick
+                    <= self.config.raid_confirmation_window_ticks
+                )
+                lifetime_sightings = (
+                    1
+                    if previous is None
+                    else previous.lifetime_sightings + int(unique_sighting)
+                )
+                confirmation_sightings = (
+                    1
+                    if not within_window
+                    else previous.confirmation_sightings + int(unique_sighting)
+                )
                 memory.enemy_core_intel[core_id] = EnemyCoreIntel(
                     id=core_id,
                     position=position,
@@ -883,7 +1083,15 @@ class ExplorationMemoryStore:
                     state=core_state,
                     destination=destination,
                     last_seen_tick=tick,
-                    sighting_count=sightings,
+                    sighting_count=confirmation_sightings,
+                    lifetime_sightings=lifetime_sightings,
+                    confirmation_sightings=confirmation_sightings,
+                    confirmation_window_start_tick=(
+                        tick
+                        if not within_window
+                        else previous.confirmation_window_start_tick
+                        or previous.last_seen_tick
+                    ),
                 )
             elif kind == "UNIT" and obj.get("controlled") is True:
                 if (cell := _position(obj.get("position"))) is not None:

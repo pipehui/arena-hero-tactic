@@ -212,8 +212,11 @@ def _sync_events(
                     assigned_tick=turn.tick,
                 )
         elif (
-            event.event_type == "DESTRUCTION_PARTICIPATION"
-            and event.reason_code == "CORE"
+            (
+                event.event_type == "DESTRUCTION_PARTICIPATION"
+                and event.reason_code == "CORE"
+                or event.event_type == "CORE_RESOURCES_CAPTURED"
+            )
             and event.target_id is not None
         ):
             memory.enemy_core_intel.pop(event.target_id, None)
@@ -261,6 +264,11 @@ def _sync_events(
                         phase="RETURNING",
                         member_ids=members,
                     )
+            if (
+                memory.raid_confirmation_lease is not None
+                and memory.raid_confirmation_lease.target_id == event.target_id
+            ):
+                memory.raid_confirmation_lease = None
             memory.raid_attempts.pop(event.target_id, None)
         elif event.event_type == "HARVEST_SUCCEEDED":
             if event.position is not None:
@@ -611,9 +619,27 @@ def _sync_enemy_memory(
     )
     for enemy_core in visible_enemy_cores:
         previous = memory.enemy_core_intel.get(enemy_core.id)
-        sightings = 1
-        if previous is not None and turn.tick - previous.last_seen_tick <= config.raid_intel_ttl:
-            sightings = previous.sighting_count + int(turn.tick > previous.last_seen_tick)
+        unique_sighting = previous is None or turn.tick > previous.last_seen_tick
+        lifetime_sightings = (
+            1
+            if previous is None
+            else previous.lifetime_sightings + int(unique_sighting)
+        )
+        within_confirmation_window = bool(
+            previous is not None
+            and turn.tick - previous.last_seen_tick
+            <= config.raid_confirmation_window_ticks
+        )
+        confirmation_sightings = (
+            1
+            if not within_confirmation_window
+            else previous.confirmation_sightings + int(unique_sighting)
+        )
+        confirmation_window_start_tick = (
+            turn.tick
+            if not within_confirmation_window
+            else previous.confirmation_window_start_tick or previous.last_seen_tick
+        )
         memory.enemy_core_intel[enemy_core.id] = EnemyCoreIntel(
             id=enemy_core.id,
             position=enemy_core.position,
@@ -622,7 +648,12 @@ def _sync_enemy_memory(
             state=enemy_core.state,
             destination=enemy_core.destination,
             last_seen_tick=turn.tick,
-            sighting_count=sightings,
+            # Compatibility field: launch confirmation is intentionally the
+            # short-window count, not the lifetime number of stale sightings.
+            sighting_count=confirmation_sightings,
+            lifetime_sightings=lifetime_sightings,
+            confirmation_sightings=confirmation_sightings,
+            confirmation_window_start_tick=confirmation_window_start_tick,
         )
     visible_core_ids = {core.id for core in visible_enemy_cores}
     for core_id, intel in tuple(memory.enemy_core_intel.items()):

@@ -112,7 +112,7 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         mission = tactic.memory.unit_missions.get(uid(1))
         self.assertTrue(mission is None or mission.mission is not UnitMission.HARVEST)
 
-    def test_enemy_core_control_zone_outlives_raid_intel_ttl(self) -> None:
+    def test_stale_enemy_core_intel_is_not_a_hard_worker_control_zone(self) -> None:
         core = friendly_core(position=(20, 0))
         worker = unit(1, UnitType.WORKER, (1, 0))
         memory = TacticMemory(core_id=core.id, core_position=core.position)
@@ -143,8 +143,46 @@ class EconomyAndLogisticsTests(unittest.TestCase):
             for row in tactic.last_decision_trace["tasks"]
             if row["actor_id"] == str(worker.id)
         )
-        self.assertEqual(task["mission"], "ESCAPE")
+        self.assertNotEqual(task["mission"], "ESCAPE")
         self.assertIn(uid(99), tactic.memory.enemy_core_control_zones)
+        zone = tactic.memory.enemy_core_control_zones[uid(99)]
+        self.assertEqual(zone.control_level, "STRATEGIC")
+
+    def test_recent_fogged_enemy_core_is_soft_risk_after_hard_window(self) -> None:
+        core = friendly_core(position=(20, 0))
+        memory = TacticMemory(core_id=core.id, core_position=core.position)
+        memory.known_passable.update(
+            (x, y) for x in range(-3, 22) for y in range(-4, 5)
+        )
+        tactic = BalancedTactic(memory=memory)
+        tactic.choose_actions(
+            make_turn(
+                tick=1,
+                core=core,
+                units=(unit(1, UnitType.WORKER, (1, 0)),),
+                enemies=(enemy_core(99, (0, 0)),),
+                resources=0,
+            )
+        )
+        turn = make_turn(
+            tick=20,
+            core=core,
+            units=(unit(1, UnitType.WORKER, (7, 0)),),
+            resources=0,
+        )
+
+        tactic.choose_actions(turn)
+
+        task = next(
+            row
+            for row in tactic.last_decision_trace["tasks"]
+            if row["actor_id"] == str(uid(1))
+        )
+        self.assertNotEqual(task["mission"], "ESCAPE")
+        self.assertEqual(
+            tactic.memory.enemy_core_control_zones[uid(99)].control_level,
+            "SOFT",
+        )
 
     def test_enemy_core_clearing_keeps_zone_sticky_and_detours_toward_core(
         self,

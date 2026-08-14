@@ -849,6 +849,7 @@ class DecisionTraceBuilder:
                     "last_seen_tick": zone.last_seen_tick,
                     "visible_now": zone.visible_now,
                     "expires_tick": zone.expires_tick,
+                    "control_level": zone.control_level.value,
                 }
                 for zone in sorted(
                     self.memory.enemy_core_control_zones.values(),
@@ -1336,6 +1337,116 @@ class DecisionTraceBuilder:
                     else list(self.memory.raid_last_position)
                 ),
                 "members": [str(item) for item in self.memory.raid_member_ids],
+                "distance_band": (
+                    None
+                    if self.memory.raid_distance_band is None
+                    else self.memory.raid_distance_band.value
+                ),
+                "siege_approach": (
+                    None
+                    if self.memory.raid_siege_approach is None
+                    else {
+                        "target_id": str(self.memory.raid_siege_approach.target_id),
+                        "target_position": list(
+                            self.memory.raid_siege_approach.target_position
+                        ),
+                        "distance_band": (
+                            self.memory.raid_siege_approach.distance_band.value
+                        ),
+                        "vanguard_positions": [
+                            list(cell)
+                            for cell in self.memory.raid_siege_approach.vanguard_positions
+                        ],
+                        "ranger_positions": [
+                            list(cell)
+                            for cell in self.memory.raid_siege_approach.ranger_positions
+                        ],
+                        "route_eta": self.memory.raid_siege_approach.route_eta,
+                    }
+                ),
+                "confirmation": (
+                    None
+                    if self.memory.raid_confirmation_lease is None
+                    else {
+                        "target_id": str(self.memory.raid_confirmation_lease.target_id),
+                        "observer_id": str(
+                            self.memory.raid_confirmation_lease.observer_id
+                        ),
+                        "first_seen_tick": (
+                            self.memory.raid_confirmation_lease.first_seen_tick
+                        ),
+                        "expires_tick": self.memory.raid_confirmation_lease.expires_tick,
+                    }
+                ),
+                "recon": (
+                    None
+                    if self.memory.raid_recon_mission is None
+                    else {
+                        "target_id": str(self.memory.raid_recon_mission.target_id),
+                        "members": [
+                            str(item)
+                            for item in self.memory.raid_recon_mission.member_ids
+                        ],
+                        "last_position": list(
+                            self.memory.raid_recon_mission.last_position
+                        ),
+                        "started_tick": self.memory.raid_recon_mission.started_tick,
+                        "last_seen_tick": self.memory.raid_recon_mission.last_seen_tick,
+                        "no_progress_ticks": (
+                            self.memory.raid_recon_mission.no_progress_ticks
+                        ),
+                        "last_group_distance": (
+                            self.memory.raid_recon_mission.last_group_distance
+                        ),
+                    }
+                ),
+                "enemy_core_intel": [
+                    {
+                        "target_id": str(intel.id),
+                        "position": list(intel.position),
+                        "distance": (
+                            None
+                            if world.core is None
+                            else manhattan(intel.position, world.core.position)
+                        ),
+                        "age": world.tick - intel.last_seen_tick,
+                        "visible": any(
+                            core.id == intel.id for core in world.enemy_cores
+                        ),
+                        "lifetime_sightings": intel.lifetime_sightings,
+                        "confirmation_sightings": intel.confirmation_sightings,
+                        "confirmation_window_start_tick": (
+                            intel.confirmation_window_start_tick
+                        ),
+                        "control_level": (
+                            None
+                            if (
+                                zone := self.memory.enemy_core_control_zones.get(
+                                    intel.id
+                                )
+                            )
+                            is None
+                            else zone.control_level.value
+                        ),
+                        "disposition": (
+                            "ACTIVE_RAID"
+                            if intel.id == self.memory.raid_target_id
+                            and self.memory.raid_phase != "RECON"
+                            else "ACTIVE_RECON"
+                            if intel.id == self.memory.raid_target_id
+                            else "CONFIRMATION_REQUIRED"
+                            if intel.confirmation_sightings
+                            < self.config.raid_confirmed_sightings
+                            else "CURRENT_VISIBILITY_REQUIRED"
+                            if not any(core.id == intel.id for core in world.enemy_cores)
+                            else "FORCE_OR_ROUTE_GATED"
+                        ),
+                    }
+                    for intel in sorted(
+                        self.memory.enemy_core_intel.values(),
+                        key=lambda item: item.id.bytes,
+                    )
+                ],
                 "return_reason": self.memory.raid_return_reason,
                 "handoff_targets": [
                     {

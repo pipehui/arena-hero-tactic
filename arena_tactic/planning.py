@@ -4,11 +4,20 @@ from collections import deque
 from dataclasses import dataclass
 from heapq import heappop, heappush
 from collections.abc import Mapping
+from uuid import UUID
 
 from arena_hero import Direction, Position
 
-from .geometry import DIRECTION_ORDER, add_direction, cardinal_neighbors, diamond, manhattan
-from .models import WorldModel
+from .geometry import (
+    DIRECTION_ORDER,
+    add_direction,
+    cardinal_neighbors,
+    diamond,
+    manhattan,
+    ranger_firing_positions,
+    ranger_line_is_clear,
+)
+from .models import RaidDistanceBand, SiegeApproachPlan, WorldModel
 
 
 _STEPS: tuple[tuple[Direction, int, int], ...] = (
@@ -45,6 +54,8 @@ class MoveViability:
 
 _viability_cache_world: WorldModel | None = None
 _viability_cache: dict[tuple[object, ...], MoveViability] = {}
+_siege_cache_world: WorldModel | None = None
+_siege_cache: dict[tuple[object, ...], SiegeApproachPlan | None] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,6 +267,78 @@ def route_to(
         return None
     first_direction = parent[1]
     return Route(distance, first_direction, add_direction(start, first_direction))
+
+
+def siege_approach_plan(
+    world: WorldModel,
+    target_id: UUID,
+    target: Position,
+    *,
+    band: RaidDistanceBand,
+    node_limit: int,
+    max_route: int,
+) -> SiegeApproachPlan | None:
+    """Find reachable attack cells without ever pathing onto a hostile Core.
+
+    The hostile Core cell remains blocked even when another hostile (most
+    commonly its Worker) shares that cell.  Vanguards terminate adjacent to
+    it, while Rangers terminate on a real unobstructed 2-3 cell firing line.
+    """
+
+    global _siege_cache_world
+    if _siege_cache_world is not world:
+        _siege_cache_world = world
+        _siege_cache.clear()
+    key = (target_id, target, band, node_limit, max_route)
+    if key in _siege_cache:
+        return _siege_cache[key]
+    if world.core is None:
+        _siege_cache[key] = None
+        return None
+    blocked = {enemy.position for enemy in world.enemies}
+    blocked.add(target)
+
+    def reachable(cells: tuple[Position, ...]) -> tuple[tuple[int, Position], ...]:
+        rows: list[tuple[int, Position]] = []
+        for cell in cells:
+            if (
+                cell not in world.known_passable
+                or cell in world.known_obstacles
+                or cell in blocked
+            ):
+                continue
+            route = route_to(
+                world,
+                world.core.position,
+                cell,
+                node_limit=node_limit,
+                blocked=frozenset(blocked - {cell}),
+            )
+            if route is not None and route.distance <= max_route:
+                rows.append((route.distance, cell))
+        return tuple(sorted(rows, key=lambda row: (row[0], row[1])))
+
+    vanguard_rows = reachable(tuple(cell for _, cell in cardinal_neighbors(target)))
+    ranger_rows = reachable(
+        tuple(
+            cell
+            for cell in ranger_firing_positions(target)
+            if ranger_line_is_clear(cell, target, world.known_obstacles)
+        )
+    )
+    if not vanguard_rows or not ranger_rows:
+        _siege_cache[key] = None
+        return None
+    result = SiegeApproachPlan(
+        target_id=target_id,
+        target_position=target,
+        distance_band=band,
+        vanguard_positions=tuple(cell for _, cell in vanguard_rows),
+        ranger_positions=tuple(cell for _, cell in ranger_rows),
+        route_eta=max(vanguard_rows[0][0], ranger_rows[0][0]),
+    )
+    _siege_cache[key] = result
+    return result
 
 
 def move_viability(
