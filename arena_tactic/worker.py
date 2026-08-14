@@ -1857,7 +1857,18 @@ class WorkerPlanner:
             state = progressed_state(
                 phase,
                 tuple(sorted(retained, key=lambda item: item.bytes)),
-                world.tick if threats else previous.last_threat_tick if previous else world.tick,
+                max(
+                    (
+                        enemy.last_seen_tick
+                        for threat_id in retained
+                        if (enemy := projection.enemy(threat_id)) is not None
+                    ),
+                    default=(
+                        previous.last_threat_tick
+                        if previous is not None
+                        else world.tick
+                    ),
+                ),
                 0,
             )
             self.memory.worker_escape_states[worker.id] = state
@@ -2153,18 +2164,13 @@ class WorkerPlanner:
                 )
                 rows = homeward_survivable
             else:
-                # A fogged threat never grants a blind shortcut home.  Keep
-                # moving laterally/outward (or explicitly wait) until a
-                # homeward step satisfies every conservative safety gate.
-                rejected_homeward = sum(
-                    manhattan(
-                        row.destination,
-                        world.core.destination or world.core.position,
-                    )
-                    < current_home_distance
-                    for row in rows
-                )
-                rows = [
+                # Prefer lateral/outward motion while the fog envelope still
+                # covers every route home.  Do not, however, turn that
+                # preference into an artificial trap: when every surviving
+                # continuation is homeward, moving along one of those proved
+                # non-fatal paths is strictly safer than waiting for the
+                # hidden attacker to close the distance.
+                non_homeward = [
                     row
                     for row in rows
                     if manhattan(
@@ -2173,10 +2179,13 @@ class WorkerPlanner:
                     )
                     >= current_home_distance
                 ]
-                filter_rejections["FOG_HOMEWARD_SAFETY_GATE"] = (
-                    filter_rejections.get("FOG_HOMEWARD_SAFETY_GATE", 0)
-                    + rejected_homeward
-                )
+                if non_homeward:
+                    filter_rejections["FOG_HOMEWARD_SAFETY_GATE"] = (
+                        filter_rejections.get("FOG_HOMEWARD_SAFETY_GATE", 0)
+                        + len(rows)
+                        - len(non_homeward)
+                    )
+                    rows = non_homeward
 
         ordered = sorted(rows, key=lambda row: row.score)
         if ordered:

@@ -224,6 +224,79 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         after = max(0, manhattan(destination, (2, 0)) - 1)
         self.assertGreaterEqual(after, before)
 
+    def test_fog_retreat_does_not_wait_when_only_survivable_steps_are_homeward(
+        self,
+    ) -> None:
+        """Regression for live Tick 107396 -> 107397.
+
+        The visible escape step increases Ranger distance.  Once the Ranger
+        enters fog, its conservative envelope covers both homeward exits, but
+        each exit still has a non-fatal four-Tick survival continuation.  The
+        fog-home gate must not delete both and replace motion with WAIT.
+        """
+
+        core = friendly_core(position=(405, -156))
+        worker_id = uid(1)
+        memory = TacticMemory(core_id=core.id, core_position=core.position)
+        memory.known_passable.update(
+            (x, y)
+            for x in range(388, 410)
+            for y in range(-222, -210)
+        )
+        tactic = BalancedTactic(memory=memory)
+        visible = make_turn(
+            tick=107396,
+            core=core,
+            units=(unit(1, UnitType.WORKER, (392, -217)),),
+            enemies=(
+                unit(100, UnitType.RANGER, (390, -218), controlled=False),
+            ),
+            obstacle_cells=((389, -217), (392, -216), (394, -218)),
+            resources=0,
+        )
+
+        tactic.choose_actions(visible)
+
+        first = visible.plan.unit_actions[worker_id]
+        self.assertIsInstance(first, MoveAction)
+        first_position = add_direction((392, -217), first.direction)
+        self.assertEqual(first_position, (393, -217))
+
+        fogged = make_turn(
+            tick=107397,
+            core=core,
+            units=(unit(1, UnitType.WORKER, first_position),),
+            obstacle_cells=(
+                (392, -216),
+                (393, -214),
+                (394, -218),
+                (394, -215),
+                (396, -217),
+            ),
+            resources=0,
+        )
+
+        tactic.choose_actions(fogged)
+
+        action = fogged.plan.unit_actions[worker_id]
+        self.assertIsInstance(action, MoveAction)
+        destination = add_direction(first_position, action.direction)
+        before = max(0, manhattan(first_position, (390, -218)) - 1)
+        after = max(0, manhattan(destination, (390, -218)) - 1)
+        self.assertGreaterEqual(after, before)
+        task = next(
+            row
+            for row in tactic.last_decision_trace["tasks"]
+            if row["actor_id"] == str(worker_id)
+        )
+        self.assertEqual(task["mission"], "ESCAPE")
+        self.assertNotEqual(task["reason"], "NO_SURVIVABLE_ROUTE")
+        self.assertGreater(task["metadata"]["survival_terminals"], 0)
+        self.assertEqual(
+            tactic.memory.worker_escape_states[worker_id].last_threat_tick,
+            107396,
+        )
+
     def test_escape_loop_keeps_a_valid_waypoint_lease(self) -> None:
         core = friendly_core(position=(10, 0))
         worker = unit(1, UnitType.WORKER, (0, 0), cargo=1)
