@@ -24,6 +24,7 @@ from .models import (
     WorkerTaskProgress,
     WorldModel,
     RaidDistanceBand,
+    ScoutReturnRouteLease,
 )
 from .planning import (
     MoveViability,
@@ -37,6 +38,8 @@ from .planning import (
     weighted_progress_route,
     weighted_route_to,
     route_to,
+    scout_visible_cells,
+    scout_sector_index,
     siege_approach_plan,
 )
 from .projection import TacticalMap
@@ -122,7 +125,6 @@ class WorkerPlanner:
             unit for unit in world.friendlies if unit.unit_type is UnitType.WORKER
         )
         self._refresh_enemy_core_control_zones(world)
-        self._ensure_scout_states(workers, world.tick, world.core.position)
         intents, escaping = self._survival_intents(world, projection, service, workers)
         deconflicting: set[UUID] = set()
         home_defense_active = (
@@ -1553,7 +1555,7 @@ class WorkerPlanner:
                 + (() if route.viability is None else route.viability.metadata),
             ),
         ]
-        blocked, _ = self._exploration_navigation(
+        blocked, costs = self._exploration_navigation(
             world,
             projection,
             worker,
@@ -1580,14 +1582,42 @@ class WorkerPlanner:
                 or projection.immediate_attackers(destination) >= worker.hp
             ):
                 continue
+            return_lease = self.memory.scout_return_route_leases.get(worker.id)
+            if (
+                mission is UnitMission.RETURN_TO_SCOUT_BAND
+                and return_lease is not None
+                and return_lease.blocked_edge == (worker.position, destination)
+                and world.tick <= return_lease.backoff_until
+            ):
+                continue
+            remaining_route = None
+            if mission is UnitMission.RETURN_TO_SCOUT_BAND:
+                remaining_route = weighted_route_to(
+                    world,
+                    destination,
+                    target,
+                    node_limit=self.config.path_node_limit,
+                    blocked=frozenset(set(blocked) - {destination, target}),
+                    cell_costs=costs,
+                )
+                if remaining_route is None:
+                    continue
             viability = move_viability(
                 world,
                 worker.position,
                 destination,
                 target=target,
                 blocked=blocked,
-                node_limit=min(self.config.path_node_limit, 512),
-                require_continuation=require_continuation,
+                node_limit=(
+                    self.config.path_node_limit
+                    if mission is UnitMission.RETURN_TO_SCOUT_BAND
+                    else min(self.config.path_node_limit, 512)
+                ),
+                require_continuation=(
+                    True
+                    if mission is UnitMission.RETURN_TO_SCOUT_BAND
+                    else require_continuation
+                ),
                 require_open_area=not require_continuation,
             )
             if not viability.viable:
@@ -1597,7 +1627,11 @@ class WorkerPlanner:
                 immediate,
                 future,
                 remembered,
-                manhattan(destination, target),
+                (
+                    remaining_route.distance
+                    if remaining_route is not None
+                    else manhattan(destination, target)
+                ),
                 int(destination == previous),
                 self.memory.congestion_counts.get(destination, 0),
                 index,
@@ -3317,6 +3351,12 @@ class WorkerPlanner:
         return intents
 
     def _exploration_assignments(self, world, projection, workers, service):
+        assert world.core is not None
+        self._ensure_scout_states(
+            workers,
+            world.tick,
+            world.core.destination or world.core.position,
+        )
         assignments: dict[UUID, tuple[Position, Route, int]] = {}
         claimed: set[Position] = set()
         last_visible = dict(world.cell_last_visible)
@@ -3324,6 +3364,7 @@ class WorkerPlanner:
         ordered = sorted(
             workers,
             key=lambda worker: (
+                self.memory.worker_scout_states[worker.id].slot,
                 self.memory.worker_scout_states[worker.id].target is not None,
                 self.memory.worker_scout_states[worker.id].last_scan_tick
                 if self.memory.worker_scout_states[worker.id].last_scan_tick is not None
@@ -3363,8 +3404,10 @@ class WorkerPlanner:
                 )
                 self.memory.worker_scout_states[worker.id] = state
 
+            returning_to_band = state.phase is WorkerScoutPhase.RETURN_TO_BAND
             target_expired = (
                 state.target is not None
+                and not returning_to_band
                 and world.tick - state.assigned_tick >= self.config.exploration_scout_hold_ticks
             )
             target_observed = (
@@ -3373,13 +3416,53 @@ class WorkerPlanner:
                 and worker.id not in self.memory.service_egress_worker_ids
             )
             looping = self._looping(worker.id)
+            if target_observed and returning_to_band:
+                self.memory.scout_return_route_leases.pop(worker.id, None)
+                state = replace(
+                    state,
+                    phase=WorkerScoutPhase.SECTOR_SCOUT,
+                    target=None,
+                    assigned_tick=world.tick,
+                    best_route_cost=None,
+                    stalled_ticks=0,
+                    backoff_until=0,
+                    reachable_candidates=0,
+                )
+                self.memory.worker_scout_states[worker.id] = state
+                self.memory.unit_missions.pop(worker.id, None)
+                returning_to_band = False
+                target_observed = False
             if looping or target_expired or target_observed:
                 backoff_until = 0
                 if state.target is not None and (looping or target_expired):
                     backoff_until = (
-                        world.tick + self.config.exploration_target_backoff_ticks
+                        world.tick
+                        + (
+                            self.config.exploration_return_loop_backoff_ticks
+                            if returning_to_band and looping
+                            else self.config.exploration_target_backoff_ticks
+                        )
                     )
                     self.memory.target_backoff_until[state.target] = backoff_until
+                if looping and returning_to_band:
+                    history = self.memory.position_history.get(worker.id, ())
+                    edge = (
+                        # Block the *next* reversal from the authoritative
+                        # current cell back to the previous cell.  Recording
+                        # the already-traversed edge in its forward direction
+                        # leaves an A-B-A-B cycle completely unconstrained.
+                        (history[-1], history[-2])
+                        if len(history) >= 2
+                        else None
+                    )
+                    old_lease = self.memory.scout_return_route_leases.get(worker.id)
+                    if old_lease is not None:
+                        self.memory.scout_return_route_leases[worker.id] = replace(
+                            old_lease,
+                            blocked_edge=edge,
+                            backoff_until=backoff_until,
+                            route_version=old_lease.route_version + 1,
+                        )
                 state = self._clear_scout_target(
                     state,
                     world.tick,
@@ -3387,6 +3470,7 @@ class WorkerPlanner:
                     backoff_until=backoff_until,
                 )
                 self.memory.unit_missions.pop(worker.id, None)
+                returning_to_band = state.phase is WorkerScoutPhase.RETURN_TO_BAND
 
             blocked, costs = self._exploration_navigation(
                 world,
@@ -3394,7 +3478,7 @@ class WorkerPlanner:
                 worker,
                 service,
             )
-            if outside_scout_band:
+            if returning_to_band or outside_scout_band:
                 fallback = self._return_to_scout_band_assignment(
                     world,
                     projection,
@@ -3402,6 +3486,7 @@ class WorkerPlanner:
                     state,
                     claimed,
                     blocked,
+                    costs,
                 )
                 if fallback is not None:
                     state, route = fallback
@@ -3498,7 +3583,7 @@ class WorkerPlanner:
                 self.memory.unit_missions.pop(worker.id, None)
 
             if (
-                not outside_scout_band
+                not returning_to_band
                 and not home_alert
                 and scan_attempts < self.config.exploration_new_goal_budget
             ):
@@ -3530,6 +3615,11 @@ class WorkerPlanner:
                         candidate in claimed
                         or candidate_radius > self.config.exploration_sector_radii[-1]
                         or abs(candidate_radius - band_radius) > 3
+                        or scout_sector_index(
+                            world.core.position,
+                            candidate,
+                        )
+                        != state.sector_index
                     ):
                         continue
                     route = route_from_field(
@@ -3636,75 +3726,143 @@ class WorkerPlanner:
         tick: int,
         core_position: Position,
     ) -> None:
+        """Synchronise balanced slots for the *active empty scout pool* only."""
+
+        active = tuple(sorted(workers, key=lambda item: item.id.bytes))
+        active_ids = {worker.id for worker in active}
+        changed = False
+        for worker_id, state in tuple(self.memory.worker_scout_states.items()):
+            if worker_id in active_ids:
+                continue
+            if state.scout_eligible or state.target is not None:
+                self.memory.worker_scout_states[worker_id] = replace(
+                    state,
+                    scout_eligible=False,
+                    target=None,
+                    best_route_cost=None,
+                    stalled_ticks=0,
+                    reachable_candidates=0,
+                )
+                changed = True
+            self.memory.scout_return_route_leases.pop(worker_id, None)
+            mission = self.memory.unit_missions.get(worker_id)
+            if mission is not None and mission.mission in {
+                UnitMission.EXPLORE,
+                UnitMission.RETURN_TO_SCOUT_BAND,
+            }:
+                self.memory.unit_missions.pop(worker_id, None)
+
+        desired_slots = set(range(len(active)))
+        retained: dict[UUID, int] = {}
         used_slots: set[int] = set()
-        next_slot = 0
+        for worker in active:
+            existing = self.memory.worker_scout_states.get(worker.id)
+            if (
+                existing is not None
+                and existing.coverage_version >= 1
+                and existing.slot in desired_slots
+                and existing.slot not in used_slots
+            ):
+                retained[worker.id] = existing.slot
+                used_slots.add(existing.slot)
+
+        available_slots = sorted(desired_slots - used_slots)
         band_count = len(self.config.exploration_sector_radii)
         max_radius = self.config.exploration_sector_radii[-1]
-        for worker in sorted(workers, key=lambda item: item.id.bytes):
+        for worker in active:
             existing = self.memory.worker_scout_states.get(worker.id)
-            if existing is not None and existing.slot not in used_slots:
-                stage = existing.slot % band_count
-                sector_index = (existing.slot // band_count) % 8
-                target = existing.target
-                if target is not None and manhattan(target, core_position) > max_radius:
-                    target = None
-                phase = existing.phase
-                if manhattan(worker.position, core_position) > max_radius:
-                    phase = WorkerScoutPhase.RETURN_TO_BAND
-                    target = None
-                elif phase is WorkerScoutPhase.RETURN_TO_BAND:
-                    phase = WorkerScoutPhase.SECTOR_SCOUT
-                self.memory.worker_scout_states[worker.id] = replace(
-                    existing,
-                    sector_index=sector_index,
-                    stage=stage,
-                    phase=phase,
-                    target=target,
-                    assigned_tick=(tick if target is None else existing.assigned_tick),
-                    best_route_cost=(None if target is None else existing.best_route_cost),
-                    stalled_ticks=(0 if target is None else existing.stalled_ticks),
-                )
-                used_slots.add(existing.slot)
-                continue
-            while next_slot in used_slots:
-                next_slot += 1
+            slot = retained.get(worker.id)
+            if slot is None:
+                if existing is not None and available_slots:
+                    slot = min(
+                        available_slots,
+                        key=lambda candidate: (
+                            int(candidate % self.config.exploration_sector_count != existing.sector_index),
+                            abs(candidate % band_count - existing.stage),
+                            candidate,
+                        ),
+                    )
+                    available_slots.remove(slot)
+                else:
+                    slot = available_slots.pop(0)
+                changed = True
+            sector_index = slot % self.config.exploration_sector_count
+            stage = slot % band_count
             mission = self.memory.unit_missions.get(worker.id)
             target = (
                 mission.target
                 if mission is not None and mission.mission is UnitMission.EXPLORE
-                else None
+                else None if existing is None else existing.target
+            )
+            slot_changed = bool(
+                existing is None
+                or existing.slot != slot
+                or existing.sector_index != sector_index
+                or existing.stage != stage
+                or existing.coverage_version < 1
+                or not existing.scout_eligible
+            )
+            if (
+                slot_changed
+                or target is not None
+                and manhattan(target, core_position) > max_radius
+                or target is not None
+                and scout_sector_index(core_position, target) != sector_index
+                and (
+                    existing is None
+                    or existing.phase is not WorkerScoutPhase.RETURN_TO_BAND
+                )
+            ):
+                target = None
+            phase = (
+                WorkerScoutPhase.RETURN_TO_BAND
+                if manhattan(worker.position, core_position) > max_radius
+                else (
+                    WorkerScoutPhase.SECTOR_SCOUT
+                    if existing is None
+                    else existing.phase
+                )
             )
             if existing is None:
                 self.memory.worker_scout_states[worker.id] = WorkerScoutState(
                     worker_id=worker.id,
-                    slot=next_slot,
-                    sector_index=(next_slot // band_count) % 8,
-                    stage=next_slot % band_count,
-                    phase=(
-                        WorkerScoutPhase.RETURN_TO_BAND
-                        if manhattan(worker.position, core_position) > max_radius
-                        else WorkerScoutPhase.SECTOR_SCOUT
-                    ),
+                    slot=slot,
+                    sector_index=sector_index,
+                    stage=stage,
+                    phase=phase,
                     target=target,
                     assigned_tick=tick if mission is None else mission.assigned_tick,
+                    scout_eligible=True,
+                    coverage_version=1,
+                    lease_until=tick + self.config.exploration_assignment_lease_ticks,
                 )
             else:
                 self.memory.worker_scout_states[worker.id] = replace(
                     existing,
-                    slot=next_slot,
-                    sector_index=(next_slot // band_count) % 8,
-                    stage=next_slot % band_count,
-                    phase=(
-                        WorkerScoutPhase.RETURN_TO_BAND
-                        if manhattan(worker.position, core_position) > max_radius
-                        else WorkerScoutPhase.SECTOR_SCOUT
+                    slot=slot,
+                    sector_index=sector_index,
+                    stage=stage,
+                    phase=phase,
+                    target=target,
+                    assigned_tick=(
+                        tick if target is None else existing.assigned_tick
                     ),
-                    target=None,
-                    assigned_tick=tick,
-                    best_route_cost=None,
-                    stalled_ticks=0,
+                    best_route_cost=(
+                        None if target is None else existing.best_route_cost
+                    ),
+                    stalled_ticks=(0 if target is None else existing.stalled_ticks),
+                    scout_eligible=True,
+                    coverage_version=1,
+                    lease_until=(
+                        tick + self.config.exploration_assignment_lease_ticks
+                        if slot_changed
+                        else max(existing.lease_until, tick)
+                    ),
                 )
-            used_slots.add(next_slot)
+            if slot_changed:
+                self.memory.scout_return_route_leases.pop(worker.id, None)
+        if changed:
+            self.memory.scout_assignment_last_rebalance_tick = tick
 
     @staticmethod
     def _clear_scout_target(
@@ -3766,6 +3924,20 @@ class WorkerPlanner:
     ) -> None:
         if state.target is None:
             return
+        target_visible = scout_visible_cells(
+            state.target,
+            world.known_obstacles,
+        )
+        claimed_visible: set[Position] = set()
+        for post in claimed:
+            claimed_visible.update(
+                scout_visible_cells(post, world.known_obstacles)
+            )
+        state = replace(
+            state,
+            visible_gain=len(target_visible - claimed_visible),
+            overlap_cells=len(target_visible & claimed_visible),
+        )
         claimed.add(state.target)
         self.memory.worker_scout_states[worker.id] = state
         mission = (
@@ -3824,6 +3996,7 @@ class WorkerPlanner:
                 limit=min(12, self.config.exploration_candidate_limit),
                 backoff=frozenset(self.memory.target_backoff_until),
                 claimed=frozenset(claimed),
+                max_radius=self.config.exploration_sector_radii[-1],
             )
             for candidate in candidates[:3]:
                 use_local_segment = (
@@ -3879,58 +4052,187 @@ class WorkerPlanner:
         state: WorkerScoutState,
         claimed: set[Position],
         blocked: frozenset[Position],
+        costs: dict[Position, int],
     ):
-        """Choose a proved route back to this Worker's fixed patrol layer."""
+        """Choose a proved risk-weighted route back to the assigned ring."""
 
         assert world.core is not None
         radius = self.config.exploration_sector_radii[state.stage]
         core = world.core.destination or world.core.position
-        candidates = tuple(
-            cell
-            for cell in manhattan_ring(core, radius)
-            if cell in world.known_passable
-            and cell not in blocked
-            and cell not in claimed
-        )
-        ordered = sorted(
-            candidates,
-            key=lambda cell: (
-                manhattan(worker.position, cell),
-                self.memory.congestion_counts.get(cell, 0),
-                cell,
-            ),
-        )
-        selected = next(
-            (
-                (target, route)
-                for target in ordered[:12]
-                if (
-                    route := self._alert_exploration_step(
-                        world,
-                        projection,
-                        worker,
-                        target,
-                        blocked,
-                    )
+        max_radius = self.config.exploration_sector_radii[-1]
+        previous = self.memory.scout_return_route_leases.get(worker.id)
+        effective_blocked = set(blocked)
+        if (
+            previous is not None
+            and previous.blocked_edge is not None
+            and world.tick <= previous.backoff_until
+            and worker.position == previous.blocked_edge[0]
+        ):
+            effective_blocked.add(previous.blocked_edge[1])
+        effective_blocked.discard(worker.position)
+
+        candidates: list[Position] = []
+        if (
+            state.target is not None
+            and state.target in world.known_passable
+            and state.target not in effective_blocked
+            and state.target not in claimed
+            and manhattan(core, state.target) <= max_radius
+            and abs(manhattan(core, state.target) - radius) <= 3
+            and self.memory.target_backoff_until.get(state.target, -1) < world.tick
+        ):
+            candidates.append(state.target)
+        sector_order = [state.sector_index]
+        for offset in range(1, self.config.exploration_sector_count // 2 + 1):
+            sector_order.extend(
+                (
+                    (state.sector_index + offset)
+                    % self.config.exploration_sector_count,
+                    (state.sector_index - offset)
+                    % self.config.exploration_sector_count,
                 )
-                is not None
-                and route.first_direction is not None
-            ),
-            None,
+            )
+        for sector_index in sector_order:
+            rows = sector_scout_candidates(
+                world,
+                core,
+                sector_index=sector_index,
+                radius=radius,
+                tick=world.tick,
+                refresh_ticks=self.config.exploration_refresh_ticks,
+                limit=min(16, self.config.exploration_candidate_limit),
+                backoff=frozenset(self.memory.target_backoff_until),
+                claimed=frozenset(claimed),
+                max_radius=max_radius,
+            )
+            candidates.extend(cell for cell in rows if cell not in candidates)
+            if len(candidates) >= 16:
+                break
+        rows = []
+        sticky_target_ready = bool(
+            state.target is not None
+            and candidates
+            and candidates[0] == state.target
+            and (
+                previous is None
+                or previous.stalled_ticks
+                < self.config.exploration_return_stall_ticks
+            )
         )
-        if selected is None:
+        candidate_scan_limit = 1 if sticky_target_ready else 6
+        for target in candidates[:candidate_scan_limit]:
+            full_route = weighted_route_to(
+                world,
+                worker.position,
+                target,
+                node_limit=self.config.path_node_limit,
+                blocked=frozenset(effective_blocked),
+                cell_costs=costs,
+            )
+            waypoint = target
+            segmented = False
+            route = full_route
+            if route is None:
+                progress = weighted_progress_route(
+                    world,
+                    worker.position,
+                    target,
+                    node_limit=self.config.path_node_limit,
+                    blocked=frozenset(effective_blocked),
+                    cell_costs=costs,
+                )
+                if progress is None:
+                    continue
+                route, waypoint = progress
+                segmented = True
+            if route.first_direction is None or route.first_position is None:
+                continue
+            viability = move_viability(
+                world,
+                worker.position,
+                route.first_position,
+                target=waypoint,
+                blocked=frozenset(effective_blocked),
+                node_limit=self.config.path_node_limit,
+                require_continuation=True,
+            )
+            if not viability.viable:
+                continue
+            estimate = (
+                route.distance + manhattan(waypoint, target)
+                if segmented
+                else route.distance
+            )
+            route = Route(
+                route.distance,
+                route.first_direction,
+                route.first_position,
+                viability,
+            )
+            rows.append(
+                (
+                    (
+                        int(state.target is None or target != state.target),
+                        int(segmented),
+                        estimate,
+                        self.memory.congestion_counts.get(target, 0),
+                        target,
+                    ),
+                    target,
+                    route,
+                    waypoint,
+                    estimate,
+                )
+            )
+        if not rows:
             return None
-        target, route = selected
+        rows.sort(key=lambda row: row[0])
+        _, target, route, waypoint, estimate = rows[0]
+        stalled = 0
+        route_version = 0 if previous is None else previous.route_version
+        if previous is not None and previous.target == target:
+            progressed = bool(
+                previous.last_route_distance is None
+                or estimate < previous.last_route_distance
+            )
+            stalled = 0 if progressed else previous.stalled_ticks + 1
+            if (
+                stalled >= self.config.exploration_return_stall_ticks
+                and len(rows) > 1
+            ):
+                self.memory.target_backoff_until[target] = (
+                    world.tick + self.config.exploration_return_loop_backoff_ticks
+                )
+                _, target, route, waypoint, estimate = rows[1]
+                stalled = 0
+                route_version += 1
+        lease = ScoutReturnRouteLease(
+            worker_id=worker.id,
+            target=target,
+            waypoint=waypoint,
+            assigned_tick=(
+                previous.assigned_tick
+                if previous is not None and previous.target == target
+                else world.tick
+            ),
+            last_position=worker.position,
+            last_route_distance=estimate,
+            stalled_ticks=stalled,
+            route_version=route_version,
+            blocked_edge=(None if previous is None else previous.blocked_edge),
+            backoff_until=(0 if previous is None else previous.backoff_until),
+        )
+        self.memory.scout_return_route_leases[worker.id] = lease
         return (
             replace(
                 state,
                 phase=WorkerScoutPhase.RETURN_TO_BAND,
                 target=target,
-                assigned_tick=world.tick,
-                best_route_cost=route.distance,
-                stalled_ticks=0,
+                assigned_tick=lease.assigned_tick,
+                best_route_cost=estimate,
+                stalled_ticks=stalled,
                 backoff_until=0,
-                reachable_candidates=len(ordered),
+                reachable_candidates=len(rows),
             ),
             route,
         )
@@ -3961,6 +4263,11 @@ class WorkerPlanner:
                 or destination in world.known_obstacles
                 or destination in claimed
                 or destination not in world.known_passable
+                or (
+                    world.core is not None
+                    and manhattan(destination, world.core.position)
+                    > self.config.exploration_sector_radii[-1]
+                )
             ):
                 continue
             immediate, future, remembered = projection.worker_exposure(destination)
@@ -3986,6 +4293,11 @@ class WorkerPlanner:
                 immediate,
                 future,
                 remembered,
+                int(
+                    world.core is not None
+                    and scout_sector_index(world.core.position, destination)
+                    != state.sector_index
+                ),
                 -gain,
                 int(destination == previous),
                 self.memory.congestion_counts.get(destination, 0),
@@ -4143,6 +4455,16 @@ class WorkerPlanner:
         )
         blocked = set(projection.hostile_occupied)
         blocked.update(control_blocked)
+        # Once a Worker is outside a currently hard enemy-Core control zone,
+        # returning/exploring may route around it but may not cut back through
+        # the radius-8 clearing belt.  Workers already inside keep the normal
+        # radius-6 hard block so their disengage planner can lead them out.
+        for zone in self.memory.enemy_core_control_zones.values():
+            if (
+                zone.control_level is EnemyCoreControlLevel.HARD
+                and manhattan(actor.position, zone.center) > zone.clear_radius
+            ):
+                blocked.update(diamond(zone.center, zone.clear_radius))
         blocked.update(protected)
         blocked.update(projection.immediate_damage)
         blocked.discard(actor.position)
@@ -4204,7 +4526,14 @@ class WorkerPlanner:
 
     def _looping(self, unit_id):
         history = self.memory.position_history.get(unit_id, ())
-        for period in range(1, len(history) // self.config.loop_repeat_limit + 1):
+        for period in range(
+            1,
+            min(
+                self.config.worker_escape_max_loop_period,
+                len(history) // self.config.loop_repeat_limit,
+            )
+            + 1,
+        ):
             required = period * self.config.loop_repeat_limit
             if len(history) < required:
                 continue

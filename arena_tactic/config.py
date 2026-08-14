@@ -35,6 +35,11 @@ class TacticConfig:
     exploration_target_backoff_ticks: int = 16
     exploration_scout_hold_ticks: int = 64
     exploration_stall_ticks: int = 3
+    exploration_sector_count: int = 8
+    exploration_assignment_lease_ticks: int = 64
+    exploration_rebalance_cooldown_ticks: int = 8
+    exploration_return_stall_ticks: int = 2
+    exploration_return_loop_backoff_ticks: int = 8
     # Empty Workers refresh a useful home vision belt.  They are scouts, not
     # disposable expedition units: their stable UUID slot never grows beyond
     # the 30-cell outer band.
@@ -204,6 +209,11 @@ class TacticConfig:
             self.exploration_target_backoff_ticks,
             self.exploration_scout_hold_ticks,
             self.exploration_stall_ticks,
+            self.exploration_sector_count,
+            self.exploration_assignment_lease_ticks,
+            self.exploration_rebalance_cooldown_ticks,
+            self.exploration_return_stall_ticks,
+            self.exploration_return_loop_backoff_ticks,
             self.exploration_sector_step,
             self.resource_memory_ttl,
             self.resource_assignment_persistence_bonus,
@@ -352,6 +362,8 @@ class TacticConfig:
             != self.exploration_sector_radii
         ):
             raise ValueError("exploration sector radii must be unique and ordered")
+        if self.exploration_sector_count != 8:
+            raise ValueError("the current scout geometry requires eight sectors")
         if not 1 <= self.recovery_urgent_percent <= 100:
             raise ValueError("recovery threshold must be within 1..100")
         if self.worker_escape_clearance_radius <= self.worker_escape_trigger_radius:

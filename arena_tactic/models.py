@@ -1063,6 +1063,31 @@ class WorkerScoutState:
     backoff_until: int = 0
     last_scan_tick: int | None = None
     reachable_candidates: int = 0
+    # Schema 17 assigns slots only among Workers that are actually available
+    # for scouting.  ``coverage_version`` distinguishes those slots from the
+    # legacy all-Worker numbering without making old in-memory constructors
+    # invalid.
+    scout_eligible: bool = True
+    coverage_version: int = 1
+    lease_until: int = 0
+    visible_gain: int = 0
+    overlap_cells: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ScoutReturnRouteLease:
+    """Short-lived proof that a remote scout is progressing toward its band."""
+
+    worker_id: UUID
+    target: Position
+    waypoint: Position | None
+    assigned_tick: int
+    last_position: Position
+    last_route_distance: int | None
+    stalled_ticks: int = 0
+    route_version: int = 0
+    blocked_edge: tuple[Position, Position] | None = None
+    backoff_until: int = 0
 
 
 @dataclass(frozen=True, slots=True)

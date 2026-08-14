@@ -139,7 +139,7 @@ class PublicContractTests(unittest.TestCase):
 
         trace = tactic.last_decision_trace
 
-        self.assertEqual(trace["schema_version"], 44)
+        self.assertEqual(trace["schema_version"], 45)
         self.assertIn("resolution", trace)
         self.assertIn("world", trace)
         global_map = trace["world"]["global_map"]

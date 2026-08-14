@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from math import ceil
+from math import atan2, ceil, pi
 
 from arena_hero import UnitType
 
@@ -20,6 +20,7 @@ from .models import (
 )
 from .projection import TacticalMap
 from .geometry import manhattan
+from .planning import scout_visible_cells
 from .rules import UNIT_MAX_HP
 from .schema import STRATEGY_LOG_SCHEMA_VERSION
 from .state import TacticMemory
@@ -519,6 +520,57 @@ class DecisionTraceBuilder:
             progress.stalled_ticks >= 2
             for progress in self.memory.service_cargo_route_progress.values()
         )
+        active_scouts = tuple(
+            (worker_id, state)
+            for worker_id, state in self.memory.worker_scout_states.items()
+            if state.scout_eligible
+            and (unit := world.friendly(worker_id)) is not None
+            and unit.unit_type is UnitType.WORKER
+            and unit.cargo == 0
+            and unit.hp >= UNIT_MAX_HP[UnitType.WORKER]
+        )
+        scout_sector_counts = Counter(
+            state.sector_index for _, state in active_scouts
+        )
+        scout_posts = tuple(
+            state.target
+            for _, state in active_scouts
+            if state.target is not None
+        )
+        annulus_cells = (
+            frozenset(
+                cell
+                for cell in world.known_passable
+                if core_position is not None
+                and self.config.exploration_sector_radii[0] - 3
+                <= manhattan(cell, core_position)
+                <= scout_limit + 3
+            )
+            if core_position is not None
+            else frozenset()
+        )
+        coverage_counts: Counter[tuple[int, int]] = Counter()
+        for post in scout_posts:
+            coverage_counts.update(
+                scout_visible_cells(post, world.known_obstacles) & annulus_cells
+            )
+        covered_cells = len(coverage_counts)
+        overlap_cells = sum(count > 1 for count in coverage_counts.values())
+        angles = (
+            sorted(
+                (atan2(post[1] - core_position[1], post[0] - core_position[0]) + 2 * pi)
+                % (2 * pi)
+                for post in scout_posts
+            )
+            if core_position is not None
+            else []
+        )
+        angular_gaps = (
+            [angles[index + 1] - angles[index] for index in range(len(angles) - 1)]
+            + [angles[0] + 2 * pi - angles[-1]]
+            if angles
+            else []
+        )
         return {
             "workers": workers,
             "worker_target": ceil(
@@ -595,6 +647,28 @@ class DecisionTraceBuilder:
                 "cargo_workers_beyond_12": cargo_beyond_staging,
                 "worker_periodic_cycles": worker_cycle_count,
                 "cargo_return_stalls": cargo_stall_count,
+                "active_scouts": len(active_scouts),
+                "scout_sector_counts": [
+                    scout_sector_counts.get(index, 0)
+                    for index in range(self.config.exploration_sector_count)
+                ],
+                "scout_annulus_cells": len(annulus_cells),
+                "scout_covered_cells": covered_cells,
+                "scout_coverage_percent": (
+                    round(covered_cells * 100 / len(annulus_cells), 2)
+                    if annulus_cells
+                    else 0.0
+                ),
+                "scout_overlap_percent": (
+                    round(overlap_cells * 100 / covered_cells, 2)
+                    if covered_cells
+                    else 0.0
+                ),
+                "scout_max_angular_gap_degrees": (
+                    round(max(angular_gaps) * 180 / pi, 2)
+                    if angular_gaps
+                    else None
+                ),
             },
             "worker_home_guard_radii": list(
                 sorted(
@@ -745,6 +819,37 @@ class DecisionTraceBuilder:
                     "stalled_ticks": state.stalled_ticks,
                     "backoff_until": state.backoff_until,
                     "reachable_candidates": state.reachable_candidates,
+                    "scout_eligible": state.scout_eligible,
+                    "coverage_version": state.coverage_version,
+                    "lease_until": state.lease_until,
+                    "visible_gain": state.visible_gain,
+                    "overlap_cells": state.overlap_cells,
+                    "return_route": (
+                        None
+                        if (
+                            lease := self.memory.scout_return_route_leases.get(
+                                worker_id
+                            )
+                        )
+                        is None
+                        else {
+                            "target": list(lease.target),
+                            "waypoint": (
+                                None
+                                if lease.waypoint is None
+                                else list(lease.waypoint)
+                            ),
+                            "remaining_distance": lease.last_route_distance,
+                            "stalled_ticks": lease.stalled_ticks,
+                            "route_version": lease.route_version,
+                            "blocked_edge": (
+                                None
+                                if lease.blocked_edge is None
+                                else [list(cell) for cell in lease.blocked_edge]
+                            ),
+                            "backoff_until": lease.backoff_until,
+                        }
+                    ),
                     "scan_budget": (
                         "GRANTED"
                         if state.last_scan_tick == world.tick

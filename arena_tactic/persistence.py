@@ -243,6 +243,11 @@ class ExplorationMemoryStore:
                     "backoff_until": state.backoff_until,
                     "last_scan_tick": state.last_scan_tick,
                     "reachable_candidates": state.reachable_candidates,
+                    "scout_eligible": state.scout_eligible,
+                    "coverage_version": state.coverage_version,
+                    "lease_until": state.lease_until,
+                    "visible_gain": state.visible_gain,
+                    "overlap_cells": state.overlap_cells,
                 }
                 for worker_id, state in sorted(
                     memory.worker_scout_states.items(),
@@ -619,8 +624,15 @@ class ExplorationMemoryStore:
                     last_scan_tick = None
                 slot = integer_fields["slot"]
                 band_count = len(self.config.exploration_sector_radii)
-                stage = slot % band_count
-                sector_index = (slot // band_count) % 8
+                if schema >= 17:
+                    stage = integer_fields["stage"] % band_count
+                    sector_index = (
+                        integer_fields["sector_index"]
+                        % self.config.exploration_sector_count
+                    )
+                else:
+                    stage = slot % band_count
+                    sector_index = (slot // band_count) % 8
                 if (
                     target is not None
                     and memory.core_position is not None
@@ -635,7 +647,7 @@ class ExplorationMemoryStore:
                     stage=stage,
                     phase=(
                         WorkerScoutPhase.SECTOR_SCOUT
-                        if schema < 15 or target is None
+                        if schema < 15
                         else phase
                     ),
                     target=target,
@@ -645,6 +657,37 @@ class ExplorationMemoryStore:
                     backoff_until=integer_fields["backoff_until"],
                     last_scan_tick=last_scan_tick,
                     reachable_candidates=integer_fields["reachable_candidates"],
+                    scout_eligible=(
+                        bool(raw.get("scout_eligible")) if schema >= 17 else True
+                    ),
+                    coverage_version=(
+                        raw.get("coverage_version")
+                        if schema >= 17
+                        and isinstance(raw.get("coverage_version"), int)
+                        and not isinstance(raw.get("coverage_version"), bool)
+                        else 0
+                    ),
+                    lease_until=(
+                        raw.get("lease_until")
+                        if schema >= 17
+                        and isinstance(raw.get("lease_until"), int)
+                        and not isinstance(raw.get("lease_until"), bool)
+                        else 0
+                    ),
+                    visible_gain=(
+                        raw.get("visible_gain")
+                        if schema >= 17
+                        and isinstance(raw.get("visible_gain"), int)
+                        and not isinstance(raw.get("visible_gain"), bool)
+                        else 0
+                    ),
+                    overlap_cells=(
+                        raw.get("overlap_cells")
+                        if schema >= 17
+                        and isinstance(raw.get("overlap_cells"), int)
+                        and not isinstance(raw.get("overlap_cells"), bool)
+                        else 0
+                    ),
                 )
 
         decay_tick = payload.get("last_congestion_decay_tick")

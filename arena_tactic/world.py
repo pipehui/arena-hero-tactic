@@ -383,6 +383,17 @@ def _sync_core_identity(
                 *memory.core_position_history,
                 turn.core.position,
             )[-4:]
+            for worker_id, state in tuple(memory.worker_scout_states.items()):
+                memory.worker_scout_states[worker_id] = replace(
+                    state,
+                    target=None,
+                    assigned_tick=turn.tick,
+                    best_route_cost=None,
+                    stalled_ticks=0,
+                    lease_until=0,
+                )
+            memory.scout_return_route_leases.clear()
+            memory.scout_assignment_last_rebalance_tick = None
         memory.core_position = turn.core.position
 
     _sync_events(turn, memory, config)
@@ -531,6 +542,9 @@ def _sync_friendly_memory(
     for unit_id in tuple(memory.worker_scout_states):
         if unit_id not in living_ids:
             memory.worker_scout_states.pop(unit_id, None)
+    for unit_id in tuple(memory.scout_return_route_leases):
+        if unit_id not in living_ids:
+            memory.scout_return_route_leases.pop(unit_id, None)
     for unit_id in tuple(memory.worker_task_progress):
         if unit_id not in living_ids:
             memory.worker_task_progress.pop(unit_id, None)

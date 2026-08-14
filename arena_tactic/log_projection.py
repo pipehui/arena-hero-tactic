@@ -274,6 +274,11 @@ def _compact_economy(value: Any) -> dict[str, Any]:
                     "target_core_distance",
                     "return_to_band",
                     "stalled_ticks",
+                    "scout_eligible",
+                    "coverage_version",
+                    "visible_gain",
+                    "overlap_cells",
+                    "return_route",
                     "action",
                     "reason",
                 )

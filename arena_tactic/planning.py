@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from heapq import heappop, heappush
+from math import atan2, pi
 from collections.abc import Mapping
 from uuid import UUID
 
@@ -16,6 +17,7 @@ from .geometry import (
     manhattan,
     ranger_firing_positions,
     ranger_line_is_clear,
+    vision_is_clear,
 )
 from .models import RaidDistanceBand, SiegeApproachPlan, WorldModel
 
@@ -788,6 +790,30 @@ _SCOUT_SECTORS: tuple[tuple[int, int], ...] = (
 )
 
 
+def scout_visible_cells(
+    origin: Position,
+    obstacles: frozenset[Position],
+    *,
+    radius: int = 3,
+) -> frozenset[Position]:
+    """Return the official obstacle-aware Worker vision footprint."""
+
+    return frozenset(
+        cell
+        for cell in diamond(origin, radius)
+        if cell not in obstacles and vision_is_clear(origin, cell, obstacles)
+    )
+
+
+def scout_sector_index(core: Position, cell: Position) -> int:
+    """Map a grid position to the nearest N/NE/E/... scout sector."""
+
+    if cell == core:
+        return 0
+    angle = (atan2(cell[1] - core[1], cell[0] - core[0]) + pi / 2) % (2 * pi)
+    return int((angle + pi / 8) // (pi / 4)) % len(_SCOUT_SECTORS)
+
+
 def sector_scout_candidates(
     world: WorldModel,
     core: Position,
@@ -799,6 +825,7 @@ def sector_scout_candidates(
     limit: int,
     backoff: frozenset[Position],
     claimed: frozenset[Position],
+    max_radius: int | None = None,
 ) -> tuple[Position, ...]:
     """Return deterministic targets around a stable sector/radius waypoint.
 
@@ -832,6 +859,11 @@ def sector_scout_candidates(
             rel_x, rel_y = cell[0] - core[0], cell[1] - core[1]
             if (
                 rel_x * dx + rel_y * dy <= 0
+                or (
+                    max_radius is not None
+                    and manhattan(core, cell) > max_radius
+                )
+                or abs(manhattan(core, cell) - radius) > 3
                 or cell in world.known_obstacles
                 or cell in backoff
                 or cell in claimed
@@ -857,15 +889,45 @@ def sector_scout_candidates(
             cell,
         ),
     )[: max(32, limit * 4)]
+    obstacles = world.known_obstacles
+    claimed_visible: set[Position] = set()
+    for post in claimed:
+        claimed_visible.update(scout_visible_cells(post, obstacles))
+
+    def freshness(cell: Position) -> int:
+        last = last_visible.get(cell)
+        if last is None:
+            return 4
+        age = tick - last
+        if age >= refresh_ticks:
+            return 2
+        if age >= refresh_ticks // 2:
+            return 1
+        return 0
+
+    coverage_scores: dict[Position, tuple[int, int]] = {}
+
+    def coverage_score(cell: Position) -> tuple[int, int]:
+        cached = coverage_scores.get(cell)
+        if cached is not None:
+            return cached
+        visible = scout_visible_cells(cell, obstacles)
+        cached = (
+            sum(
+                freshness(seen)
+                for seen in visible
+                if seen not in claimed_visible
+            ),
+            len(visible & claimed_visible),
+        )
+        coverage_scores[cell] = cached
+        return cached
+
     scored = sorted(
         shortlist,
         key=lambda cell: (
-            -information_gain(
-                cell,
-                tick=tick,
-                last_visible=last_visible,
-                refresh_ticks=refresh_ticks,
-            ),
+            -coverage_score(cell)[0],
+            coverage_score(cell)[1],
             manhattan(cell, nominal),
             abs(manhattan(core, cell) - radius),
             last_visible.get(cell, -1),

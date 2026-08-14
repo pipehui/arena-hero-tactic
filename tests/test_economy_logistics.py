@@ -19,6 +19,7 @@ from arena_tactic import (
     BalancedTactic,
     CrisisForceBaseline,
     PatientAdmissionProgress,
+    ScoutReturnRouteLease,
     TacticConfig,
     TacticMemory,
     ThreatHeatCell,
@@ -3597,6 +3598,8 @@ class EconomyAndLogisticsTests(unittest.TestCase):
                 resources=0,
             )
         )
+        self.assertIn(uid(1), tactic.memory.worker_scout_states)
+        self.assertNotIn(uid(2), tactic.memory.worker_scout_states)
         tactic.choose_actions(
             make_turn(
                 tick=2,
@@ -3622,6 +3625,214 @@ class EconomyAndLogisticsTests(unittest.TestCase):
 
         slots = [state.slot for state in tactic.memory.worker_scout_states.values()]
         self.assertEqual(len(slots), len(set(slots)))
+
+    def test_active_empty_scouts_are_balanced_across_all_eight_sectors(self) -> None:
+        workers = tuple(
+            unit(index, UnitType.WORKER, ((index % 5) - 2, index // 5 + 2))
+            for index in range(1, 21)
+        )
+        tactic = BalancedTactic()
+
+        tactic.choose_actions(make_turn(tick=1, units=workers, resources=0))
+
+        states = tuple(tactic.memory.worker_scout_states.values())
+        sector_counts = Counter(state.sector_index for state in states)
+        stage_counts = Counter(state.stage for state in states)
+        self.assertEqual(len(states), 20)
+        self.assertEqual(set(sector_counts), set(range(8)))
+        self.assertLessEqual(max(sector_counts.values()) - min(sector_counts.values()), 1)
+        self.assertLessEqual(max(stage_counts.values()) - min(stage_counts.values()), 1)
+        self.assertTrue(all(state.scout_eligible for state in states))
+
+    def test_twenty_scouts_form_a_low_overlap_obstacle_aware_ring(self) -> None:
+        core = friendly_core(position=(0, 0))
+        workers = tuple(
+            unit(index, UnitType.WORKER, ((index % 5) - 2, index // 5 + 2))
+            for index in range(1, 21)
+        )
+        memory = TacticMemory(
+            core_id=core.id,
+            core_position=core.position,
+            opening_complete=True,
+        )
+        memory.known_passable.update(
+            (x, y) for x in range(-35, 36) for y in range(-35, 36)
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(
+            make_turn(tick=1, core=core, units=workers, resources=0)
+        )
+
+        states = tuple(
+            state
+            for state in tactic.memory.worker_scout_states.values()
+            if state.scout_eligible
+        )
+        metrics = tactic.last_decision_trace["economy"]["worker_activity_metrics"]
+        self.assertTrue(
+            all(
+                state.target is not None
+                and manhattan(core.position, state.target) <= 30
+                for state in states
+            )
+        )
+        self.assertGreaterEqual(metrics["scout_coverage_percent"], 25.0)
+        self.assertLessEqual(metrics["scout_overlap_percent"], 15.0)
+        self.assertLessEqual(metrics["scout_max_angular_gap_degrees"], 45.0)
+
+    def test_cargo_worker_does_not_reserve_an_active_scout_sector(self) -> None:
+        workers = tuple(
+            unit(index, UnitType.WORKER, (index, 1), cargo=(1 if index == 9 else 0))
+            for index in range(1, 10)
+        )
+        tactic = BalancedTactic()
+
+        tactic.choose_actions(make_turn(tick=1, units=workers, resources=0))
+
+        active = tuple(
+            state
+            for state in tactic.memory.worker_scout_states.values()
+            if state.scout_eligible
+        )
+        self.assertEqual(len(active), 8)
+        self.assertEqual({state.sector_index for state in active}, set(range(8)))
+        self.assertNotIn(uid(9), tactic.memory.worker_scout_states)
+
+    def test_return_to_band_uses_real_path_instead_of_reversing_at_a_wall(self) -> None:
+        core = friendly_core(position=(0, 0))
+        worker_id = uid(1)
+        memory = TacticMemory(
+            core_id=core.id,
+            core_position=core.position,
+            worker_scout_states={
+                worker_id: WorkerScoutState(
+                    worker_id=worker_id,
+                    slot=0,
+                    sector_index=0,
+                    stage=0,
+                    phase=WorkerScoutPhase.RETURN_TO_BAND,
+                    target=(0, -20),
+                    assigned_tick=1,
+                )
+            },
+            opening_complete=True,
+        )
+        memory.known_passable.update(
+            (x, y) for x in range(-4, 5) for y in range(-34, 2)
+        )
+        memory.known_obstacles.add((0, -31))
+        tactic = BalancedTactic(memory=memory)
+        first = make_turn(
+            tick=2,
+            core=core,
+            units=(unit(1, UnitType.WORKER, (0, -32)),),
+            obstacle_cells=((0, -31),),
+            resources=0,
+        )
+
+        tactic.choose_actions(first)
+        first_action = first.plan.unit_actions[worker_id]
+        self.assertIsInstance(first_action, MoveAction)
+        self.assertEqual(first_action.direction, Direction.LEFT)
+
+        second = make_turn(
+            tick=3,
+            core=core,
+            units=(unit(1, UnitType.WORKER, (-1, -32)),),
+            obstacle_cells=((0, -31),),
+            resources=0,
+        )
+        tactic.choose_actions(second)
+        second_action = second.plan.unit_actions[worker_id]
+        self.assertIsInstance(second_action, MoveAction)
+        self.assertEqual(second_action.direction, Direction.DOWN)
+        self.assertNotEqual(second_action.direction, Direction.RIGHT)
+
+    def test_return_phase_stays_sticky_after_crossing_inside_radius_thirty(self) -> None:
+        core = friendly_core(position=(0, 0))
+        worker = unit(1, UnitType.WORKER, (0, -29))
+        memory = TacticMemory(
+            core_id=core.id,
+            core_position=core.position,
+            worker_scout_states={
+                worker.id: WorkerScoutState(
+                    worker_id=worker.id,
+                    slot=0,
+                    sector_index=0,
+                    stage=0,
+                    phase=WorkerScoutPhase.RETURN_TO_BAND,
+                    target=(0, -20),
+                    assigned_tick=1,
+                )
+            },
+            opening_complete=True,
+        )
+        memory.known_passable.update(
+            (x, y) for x in range(-3, 4) for y in range(-32, 2)
+        )
+        tactic = BalancedTactic(memory=memory)
+        turn = make_turn(tick=2, core=core, units=(worker,), resources=0)
+
+        tactic.choose_actions(turn)
+
+        state = tactic.memory.worker_scout_states[worker.id]
+        task = next(
+            row
+            for row in tactic.last_decision_trace["tasks"]
+            if row["actor_id"] == str(worker.id)
+        )
+        self.assertEqual(state.phase, WorkerScoutPhase.RETURN_TO_BAND)
+        self.assertEqual(state.target, (0, -20))
+        self.assertEqual(task["mission"], UnitMission.RETURN_TO_SCOUT_BAND.value)
+
+    def test_return_loop_backs_off_the_next_reverse_edge(self) -> None:
+        core = friendly_core(position=(0, 0))
+        worker = unit(1, UnitType.WORKER, (0, -32))
+        target = (0, -20)
+        memory = TacticMemory(
+            core_id=core.id,
+            core_position=core.position,
+            worker_scout_states={
+                worker.id: WorkerScoutState(
+                    worker_id=worker.id,
+                    slot=0,
+                    sector_index=0,
+                    stage=0,
+                    phase=WorkerScoutPhase.RETURN_TO_BAND,
+                    target=target,
+                    assigned_tick=1,
+                )
+            },
+            scout_return_route_leases={
+                worker.id: ScoutReturnRouteLease(
+                    worker_id=worker.id,
+                    target=target,
+                    waypoint=target,
+                    assigned_tick=1,
+                    last_position=worker.position,
+                    last_route_distance=12,
+                )
+            },
+            opening_complete=True,
+        )
+        memory.position_history[worker.id] = (
+            (-1, -32),
+            (0, -32),
+            (-1, -32),
+        )
+        memory.known_passable.update(
+            (x, y) for x in range(-4, 5) for y in range(-34, 2)
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(
+            make_turn(tick=5, core=core, units=(worker,), resources=0)
+        )
+
+        lease = tactic.memory.scout_return_route_leases[worker.id]
+        self.assertEqual(lease.blocked_edge, ((0, -32), (-1, -32)))
+        self.assertGreaterEqual(lease.backoff_until, 13)
 
 
 if __name__ == "__main__":

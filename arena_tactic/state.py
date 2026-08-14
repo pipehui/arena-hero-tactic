@@ -36,6 +36,7 @@ from .models import (
     ShotFeedback,
     ShotPlan,
     ScreeningGroupState,
+    ScoutReturnRouteLease,
     ServiceMoveFeedback,
     ServiceTransitProgress,
     ServiceTransitRoute,
@@ -94,6 +95,10 @@ class TacticMemory:
     worker_escape_states: dict[UUID, WorkerEscapeState] = field(default_factory=dict)
     worker_disengage_leases: dict[UUID, WorkerDisengageLease] = field(default_factory=dict)
     worker_scout_states: dict[UUID, WorkerScoutState] = field(default_factory=dict)
+    scout_return_route_leases: dict[UUID, ScoutReturnRouteLease] = field(
+        default_factory=dict
+    )
+    scout_assignment_last_rebalance_tick: int | None = None
     worker_task_progress: dict[UUID, WorkerTaskProgress] = field(default_factory=dict)
     worker_resource_backoff: dict[tuple[UUID, Position], int] = field(default_factory=dict)
     manual_move_leases: dict[UUID, ManualMoveLease] = field(default_factory=dict)
@@ -252,6 +257,8 @@ class TacticMemory:
         self.worker_escape_states.clear()
         self.worker_disengage_leases.clear()
         self.worker_scout_states.clear()
+        self.scout_return_route_leases.clear()
+        self.scout_assignment_last_rebalance_tick = None
         self.worker_task_progress.clear()
         self.worker_resource_backoff.clear()
         self.engaged_enemy_until.clear()
