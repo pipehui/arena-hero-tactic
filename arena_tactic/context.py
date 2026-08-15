@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from arena_hero import Position
 
-from .models import CoreServiceQueue, WorldModel
+from .models import CoreServiceQueue, EconomyPolicyDecision, WorldModel
 from .projection import TacticalMap
 
 
@@ -15,6 +15,7 @@ class DecisionContext:
     world: WorldModel
     tactical_map: TacticalMap
     service: CoreServiceQueue
+    economy_policy: EconomyPolicyDecision
     protected_positions: frozenset[Position]
     core_starting_move: bool
     combat_active: bool

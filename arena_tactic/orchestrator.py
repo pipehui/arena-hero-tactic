@@ -109,6 +109,7 @@ class DecisionKernel:
             products.home_combat_assignment,
             products.counter_siege,
             context.combat_active,
+            context.economy_policy,
         )
         return world, resolution, trace
 
@@ -140,6 +141,7 @@ class DecisionKernel:
             (),
             None,
             (),
+            economy_policy=self.production.policy(world),
         )
         return world, resolution, trace
 
@@ -166,6 +168,7 @@ class DecisionKernel:
             core_starting_move=core_starting_move,
             projected_core_destination=core_move_target,
         )
+        economy_policy = self.production.policy(world)
         protected = service_protected_positions(world, service)
         visible_home_threat = any(
             enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
@@ -185,6 +188,7 @@ class DecisionKernel:
             world=world,
             tactical_map=tactical_map,
             service=service,
+            economy_policy=economy_policy,
             protected_positions=protected,
             core_starting_move=core_starting_move,
             combat_active=combat_active,
@@ -203,7 +207,12 @@ class DecisionKernel:
             world,
             projection,
         )
-        worker_intents = self.workers.intents(world, projection, service)
+        worker_intents = self.workers.intents(
+            world,
+            projection,
+            service,
+            context.economy_policy,
+        )
         egress_intents = self.service.combat_egress_intents(world, projection, service)
         recovery_intents = self.recovery.intents(world, projection, service)
         home_combat_assignment = self.combat.home_combat_assignment(
@@ -273,6 +282,7 @@ class DecisionKernel:
             projection,
             reserved_resources=service.reserved_resources,
             timeline=service.timeline,
+            policy=context.economy_policy,
         )
         intents.extend(production_intents)
         intents.extend(self._fallback_waits(world))

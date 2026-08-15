@@ -1,16 +1,17 @@
 from __future__ import annotations
 
-from collections import Counter
 from math import ceil
 
 from arena_hero import CoreState, UnitType, unit_cost
 
 from .combat import CombatPlanner
 from .config import TacticConfig
+from .economy import decide_economy_policy
 from .models import (
     ActionIntent,
     CoreOperationTimeline,
     CrisisForceBaseline,
+    EconomyPolicyDecision,
     EntitySnapshot,
     IntentAction,
     UnitMission,
@@ -41,9 +42,11 @@ class ProductionPlanner:
         *,
         reserved_resources: int = 0,
         timeline: CoreOperationTimeline | None = None,
+        policy: EconomyPolicyDecision | None = None,
     ) -> tuple[list[ActionIntent], tuple[dict[str, object], ...]]:
         if world.core is None or world.core.state is CoreState.MOVING:
             return [], ()
+        policy = policy or self.policy(world)
         if timeline is not None and not timeline.production_allowed:
             return [], (
                 {
@@ -54,10 +57,9 @@ class ProductionPlanner:
                     "spawn_egress": timeline.spawn_egress_cell,
                 },
             )
-        counts = Counter(unit.unit_type for unit in world.friendlies)
-        workers = counts[UnitType.WORKER]
-        vanguards = counts[UnitType.VANGUARD]
-        rangers = counts[UnitType.RANGER]
+        workers = policy.workers
+        vanguards = policy.vanguards
+        rangers = policy.rangers
         combat_enemies = tuple(
             enemy
             for enemy in world.enemies
@@ -82,23 +84,12 @@ class ProductionPlanner:
             for enemy in home_enemies
         )
         home_alert = self.memory.home_defense_alert_until >= world.tick
-        home_target = max(self.config.home_force_floor, self.memory.home_force_high_water)
+        home_target = policy.home_force_target
         combat_count = vanguards + rangers
-        mature_worker_target = self.config.stockpile_worker_target
-        mature_combat_target = max(
-            self.config.stockpile_combat_target,
-            home_target,
-        )
-        species_floor_missing = (
-            vanguards < self.config.minimum_vanguards
-            or rangers < self.config.minimum_rangers
-        )
-        stockpile_ready = bool(
-            world.population >= self.config.population_stockpile_threshold
-            and workers >= mature_worker_target
-            and combat_count >= mature_combat_target
-            and not species_floor_missing
-        )
+        mature_worker_target = policy.mature_worker_target
+        mature_combat_target = policy.mature_combat_target
+        species_floor_missing = not policy.species_ready
+        stockpile_ready = policy.mature_stockpile_ready
         next_worker_target = ceil(
             (world.population + 1) * self.config.worker_ratio_percent / 100
         )
@@ -181,6 +172,8 @@ class ProductionPlanner:
                 # From that point on, marginal production is intentionally
                 # suspended so the Core keeps its defensive reserve.
                 reason = "HIGH_POP_STOCKPILE"
+            elif not policy.normal_production_allowed:
+                reason = "WAIT_FOR_FULL_STORAGE"
             elif world.population < self.config.worker_only_population_threshold:
                 if workers < next_worker_target:
                     chosen = UnitType.WORKER
@@ -250,6 +243,21 @@ class ProductionPlanner:
             else:
                 reason = "HIGH_POP_STOCKPILE"
 
+        emergency_reasons = {
+            "OPENING_THREAT_INTERRUPT",
+            "CRISIS_REINFORCEMENT",
+            "POST_CRISIS_REBUILD",
+            "EMERGENCY_HOME_FORCE",
+        }
+        if (
+            chosen is not None
+            and not policy.normal_production_allowed
+            and reason not in emergency_reasons
+        ):
+            chosen = None
+            reinforcement_order = ()
+            reason = "WAIT_FOR_FULL_STORAGE"
+
         available = max(0, world.resources - reserved_resources)
         strategic_primary = chosen
         selection_order = reinforcement_order or (() if chosen is None else (chosen,))
@@ -280,6 +288,13 @@ class ProductionPlanner:
                 "reserved_for_recovery": reserved_resources,
                 "production_mode": reason,
                 "full_storage_gate": world.resources == world.resource_capacity,
+                "economy_phase": policy.phase,
+                "mature_stockpile_ready": policy.mature_stockpile_ready,
+                "normal_production_requires_full": (
+                    policy.normal_production_requires_full
+                ),
+                "normal_production_allowed": policy.normal_production_allowed,
+                "production_gate_reason": policy.production_gate_reason,
                 "crisis_phase": baseline.phase,
                 "pre_crisis_vanguards": baseline.vanguards,
                 "pre_crisis_rangers": baseline.rangers,
@@ -307,6 +322,9 @@ class ProductionPlanner:
                 reason=reason,
             )
         ], candidates
+
+    def policy(self, world: WorldModel) -> EconomyPolicyDecision:
+        return decide_economy_policy(self.config, self.memory, world)
 
     def _sync_crisis_baseline(
         self,

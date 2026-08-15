@@ -1160,7 +1160,11 @@ class EconomyAndLogisticsTests(unittest.TestCase):
             all(task["mission"] == "FULL_STORAGE_STAGING" for task in cargo_tasks)
         )
         self.assertTrue(empty_tasks)
-        self.assertTrue(all(task["mission"] == "EXPLORE" for task in empty_tasks))
+        self.assertTrue(all(task["mission"] == "HARVEST" for task in empty_tasks))
+        self.assertEqual(
+            tactic.memory.worker_economy_modes[workers[-1].id],
+            WorkerEconomyMode.RESOURCE_ACQUISITION,
+        )
         self.assertFalse(
             {
                 "RETURN_CARGO",
@@ -1451,7 +1455,7 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         self.assertIsInstance(turn.plan.core_action, SpawnAction)
         self.assertEqual(turn.plan.core_action.unit_type, UnitType.VANGUARD)
 
-    def test_population_35_does_not_mean_mature_force_stockpile(self) -> None:
+    def test_population_35_waits_for_exact_full_storage_before_normal_spawn(self) -> None:
         units = tuple(
             [unit(i, UnitType.WORKER, (20 + i, 0)) for i in range(1, 24)]
             + [unit(100 + i, UnitType.VANGUARD, (i, 5)) for i in range(1, 7)]
@@ -1462,11 +1466,73 @@ class EconomyAndLogisticsTests(unittest.TestCase):
 
         tactic.choose_actions(turn)
 
+        self.assertIsInstance(turn.plan.core_action, WaitAction)
+        candidates = tactic.last_decision_trace["economy"]["production_candidates"]
+        self.assertFalse(any(item["selected"] for item in candidates))
+        self.assertEqual(
+            {item["production_mode"] for item in candidates},
+            {"WAIT_FOR_FULL_STORAGE"},
+        )
+
+    def test_population_35_exact_full_storage_spawns_one_needed_unit(self) -> None:
+        units = tuple(
+            [unit(i, UnitType.WORKER, (20 + i, 0)) for i in range(1, 24)]
+            + [unit(100 + i, UnitType.VANGUARD, (i, 5)) for i in range(1, 7)]
+            + [unit(200 + i, UnitType.RANGER, (i, -5)) for i in range(1, 7)]
+        )
+        turn = make_turn(units=units, resources=175)
+        tactic = BalancedTactic(memory=TacticMemory(opening_complete=True))
+
+        tactic.choose_actions(turn)
+
         self.assertIsInstance(turn.plan.core_action, SpawnAction)
         self.assertEqual(turn.plan.core_action.unit_type, UnitType.VANGUARD)
         candidates = tactic.last_decision_trace["economy"]["production_candidates"]
         selected = next(item for item in candidates if item["selected"])
         self.assertEqual(selected["production_mode"], "MATURE_COMBAT_TARGET")
+
+    def test_population_25_and_69_wait_for_full_storage(self) -> None:
+        cases = (
+            tuple(
+                [unit(i, UnitType.WORKER, (20 + i, 0)) for i in range(1, 14)]
+                + [unit(100 + i, UnitType.VANGUARD, (i, 5)) for i in range(1, 7)]
+                + [unit(200 + i, UnitType.RANGER, (i, -5)) for i in range(1, 7)]
+            ),
+            tuple(
+                [unit(i, UnitType.WORKER, (40 + i, 0)) for i in range(1, 36)]
+                + [unit(100 + i, UnitType.VANGUARD, (i, 5)) for i in range(1, 18)]
+                + [unit(200 + i, UnitType.RANGER, (i, -5)) for i in range(1, 18)]
+            ),
+        )
+        for units in cases:
+            with self.subTest(population=len(units)):
+                turn = make_turn(
+                    units=units,
+                    resources=len(units) * 5 - 5,
+                )
+                tactic = BalancedTactic(
+                    memory=TacticMemory(opening_complete=True)
+                )
+
+                tactic.choose_actions(turn)
+
+                self.assertIsInstance(turn.plan.core_action, WaitAction)
+                self.assertEqual(
+                    tactic.last_decision_trace["economy"]["production_mode"],
+                    "WAIT_FOR_FULL_STORAGE",
+                )
+
+    def test_population_24_can_spawn_without_full_storage(self) -> None:
+        units = tuple(
+            [unit(i, UnitType.WORKER, (20 + i, 0)) for i in range(1, 13)]
+            + [unit(100 + i, UnitType.VANGUARD, (i, 5)) for i in range(1, 7)]
+            + [unit(200 + i, UnitType.RANGER, (i, -5)) for i in range(1, 7)]
+        )
+        turn = make_turn(units=units, resources=20)
+
+        BalancedTactic(memory=TacticMemory(opening_complete=True)).choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.core_action, SpawnAction)
 
     def test_mature_force_fills_missing_combat_before_stockpiling(self) -> None:
         units = tuple(
@@ -1537,6 +1603,75 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         self.assertEqual(economy["stockpile_combat_target"], 35)
         self.assertEqual(economy["stockpile_worker_gap"], 0)
         self.assertEqual(economy["stockpile_combat_gap"], 0)
+        self.assertTrue(economy["mature_stockpile_ready"])
+        self.assertTrue(economy["saturated_patrol_active"])
+        self.assertEqual(
+            tactic.memory.worker_economy_modes[units[0].id],
+            WorkerEconomyMode.SATURATED_PATROL,
+        )
+
+    def test_mature_patrol_uses_storage_hysteresis_but_releases_at_five_space(self) -> None:
+        units = tuple(
+            [unit(i, UnitType.WORKER, (40 + i, 0)) for i in range(1, 36)]
+            + [unit(100 + i, UnitType.VANGUARD, (i, 5)) for i in range(1, 19)]
+            + [unit(200 + i, UnitType.RANGER, (i, -5)) for i in range(1, 18)]
+        )
+        tactic = BalancedTactic(
+            memory=TacticMemory(opening_complete=True, home_force_high_water=22)
+        )
+
+        tactic.choose_actions(make_turn(tick=1, units=units, resources=350))
+        self.assertTrue(
+            tactic.last_decision_trace["economy"]["saturated_patrol_active"]
+        )
+
+        tactic.choose_actions(make_turn(tick=2, units=units, resources=349))
+        self.assertTrue(
+            tactic.last_decision_trace["economy"]["saturated_patrol_active"]
+        )
+        self.assertEqual(
+            tactic.memory.worker_economy_modes[units[0].id],
+            WorkerEconomyMode.SATURATED_PATROL,
+        )
+
+        tactic.choose_actions(make_turn(tick=3, units=units, resources=345))
+        self.assertFalse(
+            tactic.last_decision_trace["economy"]["saturated_patrol_active"]
+        )
+        self.assertEqual(
+            tactic.memory.worker_economy_modes[units[0].id],
+            WorkerEconomyMode.RESOURCE_SEARCH,
+        )
+
+    def test_dynamic_home_force_gap_blocks_mature_patrol_and_spawns_at_full(self) -> None:
+        units = tuple(
+            [unit(i, UnitType.WORKER, (40 + i, 0)) for i in range(1, 36)]
+            + [unit(100 + i, UnitType.VANGUARD, (i, 5)) for i in range(1, 19)]
+            + [unit(200 + i, UnitType.RANGER, (i, -5)) for i in range(1, 18)]
+        )
+        tactic = BalancedTactic(
+            memory=TacticMemory(
+                core_id=uid(10_000),
+                core_position=(0, 0),
+                opening_complete=True,
+                home_force_high_water=40,
+            )
+        )
+        turn = make_turn(units=units, resources=350)
+
+        tactic.choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.core_action, SpawnAction)
+        self.assertFalse(
+            tactic.last_decision_trace["economy"]["mature_stockpile_ready"]
+        )
+        self.assertFalse(
+            tactic.last_decision_trace["economy"]["saturated_patrol_active"]
+        )
+        self.assertNotEqual(
+            tactic.memory.worker_economy_modes[units[0].id],
+            WorkerEconomyMode.SATURATED_PATROL,
+        )
 
     def test_high_population_post_crisis_rebuild_uses_available_stockpile(self) -> None:
         memory = TacticMemory(
@@ -3333,14 +3468,14 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         tactic.choose_actions(make_turn(tick=2, units=(worker,), resources=10))
         self.assertEqual(
             tactic.memory.worker_economy_modes[worker.id],
-            WorkerEconomyMode.SATURATED_PATROL,
+            WorkerEconomyMode.RESOURCE_SEARCH,
         )
         self.assertTrue(tactic.memory.storage_saturated)
 
         tactic.choose_actions(make_turn(tick=3, units=(worker,), resources=9))
         self.assertEqual(
             tactic.memory.worker_economy_modes[worker.id],
-            WorkerEconomyMode.SATURATED_PATROL,
+            WorkerEconomyMode.RESOURCE_SEARCH,
         )
 
         tactic.choose_actions(make_turn(tick=4, units=(worker,), resources=5))
@@ -3349,6 +3484,81 @@ class EconomyAndLogisticsTests(unittest.TestCase):
             WorkerEconomyMode.RESOURCE_SEARCH,
         )
         self.assertFalse(tactic.memory.storage_saturated)
+
+    def test_temporary_full_storage_preserves_empty_worker_resource_order(self) -> None:
+        core = friendly_core(position=(0, 0))
+        worker = unit(1, UnitType.WORKER, (2, 0))
+        target = (8, 0)
+        order = ResourceWorkOrder(
+            worker_id=worker.id,
+            target=target,
+            assigned_tick=1,
+            last_confirmed_tick=1,
+            last_route_distance=6,
+        )
+        memory = TacticMemory(
+            core_id=core.id,
+            core_position=core.position,
+            known_passable={(x, y) for x in range(-2, 10) for y in range(-2, 3)},
+            resource_memory={target: 1},
+            resource_work_orders={worker.id: order},
+            opening_complete=True,
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        tactic.choose_actions(
+            make_turn(tick=2, core=core, units=(worker,), resources=10)
+        )
+
+        self.assertEqual(tactic.memory.resource_work_orders[worker.id], order)
+        self.assertEqual(
+            tactic.memory.worker_economy_modes[worker.id],
+            WorkerEconomyMode.RESOURCE_ACQUISITION,
+        )
+        self.assertFalse(
+            tactic.last_decision_trace["economy"]["saturated_patrol_active"]
+        )
+
+    def test_temporary_full_service_block_keeps_empty_worker_economy_task(self) -> None:
+        core = friendly_core(position=(0, 0))
+        worker = unit(1, UnitType.WORKER, (2, 0))
+        patient = unit(2, UnitType.VANGUARD, (0, 0), hp=3)
+        target = (8, 0)
+        memory = TacticMemory(
+            core_id=core.id,
+            core_position=core.position,
+            known_passable={(x, y) for x in range(-2, 10) for y in range(-2, 3)},
+            resource_memory={target: 1},
+            resource_work_orders={
+                worker.id: ResourceWorkOrder(
+                    worker_id=worker.id,
+                    target=target,
+                    assigned_tick=1,
+                    last_confirmed_tick=1,
+                    last_route_distance=6,
+                )
+            },
+            opening_complete=True,
+        )
+        tactic = BalancedTactic(memory=memory)
+        turn = make_turn(
+            tick=2,
+            core=core,
+            units=(worker, patient),
+            resources=10,
+        )
+
+        tactic.choose_actions(turn)
+
+        self.assertNotIsInstance(turn.plan.core_action, SpawnAction)
+        self.assertIn(worker.id, tactic.memory.resource_work_orders)
+        self.assertEqual(
+            tactic.memory.worker_economy_modes[worker.id],
+            WorkerEconomyMode.RESOURCE_ACQUISITION,
+        )
+        self.assertFalse(
+            tactic.last_decision_trace["economy"]["saturated_patrol_active"]
+        )
 
     def test_loaded_worker_clears_remote_order_and_returns_toward_core(self) -> None:
         core = friendly_core(position=(0, 0))

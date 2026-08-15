@@ -134,7 +134,7 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
             self.assertIn(uid(900), restored.enemy_core_intel)
 
     def test_schema_versions_are_upgraded(self) -> None:
-        self.assertEqual(LOG_SCHEMA_VERSION, 48)
+        self.assertEqual(LOG_SCHEMA_VERSION, 49)
         self.assertEqual(EXPLORATION_MEMORY_SCHEMA_VERSION, 18)
 
     def test_schema_18_preserves_remote_resource_work_order_beyond_memory_ttl(
@@ -620,7 +620,7 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
             text = logger.path.read_text(encoding="utf-8")
             first = json.loads(text.splitlines()[0])
 
-        self.assertEqual(first["schema_version"], 48)
+        self.assertEqual(first["schema_version"], 49)
         self.assertNotIn("hidden-token", text)
 
     def test_turn_log_contains_detached_schema_41_strategy(self) -> None:
@@ -645,10 +645,10 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
             logger.close(status="completed", last_tick=9)
             records = [json.loads(line) for line in logger.path.read_text(encoding="utf-8").splitlines()]
 
-        self.assertEqual(records[0]["schema_version"], 48)
+        self.assertEqual(records[0]["schema_version"], 49)
         record = next(item for item in records if item["record_type"] == "turn")
-        self.assertEqual(record["strategy"]["schema_version"], 48)
-        self.assertEqual(record["strategy"]["source_trace_schema"], 46)
+        self.assertEqual(record["strategy"]["schema_version"], 49)
+        self.assertEqual(record["strategy"]["source_trace_schema"], 47)
         self.assertNotIn("tasks", record["strategy"])
         self.assertIn("resolution", record["strategy"])
         decisions = record["strategy"]["decisions"]

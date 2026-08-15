@@ -24,6 +24,37 @@ class WorkerEconomyMode(str, Enum):
     FULL_STORAGE_STAGING = "FULL_STORAGE_STAGING"
 
 
+@dataclass(frozen=True, slots=True)
+class EconomyPolicyDecision:
+    """One authoritative economy gate shared by production and Workers."""
+
+    phase: str
+    population: int
+    workers: int
+    vanguards: int
+    rangers: int
+    combat_units: int
+    home_force_target: int
+    mature_worker_target: int
+    mature_combat_target: int
+    worker_gap: int
+    combat_gap: int
+    vanguard_gap: int
+    ranger_gap: int
+    population_ready: bool
+    worker_ready: bool
+    combat_ready: bool
+    species_ready: bool
+    mature_stockpile_ready: bool
+    storage_full_now: bool
+    storage_saturated_hysteresis: bool
+    normal_production_requires_full: bool
+    normal_production_allowed: bool
+    saturated_patrol_active: bool
+    production_gate_reason: str
+    patrol_gate_reason: str
+
+
 class WorkerScoutPhase(str, Enum):
     FRONTIER = "FRONTIER"
     STALE_REVISIT = "STALE_REVISIT"

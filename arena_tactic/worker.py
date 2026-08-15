@@ -10,6 +10,7 @@ from .geometry import cardinal_neighbors, diamond, manhattan, manhattan_ring
 from .models import (
     ActionIntent,
     CoreServiceQueue,
+    EconomyPolicyDecision,
     EntitySnapshot,
     EnemyCoreControlZone,
     EnemyCoreControlLevel,
@@ -120,6 +121,7 @@ class WorkerPlanner:
         world: WorldModel,
         projection: TacticalMap,
         service: CoreServiceQueue,
+        economy_policy: EconomyPolicyDecision,
     ) -> list[ActionIntent]:
         if world.core is None:
             return []
@@ -186,7 +188,37 @@ class WorkerPlanner:
                     )
                     deconflicting.add(worker.id)
         guarding: dict[UUID, Position] = {}
+        service_ids = set(service.depositors)
+        guard_eligible = tuple(
+            worker
+            for worker in workers
+            if worker.id not in escaping and worker.id not in deconflicting
+            and worker.hp >= UNIT_MAX_HP[UnitType.WORKER]
+            and worker.id != world.beacon.carrier_id
+            and worker.id not in service_ids
+        )
+        carriers = tuple(worker for worker in guard_eligible if worker.cargo > 0)
         if self.memory.storage_saturated:
+            # The storage latch applies to cargo because the Core cannot accept
+            # it yet.  Empty Workers only inherit this latch after the mature
+            # economy is complete; temporary fullness must not interrupt work.
+            guarding = self._home_guard_assignments(
+                world,
+                projection,
+                service,
+                carriers,
+            )
+            self.memory.worker_economy_modes.update(
+                {
+                    worker.id: WorkerEconomyMode.FULL_STORAGE_STAGING
+                    for worker in carriers
+                }
+            )
+        else:
+            self.memory.worker_home_guard_targets.clear()
+            self.memory.worker_parking_assignments.clear()
+
+        if economy_policy.saturated_patrol_active:
             self.memory.resource_work_orders.clear()
             self.memory.resource_candidate_counts.clear()
             self.memory.resource_rejection_counts.clear()
@@ -194,35 +226,13 @@ class WorkerPlanner:
                 if mission.mission is UnitMission.HARVEST:
                     self.memory.unit_missions.pop(worker_id, None)
                     self.memory.worker_task_progress.pop(worker_id, None)
-            service_ids = set(service.depositors)
-            guard_eligible = tuple(
-                worker
-                for worker in workers
-                if worker.id not in escaping and worker.id not in deconflicting
-                and worker.hp >= UNIT_MAX_HP[UnitType.WORKER]
-                and worker.id != world.beacon.carrier_id
-                and worker.id not in service_ids
-            )
-            # Full storage means "stop harvesting", not "send cargo back to
-            # the frontier".  Every carrier converges on the same bounded
-            # economic staging belt; empty Workers keep bounded scout tasks.
-            carriers = tuple(
-                worker for worker in guard_eligible if worker.cargo > 0
-            )
-            guard_workers = carriers
-            guarding = self._home_guard_assignments(
-                world,
-                projection,
-                service,
-                guard_workers,
-            )
             resource_assignments: dict[UUID, Position] = {}
             exploring = tuple(
                 worker
                 for worker in guard_eligible
                 if worker.cargo == 0 and worker.id not in guarding
             )
-            for worker in (*guard_workers, *exploring):
+            for worker in (*carriers, *exploring):
                 self.memory.worker_task_progress.pop(worker.id, None)
                 mission = self.memory.unit_missions.get(worker.id)
                 if mission is not None and mission.mission in {
@@ -239,19 +249,11 @@ class WorkerPlanner:
             )
             self.memory.worker_economy_modes.update(
                 {
-                    worker.id: WorkerEconomyMode.FULL_STORAGE_STAGING
-                    for worker in guard_workers
-                }
-            )
-            self.memory.worker_economy_modes.update(
-                {
                     worker.id: WorkerEconomyMode.SATURATED_PATROL
                     for worker in exploring
                 }
             )
         else:
-            self.memory.worker_home_guard_targets.clear()
-            self.memory.worker_parking_assignments.clear()
             available = tuple(
                 worker
                 for worker in workers
@@ -307,7 +309,7 @@ class WorkerPlanner:
                     worker,
                     resource_assignments.get(worker.id),
                     exploration_assignments.get(worker.id),
-                    allow_harvest=not self.memory.storage_saturated,
+                    allow_harvest=not economy_policy.saturated_patrol_active,
                 )
             )
         return intents

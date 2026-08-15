@@ -10,12 +10,14 @@ from .models import (
     ActionIntent,
     CoreEvacuationCampaign,
     CoreServiceQueue,
+    EconomyPolicyDecision,
     FireMission,
     HomeCombatAssignment,
     HomeCounterSiegeDecision,
     IntentAction,
     IntentResolution,
     UnitMission,
+    WorkerEconomyMode,
     WorldModel,
 )
 from .projection import TacticalMap
@@ -44,6 +46,7 @@ class DecisionTraceBuilder:
         home_combat_assignment: HomeCombatAssignment = HomeCombatAssignment(),
         counter_siege: HomeCounterSiegeDecision = HomeCounterSiegeDecision(),
         home_defense_active: bool = False,
+        economy_policy: EconomyPolicyDecision | None = None,
     ) -> dict[str, object]:
         decisions = self._decision_dicts(world, resolution, service)
         return {
@@ -82,6 +85,7 @@ class DecisionTraceBuilder:
                 service,
                 production_candidates,
                 resolution,
+                economy_policy,
             ),
             "combat": self._combat_dict(
                 world,
@@ -461,6 +465,7 @@ class DecisionTraceBuilder:
         service: CoreServiceQueue,
         production_candidates: tuple[dict[str, object], ...],
         resolution: IntentResolution,
+        economy_policy: EconomyPolicyDecision | None,
     ) -> dict[str, object]:
         workers = sum(unit.unit_type is UnitType.WORKER for unit in world.friendlies)
         combat_units = sum(
@@ -578,6 +583,13 @@ class DecisionTraceBuilder:
             mode.value in {"SATURATED_PATROL", "FULL_STORAGE_STAGING"}
             for mode in self.memory.worker_economy_modes.values()
         ) and not self.memory.storage_saturated
+        saturated_patrol_without_policy = any(
+            mode is WorkerEconomyMode.SATURATED_PATROL
+            for mode in self.memory.worker_economy_modes.values()
+        ) and not (
+            economy_policy is not None
+            and economy_policy.saturated_patrol_active
+        )
         return {
             "workers": workers,
             "worker_target": ceil(
@@ -599,6 +611,49 @@ class DecisionTraceBuilder:
                     self.memory.home_force_high_water,
                 )
                 - combat_units,
+            ),
+            "population_phase": (
+                None if economy_policy is None else economy_policy.phase
+            ),
+            "mature_stockpile_ready": (
+                False
+                if economy_policy is None
+                else economy_policy.mature_stockpile_ready
+            ),
+            "mature_population_ready": (
+                False if economy_policy is None else economy_policy.population_ready
+            ),
+            "mature_worker_ready": (
+                False if economy_policy is None else economy_policy.worker_ready
+            ),
+            "mature_combat_ready": (
+                False if economy_policy is None else economy_policy.combat_ready
+            ),
+            "mature_species_ready": (
+                False if economy_policy is None else economy_policy.species_ready
+            ),
+            "normal_production_requires_full": (
+                False
+                if economy_policy is None
+                else economy_policy.normal_production_requires_full
+            ),
+            "normal_production_allowed": (
+                False
+                if economy_policy is None
+                else economy_policy.normal_production_allowed
+            ),
+            "production_gate_reason": (
+                None
+                if economy_policy is None
+                else economy_policy.production_gate_reason
+            ),
+            "saturated_patrol_active": (
+                False
+                if economy_policy is None
+                else economy_policy.saturated_patrol_active
+            ),
+            "saturated_patrol_gate_reason": (
+                None if economy_policy is None else economy_policy.patrol_gate_reason
             ),
             "production_mode": production_mode,
             "full_storage_gate": world.resources == world.resource_capacity,
@@ -648,9 +703,16 @@ class DecisionTraceBuilder:
             "storage_headroom": max(0, world.resource_capacity - world.resources),
             "worker_economy_mode_counts": dict(sorted(economy_mode_counts.items())),
             "worker_economy_liveness_alerts": (
-                ["SATURATED_MODE_WITHOUT_STORAGE_LATCH"]
-                if saturated_mode_without_latch
-                else []
+                (
+                    ["SATURATED_MODE_WITHOUT_STORAGE_LATCH"]
+                    if saturated_mode_without_latch
+                    else []
+                )
+                + (
+                    ["SATURATED_PATROL_WITHOUT_MATURE_POLICY"]
+                    if saturated_patrol_without_policy
+                    else []
+                )
             ),
             "resource_assignment_policy": {
                 "max_radius": self.config.resource_assignment_max_radius,
