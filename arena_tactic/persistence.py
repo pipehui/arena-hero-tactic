@@ -25,6 +25,7 @@ from .models import (
     RaidConfirmationLease,
     RaidDistanceBand,
     RaidReconMission,
+    ResourceWorkOrder,
     SiegeApproachPlan,
     ThreatHeatCell,
     WorkerScoutPhase,
@@ -111,8 +112,14 @@ class ExplorationMemoryStore:
         replay_tick = self._catch_up(memory, after_tick=saved_tick)
         latest = replay_tick if replay_tick is not None else saved_tick
         if latest is not None:
+            active_resource_targets = {
+                order.target for order in memory.resource_work_orders.values()
+            }
             for cell, seen_tick in tuple(memory.resource_memory.items()):
-                if latest - seen_tick > self.config.resource_memory_ttl:
+                if (
+                    latest - seen_tick > self.config.resource_memory_ttl
+                    and cell not in active_resource_targets
+                ):
                     memory.resource_memory.pop(cell, None)
             for cell, record in tuple(memory.threat_heat.items()):
                 if record.score(latest) <= 0:
@@ -156,6 +163,21 @@ class ExplorationMemoryStore:
             "resource_memory": self._counter_rows(memory.resource_memory),
             "resource_seen_count": self._counter_rows(memory.resource_seen_count),
             "resource_harvest_count": self._counter_rows(memory.resource_harvest_count),
+            "resource_work_orders": [
+                {
+                    "worker_id": str(worker_id),
+                    "target": list(order.target),
+                    "assigned_tick": order.assigned_tick,
+                    "last_confirmed_tick": order.last_confirmed_tick,
+                    "last_route_distance": order.last_route_distance,
+                    "stalled_ticks": order.stalled_ticks,
+                    "failures": order.failures,
+                }
+                for worker_id, order in sorted(
+                    memory.resource_work_orders.items(),
+                    key=lambda item: item[0].bytes,
+                )
+            ],
             "threat_heat": [
                 [
                     cell[0],
@@ -462,6 +484,47 @@ class ExplorationMemoryStore:
                 old_key = "patrol_visits"
             for cell, value in _triples(payload.get(old_key, [])):
                 target[cell] = value
+
+        if schema >= 18:
+            for raw in payload.get("resource_work_orders", []):
+                if not isinstance(raw, dict):
+                    continue
+                worker_id = _uuid(raw.get("worker_id"))
+                target = _position(raw.get("target"))
+                assigned_tick = raw.get("assigned_tick")
+                last_confirmed_tick = raw.get("last_confirmed_tick")
+                last_route_distance = raw.get("last_route_distance")
+                stalled_ticks = raw.get("stalled_ticks", 0)
+                failures = raw.get("failures", 0)
+                if (
+                    worker_id is None
+                    or target is None
+                    or not isinstance(assigned_tick, int)
+                    or isinstance(assigned_tick, bool)
+                    or not isinstance(last_confirmed_tick, int)
+                    or isinstance(last_confirmed_tick, bool)
+                    or not isinstance(stalled_ticks, int)
+                    or isinstance(stalled_ticks, bool)
+                    or stalled_ticks < 0
+                    or not isinstance(failures, int)
+                    or isinstance(failures, bool)
+                    or failures < 0
+                ):
+                    continue
+                if not isinstance(last_route_distance, int) or isinstance(
+                    last_route_distance, bool
+                ):
+                    last_route_distance = None
+                memory.resource_work_orders[worker_id] = ResourceWorkOrder(
+                    worker_id=worker_id,
+                    target=target,
+                    assigned_tick=assigned_tick,
+                    last_confirmed_tick=last_confirmed_tick,
+                    last_route_distance=last_route_distance,
+                    stalled_ticks=stalled_ticks,
+                    failures=failures,
+                )
+                memory.resource_memory.setdefault(target, last_confirmed_tick)
 
         if schema >= 9:
             for raw in payload.get("threat_heat", []):

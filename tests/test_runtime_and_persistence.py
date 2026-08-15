@@ -47,6 +47,7 @@ from arena_tactic.models import (
     LongRangeRaidCampaign,
     RaidAttemptMemory,
     RaidDistanceBand,
+    ResourceWorkOrder,
     SiegeApproachPlan,
 )
 from arena_tactic.runtime import InstanceAlreadyRunning, SingleInstanceLock
@@ -133,8 +134,36 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
             self.assertIn(uid(900), restored.enemy_core_intel)
 
     def test_schema_versions_are_upgraded(self) -> None:
-        self.assertEqual(LOG_SCHEMA_VERSION, 47)
-        self.assertEqual(EXPLORATION_MEMORY_SCHEMA_VERSION, 17)
+        self.assertEqual(LOG_SCHEMA_VERSION, 48)
+        self.assertEqual(EXPLORATION_MEMORY_SCHEMA_VERSION, 18)
+
+    def test_schema_18_preserves_remote_resource_work_order_beyond_memory_ttl(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            worker_id = uid(1)
+            target = (101, 0)
+            memory = TacticMemory(
+                core_id=uid(10_000),
+                core_position=(0, 0),
+                resource_memory={target: 1},
+            )
+            memory.resource_work_orders[worker_id] = ResourceWorkOrder(
+                worker_id=worker_id,
+                target=target,
+                assigned_tick=2,
+                last_confirmed_tick=1,
+                last_route_distance=99,
+                stalled_ticks=0,
+                failures=0,
+            )
+            store = ExplorationMemoryStore(directory, save_interval_ticks=1)
+            self.assertTrue(store.save(memory, tick=300, force=True))
+
+            restored = ExplorationMemoryStore(directory).load()
+
+        self.assertEqual(restored.resource_work_orders[worker_id], memory.resource_work_orders[worker_id])
+        self.assertEqual(restored.resource_memory[target], 1)
 
     def test_schema_15_preserves_core_control_attempts_and_returning_raid(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -591,7 +620,7 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
             text = logger.path.read_text(encoding="utf-8")
             first = json.loads(text.splitlines()[0])
 
-        self.assertEqual(first["schema_version"], 47)
+        self.assertEqual(first["schema_version"], 48)
         self.assertNotIn("hidden-token", text)
 
     def test_turn_log_contains_detached_schema_41_strategy(self) -> None:
@@ -616,10 +645,10 @@ class RuntimeAndPersistenceTests(unittest.TestCase):
             logger.close(status="completed", last_tick=9)
             records = [json.loads(line) for line in logger.path.read_text(encoding="utf-8").splitlines()]
 
-        self.assertEqual(records[0]["schema_version"], 47)
+        self.assertEqual(records[0]["schema_version"], 48)
         record = next(item for item in records if item["record_type"] == "turn")
-        self.assertEqual(record["strategy"]["schema_version"], 47)
-        self.assertEqual(record["strategy"]["source_trace_schema"], 45)
+        self.assertEqual(record["strategy"]["schema_version"], 48)
+        self.assertEqual(record["strategy"]["source_trace_schema"], 46)
         self.assertNotIn("tasks", record["strategy"])
         self.assertIn("resolution", record["strategy"])
         decisions = record["strategy"]["decisions"]

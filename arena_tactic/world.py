@@ -274,6 +274,8 @@ def _sync_events(
             if event.position is not None:
                 memory.resource_harvest_count[event.position] += 1
                 memory.resource_memory.pop(event.position, None)
+            if event.actor_id is not None:
+                memory.resource_work_orders.pop(event.actor_id, None)
         elif event.event_type == "HARVEST_FAILED" and event.reason_code in {
             "NOT_RESOURCE_CELL",
             "RESOURCE_DEPLETED",
@@ -287,6 +289,7 @@ def _sync_events(
                     memory.resource_memory.pop(mission.target, None)
                     memory.unit_missions.pop(event.actor_id, None)
                     memory.worker_task_progress.pop(event.actor_id, None)
+                memory.resource_work_orders.pop(event.actor_id, None)
         elif event.event_type in {
             "UNIT_MOVE_FAILED",
             "CORE_MOVE_FAILED",
@@ -428,7 +431,18 @@ def _sync_map_memory(
     for cell in tuple(memory.resource_memory):
         if cell in visible and cell not in visible_resources:
             memory.resource_memory.pop(cell, None)
-        elif turn.tick - memory.resource_memory[cell] > config.resource_memory_ttl:
+            for worker_id, order in tuple(memory.resource_work_orders.items()):
+                if order.target == cell:
+                    memory.resource_work_orders.pop(worker_id, None)
+                    memory.unit_missions.pop(worker_id, None)
+                    memory.worker_task_progress.pop(worker_id, None)
+        elif (
+            turn.tick - memory.resource_memory[cell] > config.resource_memory_ttl
+            and all(
+                order.target != cell
+                for order in memory.resource_work_orders.values()
+            )
+        ):
             memory.resource_memory.pop(cell, None)
     return frame
 
@@ -548,6 +562,16 @@ def _sync_friendly_memory(
     for unit_id in tuple(memory.worker_task_progress):
         if unit_id not in living_ids:
             memory.worker_task_progress.pop(unit_id, None)
+    units_by_id = {unit.id: unit for unit in turn.units}
+    for unit_id in tuple(memory.resource_work_orders):
+        unit = units_by_id.get(unit_id)
+        if (
+            unit is None
+            or unit.unit_type is not UnitType.WORKER
+            or (unit.cargo or 0) > 0
+            or unit.hp < UNIT_MAX_HP[UnitType.WORKER]
+        ):
+            memory.resource_work_orders.pop(unit_id, None)
     for unit_id in tuple(memory.home_return_missions):
         if unit_id not in living_ids:
             memory.home_return_missions.pop(unit_id, None)
@@ -566,7 +590,6 @@ def _sync_friendly_memory(
         ),
         *memory.service_queue_cells,
     }
-    units_by_id = {unit.id: unit for unit in turn.units}
     for unit_id in tuple(memory.service_egress_worker_ids):
         unit = units_by_id.get(unit_id)
         if unit is None or unit.position not in service_cells:

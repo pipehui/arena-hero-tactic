@@ -16,7 +16,9 @@ from .models import (
     FullStorageParkingAssignment,
     IntentAction,
     MissionState,
+    ResourceWorkOrder,
     UnitMission,
+    WorkerEconomyMode,
     WorkerSurvivalLease,
     WorkerDisengageLease,
     WorkerScoutPhase,
@@ -124,6 +126,19 @@ class WorkerPlanner:
         workers = tuple(
             unit for unit in world.friendlies if unit.unit_type is UnitType.WORKER
         )
+        worker_ids = {worker.id for worker in workers}
+        self.memory.worker_economy_modes.clear()
+        for worker_id in tuple(self.memory.resource_work_orders):
+            worker = next((item for item in workers if item.id == worker_id), None)
+            if (
+                worker is None
+                or worker.cargo > 0
+                or worker.hp < UNIT_MAX_HP[UnitType.WORKER]
+            ):
+                self.memory.resource_work_orders.pop(worker_id, None)
+        for worker_id in tuple(self.memory.resource_work_orders):
+            if worker_id not in worker_ids:
+                self.memory.resource_work_orders.pop(worker_id, None)
         self._refresh_enemy_core_control_zones(world)
         intents, escaping = self._survival_intents(world, projection, service, workers)
         deconflicting: set[UUID] = set()
@@ -172,6 +187,13 @@ class WorkerPlanner:
                     deconflicting.add(worker.id)
         guarding: dict[UUID, Position] = {}
         if self.memory.storage_saturated:
+            self.memory.resource_work_orders.clear()
+            self.memory.resource_candidate_counts.clear()
+            self.memory.resource_rejection_counts.clear()
+            for worker_id, mission in tuple(self.memory.unit_missions.items()):
+                if mission.mission is UnitMission.HARVEST:
+                    self.memory.unit_missions.pop(worker_id, None)
+                    self.memory.worker_task_progress.pop(worker_id, None)
             service_ids = set(service.depositors)
             guard_eligible = tuple(
                 worker
@@ -215,6 +237,18 @@ class WorkerPlanner:
                 exploring,
                 service,
             )
+            self.memory.worker_economy_modes.update(
+                {
+                    worker.id: WorkerEconomyMode.FULL_STORAGE_STAGING
+                    for worker in guard_workers
+                }
+            )
+            self.memory.worker_economy_modes.update(
+                {
+                    worker.id: WorkerEconomyMode.SATURATED_PATROL
+                    for worker in exploring
+                }
+            )
         else:
             self.memory.worker_home_guard_targets.clear()
             self.memory.worker_parking_assignments.clear()
@@ -228,6 +262,22 @@ class WorkerPlanner:
             )
             resource_assignments, exploration_assignments = self._assign_work(
                 world, projection, service, available
+            )
+            self.memory.worker_economy_modes.update(
+                {
+                    worker_id: WorkerEconomyMode.RESOURCE_ACQUISITION
+                    for worker_id in resource_assignments
+                }
+            )
+            self.memory.worker_economy_modes.update(
+                {
+                    worker_id: WorkerEconomyMode.RESOURCE_SEARCH
+                    for worker_id in (
+                        worker.id
+                        for worker in available
+                        if worker.id not in resource_assignments
+                    )
+                }
             )
 
         for worker in workers:
@@ -1121,8 +1171,6 @@ class WorkerPlanner:
             worker
             for worker in available
             if worker.position != world.core.position
-            and manhattan(worker.position, world.core.position)
-            <= self.config.exploration_sector_radii[-1]
         )
         service_blocks = frozenset(
             cell
@@ -1136,12 +1184,62 @@ class WorkerPlanner:
             )
             if cell is not None
         )
-        resources = self.resources.allocate(
+        allocation = self.resources.allocate(
             world,
             projection,
             resource_workers,
             hard_blocked=service_blocks,
-        ).as_dict()
+        )
+        self.memory.resource_candidate_counts = dict(allocation.candidate_counts)
+        self.memory.resource_rejection_counts = dict(allocation.rejection_counts)
+        resources = allocation.as_dict()
+        available_by_id = {worker.id: worker for worker in resource_workers}
+        for worker_id, order in tuple(self.memory.resource_work_orders.items()):
+            if worker_id not in available_by_id:
+                self.memory.resource_work_orders.pop(worker_id, None)
+                continue
+            if (
+                worker_id not in resources
+                and order.target in self.memory.resource_memory
+                and self.memory.worker_resource_backoff.get(
+                    (worker_id, order.target), -1
+                ) < world.tick
+                and order.stalled_ticks < 2
+            ):
+                resources[worker_id] = order.target
+        for worker_id, target in resources.items():
+            existing = self.memory.resource_work_orders.get(worker_id)
+            confirmed_tick = self.memory.resource_memory.get(
+                target,
+                existing.last_confirmed_tick
+                if existing is not None and existing.target == target
+                else world.tick,
+            )
+            self.memory.resource_work_orders[worker_id] = ResourceWorkOrder(
+                worker_id=worker_id,
+                target=target,
+                assigned_tick=(
+                    existing.assigned_tick
+                    if existing is not None and existing.target == target
+                    else world.tick
+                ),
+                last_confirmed_tick=confirmed_tick,
+                last_route_distance=(
+                    existing.last_route_distance
+                    if existing is not None and existing.target == target
+                    else None
+                ),
+                stalled_ticks=(
+                    existing.stalled_ticks
+                    if existing is not None and existing.target == target
+                    else 0
+                ),
+                failures=(
+                    existing.failures
+                    if existing is not None and existing.target == target
+                    else 0
+                ),
+            )
         explorers = tuple(
             worker for worker in available if worker.id not in resources
         )
@@ -1254,16 +1352,27 @@ class WorkerPlanner:
         route = self._route(world, projection, worker, resource, service)
         previous_progress = self.memory.worker_task_progress.get(worker.id)
         route_distance = None if route is None else route.distance
+        same_target = bool(
+            previous_progress is not None
+            and previous_progress.target == resource
+        )
         improved = bool(
-            previous_progress is None
-            or previous_progress.target != resource
-            or route_distance is not None
+            route_distance is not None
             and (
-                previous_progress.route_distance is None
+                not same_target
+                or previous_progress.route_distance is None
                 or route_distance < previous_progress.route_distance
             )
         )
-        stalled = 0 if improved else previous_progress.stalled_ticks + 1
+        stalled = (
+            0
+            if improved
+            else (
+                previous_progress.stalled_ticks + 1
+                if same_target
+                else 1
+            )
+        )
         progress = WorkerTaskProgress(
             worker_id=worker.id,
             target=resource,
@@ -1284,6 +1393,7 @@ class WorkerPlanner:
                 backoff_until=backoff_until,
             )
             self.memory.worker_resource_backoff[(worker.id, resource)] = backoff_until
+            self.memory.resource_work_orders.pop(worker.id, None)
             self.memory.unit_missions.pop(worker.id, None)
             self.memory.worker_task_progress[worker.id] = progress
             return self._resource_stall_fallback(
@@ -1293,11 +1403,34 @@ class WorkerPlanner:
                 worker,
                 resource,
             )
+        existing_order = self.memory.resource_work_orders.get(worker.id)
+        self.memory.resource_work_orders[worker.id] = ResourceWorkOrder(
+            worker_id=worker.id,
+            target=resource,
+            assigned_tick=(
+                existing_order.assigned_tick
+                if existing_order is not None and existing_order.target == resource
+                else world.tick
+            ),
+            last_confirmed_tick=self.memory.resource_memory.get(
+                resource,
+                existing_order.last_confirmed_tick
+                if existing_order is not None and existing_order.target == resource
+                else world.tick,
+            ),
+            last_route_distance=route_distance,
+            stalled_ticks=stalled,
+            failures=(
+                existing_order.failures
+                if existing_order is not None and existing_order.target == resource
+                else 0
+            ),
+        )
         self.memory.worker_task_progress[worker.id] = progress
         self.memory.unit_missions[worker.id] = MissionState(
             UnitMission.HARVEST,
             resource,
-            world.tick,
+            self.memory.resource_work_orders[worker.id].assigned_tick,
         )
         if route is None or route.first_direction is None:
             return self._resource_stall_fallback(

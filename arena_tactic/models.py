@@ -15,6 +15,15 @@ class WorkerPatrolMode(str, Enum):
     LOCAL_FALLBACK = "LOCAL_FALLBACK"
 
 
+class WorkerEconomyMode(str, Enum):
+    """Why a healthy Worker is moving while the economy is peaceful."""
+
+    RESOURCE_ACQUISITION = "RESOURCE_ACQUISITION"
+    RESOURCE_SEARCH = "RESOURCE_SEARCH"
+    SATURATED_PATROL = "SATURATED_PATROL"
+    FULL_STORAGE_STAGING = "FULL_STORAGE_STAGING"
+
+
 class WorkerScoutPhase(str, Enum):
     FRONTIER = "FRONTIER"
     STALE_REVISIT = "STALE_REVISIT"
@@ -986,6 +995,19 @@ class MissionState:
     mission: UnitMission
     target: Position | None
     assigned_tick: int
+    failures: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceWorkOrder:
+    """Durable claim on a remembered node while a Worker travels to verify it."""
+
+    worker_id: UUID
+    target: Position
+    assigned_tick: int
+    last_confirmed_tick: int
+    last_route_distance: int | None = None
+    stalled_ticks: int = 0
     failures: int = 0
 
 

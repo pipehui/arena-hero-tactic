@@ -45,6 +45,10 @@ class TacticConfig:
     # the 30-cell outer band.
     exploration_sector_radii: tuple[int, ...] = (20, 25, 30)
     exploration_sector_step: int = 10
+    # Known, safely reachable resources are economic destinations rather than
+    # scout targets.  ``None`` deliberately leaves their distance unbounded;
+    # the fixed scout radii still bound proactive information gathering.
+    resource_assignment_max_radius: int | None = None
     resource_memory_ttl: int = 256
     resource_assignment_persistence_bonus: int = 6
     congestion_decay_ticks: int = 64
@@ -338,6 +342,11 @@ class TacticConfig:
         )
         if any(value <= 0 for value in positive):
             raise ValueError("tactic limits must be positive")
+        if (
+            self.resource_assignment_max_radius is not None
+            and self.resource_assignment_max_radius <= 0
+        ):
+            raise ValueError("resource assignment radius must be positive or None")
         if not 1 <= self.worker_ratio_percent <= 100:
             raise ValueError("worker ratio must be within 1..100")
         if self.population_stockpile_threshold <= self.worker_only_population_threshold:

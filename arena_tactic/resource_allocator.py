@@ -9,7 +9,7 @@ from arena_hero import Position
 from .config import TacticConfig
 from .geometry import manhattan
 from .models import EntitySnapshot, UnitMission, WorldModel
-from .planning import bfs_distances
+from .planning import bfs_distances, route_to
 from .projection import TacticalMap
 from .state import TacticMemory
 from .worker_safety import WorkerSafetyEvaluator
@@ -26,6 +26,8 @@ class ResourceAssignment:
 class ResourceAllocation:
     assignments: tuple[ResourceAssignment, ...]
     unreachable_pairs: int = 0
+    candidate_counts: tuple[tuple[str, int], ...] = ()
+    rejection_counts: tuple[tuple[str, int], ...] = ()
 
     def as_dict(self) -> dict[UUID, Position]:
         return {item.worker_id: item.resource for item in self.assignments}
@@ -155,17 +157,62 @@ class ResourceAllocator:
             projection,
             tuple(self.memory.enemy_core_control_zones.values()),
         )
-        max_radius = self.config.exploration_sector_radii[-1]
+        all_resources = tuple(sorted(resource.position for resource in projection.resources))
+        distance_bands = {
+            "0_30": sum(
+                manhattan(resource, world.core.position) <= 30
+                for resource in all_resources
+            ),
+            "31_60": sum(
+                31 <= manhattan(resource, world.core.position) <= 60
+                for resource in all_resources
+            ),
+            "61_plus": sum(
+                manhattan(resource, world.core.position) >= 61
+                for resource in all_resources
+            ),
+        }
+        rejected_control = sum(resource in enemy_core_zone for resource in all_resources)
+        rejected_radius = sum(
+            resource not in enemy_core_zone
+            and self.config.resource_assignment_max_radius is not None
+            and manhattan(resource, world.core.position)
+            > self.config.resource_assignment_max_radius
+            for resource in all_resources
+        )
         resources = tuple(
+            resource
+            for resource in all_resources
+            if resource not in enemy_core_zone
+            and (
+                self.config.resource_assignment_max_radius is None
+                or manhattan(resource, world.core.position)
+                <= self.config.resource_assignment_max_radius
+            )
+        )
+        candidate_counts = tuple(
             sorted(
-                resource.position
-                for resource in projection.resources
-                if resource.position not in enemy_core_zone
-                and manhattan(resource.position, world.core.position) <= max_radius
+                {
+                    "total": len(all_resources),
+                    "eligible": len(resources),
+                    **distance_bands,
+                }.items()
+            )
+        )
+        rejection_counts = tuple(
+            sorted(
+                {
+                    "ENEMY_CORE_CONTROL_ZONE": rejected_control,
+                    "RESOURCE_RADIUS_LIMIT": rejected_radius,
+                }.items()
             )
         )
         if not resources:
-            return ResourceAllocation(())
+            return ResourceAllocation(
+                (),
+                candidate_counts=candidate_counts,
+                rejection_counts=rejection_counts,
+            )
         seen_ticks = {
             resource.position: resource.last_seen_tick
             for resource in projection.resources
@@ -180,7 +227,11 @@ class ResourceAllocator:
             blocked,
         )
         if not workers or not resources:
-            return ResourceAllocation(stable)
+            return ResourceAllocation(
+                stable,
+                candidate_counts=candidate_counts,
+                rejection_counts=rejection_counts,
+            )
 
         route_distances, core_distances = self._distance_tables(
             world,
@@ -232,6 +283,15 @@ class ResourceAllocator:
                 for worker_id, resource, cost in rows
             ),
             unreachable_pairs=unreachable,
+            candidate_counts=candidate_counts,
+            rejection_counts=tuple(
+                sorted(
+                    {
+                        **dict(rejection_counts),
+                        "UNREACHABLE_PAIR": unreachable,
+                    }.items()
+                )
+            ),
         )
 
     def _blocked_positions(
@@ -272,8 +332,11 @@ class ResourceAllocator:
         resource_set = set(resources)
         for worker in sorted(workers, key=lambda item: item.id.bytes):
             previous = self.memory.unit_missions.get(worker.id)
+            work_order = self.memory.resource_work_orders.get(worker.id)
             target = (
-                previous.target
+                work_order.target
+                if work_order is not None
+                else previous.target
                 if previous is not None and previous.mission is UnitMission.HARVEST
                 else None
             )
@@ -297,8 +360,17 @@ class ResourceAllocator:
             )
             outbound_distance = distances.get(worker.position)
             if outbound_distance is None:
-                remaining_workers.append(worker)
-                continue
+                route = route_to(
+                    world,
+                    worker.position,
+                    target,
+                    node_limit=self.config.path_node_limit,
+                    blocked=blocked - {target, worker.position},
+                )
+                outbound_distance = None if route is None else route.distance
+                if outbound_distance is None:
+                    remaining_workers.append(worker)
+                    continue
             return_distance = distances.get(
                 world.core.position,
                 manhattan(target, world.core.position),
@@ -393,6 +465,20 @@ class ResourceAllocator:
                 for resource in usable_resources:
                     if resource in distances:
                         route_distances[(worker.id, resource)] = distances[resource]
+        for worker in sorted(workers, key=lambda item: item.id.bytes):
+            for resource in usable_resources:
+                key = (worker.id, resource)
+                if key in route_distances:
+                    continue
+                route = route_to(
+                    world,
+                    worker.position,
+                    resource,
+                    node_limit=self.config.path_node_limit,
+                    blocked=blocked - {worker.position, resource},
+                )
+                if route is not None:
+                    route_distances[key] = route.distance
         return route_distances, core_distances
 
     def _pair_cost(

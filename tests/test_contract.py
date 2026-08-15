@@ -30,6 +30,7 @@ from arena_tactic import (
     PatientQueueEntry,
     PendingSubmission,
     RangerStanceOption,
+    ResourceWorkOrder,
     ScreeningContactDecision,
     ServiceCellLease,
     ServiceLaneLease,
@@ -75,6 +76,7 @@ class PublicContractTests(unittest.TestCase):
             PatientQueueEntry,
             PendingSubmission,
             RangerStanceOption,
+            ResourceWorkOrder,
             ScreeningContactDecision,
             ServiceCellLease,
             ServiceLaneLease,
@@ -139,7 +141,7 @@ class PublicContractTests(unittest.TestCase):
 
         trace = tactic.last_decision_trace
 
-        self.assertEqual(trace["schema_version"], 45)
+        self.assertEqual(trace["schema_version"], 46)
         self.assertIn("resolution", trace)
         self.assertIn("world", trace)
         global_map = trace["world"]["global_map"]

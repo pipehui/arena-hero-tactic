@@ -571,6 +571,13 @@ class DecisionTraceBuilder:
             if angles
             else []
         )
+        economy_mode_counts = Counter(
+            mode.value for mode in self.memory.worker_economy_modes.values()
+        )
+        saturated_mode_without_latch = any(
+            mode.value in {"SATURATED_PATROL", "FULL_STORAGE_STAGING"}
+            for mode in self.memory.worker_economy_modes.values()
+        ) and not self.memory.storage_saturated
         return {
             "workers": workers,
             "worker_target": ceil(
@@ -595,6 +602,12 @@ class DecisionTraceBuilder:
             ),
             "production_mode": production_mode,
             "full_storage_gate": world.resources == world.resource_capacity,
+            "storage_full_now": world.resources == world.resource_capacity,
+            "storage_saturated_hysteresis": self.memory.storage_saturated,
+            "storage_hysteresis_active": (
+                self.memory.storage_saturated
+                and world.resources < world.resource_capacity
+            ),
             "crisis_force_baseline": (
                 None
                 if crisis is None
@@ -633,6 +646,17 @@ class DecisionTraceBuilder:
             ],
             "storage_saturated": self.memory.storage_saturated,
             "storage_headroom": max(0, world.resource_capacity - world.resources),
+            "worker_economy_mode_counts": dict(sorted(economy_mode_counts.items())),
+            "worker_economy_liveness_alerts": (
+                ["SATURATED_MODE_WITHOUT_STORAGE_LATCH"]
+                if saturated_mode_without_latch
+                else []
+            ),
+            "resource_assignment_policy": {
+                "max_radius": self.config.resource_assignment_max_radius,
+                "candidate_counts": dict(self.memory.resource_candidate_counts),
+                "rejection_counts": dict(self.memory.resource_rejection_counts),
+            },
             "worker_bounds": {
                 "scout_radii": list(self.config.exploration_sector_radii),
                 "max_scout_radius": scout_limit,
@@ -799,6 +823,16 @@ class DecisionTraceBuilder:
                         state.stage % len(self.config.exploration_sector_radii)
                     ],
                     "mode": state.phase.value,
+                    "economy_mode": (
+                        None
+                        if (
+                            economy_mode := self.memory.worker_economy_modes.get(
+                                worker_id
+                            )
+                        )
+                        is None
+                        else economy_mode.value
+                    ),
                     "target": None if state.target is None else list(state.target),
                     "worker_core_distance": (
                         None
@@ -883,6 +917,30 @@ class DecisionTraceBuilder:
                     "worker_id": str(unit_id),
                     "target": None if mission.target is None else list(mission.target),
                     "mission": mission.mission.value,
+                    "economy_mode": (
+                        None
+                        if (
+                            economy_mode := self.memory.worker_economy_modes.get(
+                                unit_id
+                            )
+                        )
+                        is None
+                        else economy_mode.value
+                    ),
+                    "work_order": (
+                        None
+                        if (
+                            order := self.memory.resource_work_orders.get(unit_id)
+                        )
+                        is None
+                        else {
+                            "assigned_tick": order.assigned_tick,
+                            "last_confirmed_tick": order.last_confirmed_tick,
+                            "last_route_distance": order.last_route_distance,
+                            "stalled_ticks": order.stalled_ticks,
+                            "failures": order.failures,
+                        }
+                    ),
                 }
                 for unit_id, mission in sorted(
                     self.memory.unit_missions.items(), key=lambda item: item[0].bytes

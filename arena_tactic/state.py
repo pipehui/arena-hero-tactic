@@ -21,6 +21,7 @@ from .models import (
     PartnerDependencyFeedback,
     PeacefulFormationAssignment,
     RangerStanceLease,
+    ResourceWorkOrder,
     ScreeningContactDecision,
     WorkerTaskProgress,
     SquadRendezvousLease,
@@ -32,6 +33,7 @@ from .models import (
     WorkerEscapeState,
     WorkerDisengageLease,
     WorkerPatrolMode,
+    WorkerEconomyMode,
     WorkerScoutState,
     ShotFeedback,
     ShotPlan,
@@ -78,6 +80,10 @@ class TacticMemory:
     resource_memory: dict[Position, int] = field(default_factory=dict)
     resource_seen_count: Counter[Position] = field(default_factory=Counter)
     resource_harvest_count: Counter[Position] = field(default_factory=Counter)
+    resource_work_orders: dict[UUID, ResourceWorkOrder] = field(default_factory=dict)
+    worker_economy_modes: dict[UUID, WorkerEconomyMode] = field(default_factory=dict)
+    resource_candidate_counts: dict[str, int] = field(default_factory=dict)
+    resource_rejection_counts: dict[str, int] = field(default_factory=dict)
     # Session-level outcome counters are intentionally transient.  They make
     # the live trace useful for tuning without polluting durable world memory.
     event_counts: Counter[str] = field(default_factory=Counter)
@@ -261,6 +267,10 @@ class TacticMemory:
         self.scout_assignment_last_rebalance_tick = None
         self.worker_task_progress.clear()
         self.worker_resource_backoff.clear()
+        self.resource_work_orders.clear()
+        self.worker_economy_modes.clear()
+        self.resource_candidate_counts.clear()
+        self.resource_rejection_counts.clear()
         self.engaged_enemy_until.clear()
         self.manual_move_leases.clear()
         self.last_move_attempts.clear()
