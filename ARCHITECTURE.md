@@ -46,13 +46,20 @@ Core + Worker + Vanguard + Ranger 的独立视野
 | `world.py` | 同步事件、独立视野贡献和长期地图事实，生成 `WorldModel` |
 | `projection.py` | 从世界事实一次性生成不可变 `TacticalMap` |
 | `planning.py` | A*、BFS、风险加权路径和信息增益 |
-| `worker.py` / `resource_allocator.py` | 从全局资源和风险图生成采集、返航、探索与避险意图 |
+| `worker.py` / `resource_allocator.py` | 从全局资源和风险图生成采集、返航、无界资源前沿搜索、成熟满仓巡逻与避险意图 |
 | `combat.py` / `defense.py` | 从全局敌情生成射线、齐射、截击、封路和阵位意图 |
 | `service.py` / `recovery.py` | Core 通道、FIFO 交付和治疗仲裁 |
 | `core_safety.py` / `production.py` | 从整体压力和预算生成迁移、治疗及生产意图 |
 | `resolver.py` | 资源预算、容量、移动依赖、保护区和单格独占的全局仲裁 |
-| `trace.py` | schema 22 决策追踪，包括全局地图、满仓驻守、动态射击位和最终预订 |
-| `persistence.py` | schema 11 检查点；永久地图、资源、热区和短期敌情可跨后台重启恢复 |
+| `trace.py` | schema 48 决策追踪；磁盘投影 schema 50，包含全局地图、资源搜索租约、死路证明、动态射击位和最终预订 |
+| `persistence.py` | schema 19 检查点；永久地图、资源工单、无界搜索租约、热区和敌情可跨后台重启恢复 |
+
+## Worker 经济模式
+
+- 非满仓且没有可分配资源时，健康空载 Worker 使用独立的 `RESOURCE_FRONTIER_SEARCH`：按稳定角度分散，只选择实际可达、具有正信息增益的未知前沿，搜索距离不受 Core 半径限制。
+- 完整路线超出单 Tick 搜索预算时保存分段航点；目标、路线和退避边跨 Tick 保持，避免逐步贪心形成两格折返。
+- `20/25/30` 环只属于成熟编制且满仓滞回生效后的 `SATURATED_PATROL`，不得被普通资源搜索复用。
+- 采集、搜索、载货返航、治疗返航、逃生、敌核脱离及满仓等待的首步都必须携带统一的 `MoveViability` 证明。除实际资源格和我方 Core 服务格外，已知死路不能作为中间格或任务终点。
 
 ## 决策优先级
 

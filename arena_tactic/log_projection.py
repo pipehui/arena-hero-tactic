@@ -257,7 +257,7 @@ def _compact_economy(value: Any) -> dict[str, Any]:
     compact = {
         key: deepcopy(item)
         for key, item in value.items()
-        if key not in {"service_queue", "worker_scouts"}
+        if key not in {"service_queue", "worker_scouts", "resource_searches"}
     }
     scouts = value.get("worker_scouts")
     compact["worker_scouts"] = []
@@ -285,6 +285,34 @@ def _compact_economy(value: Any) -> dict[str, Any]:
                 )
             }
             for row in scouts
+            if isinstance(row, Mapping)
+        ]
+    searches = value.get("resource_searches")
+    compact["resource_searches"] = []
+    if isinstance(searches, (list, tuple)):
+        compact["resource_searches"] = [
+            {
+                key: deepcopy(row.get(key))
+                for key in (
+                    "worker_id",
+                    "direction_slot",
+                    "target",
+                    "target_core_distance",
+                    "waypoint",
+                    "route_distance",
+                    "stalled_ticks",
+                    "route_version",
+                    "blocked_edge",
+                    "backoff_until",
+                    "information_gain",
+                    "visible_gain",
+                    "overlap_cells",
+                    "cycle_period",
+                    "action",
+                    "reason",
+                )
+            }
+            for row in searches
             if isinstance(row, Mapping)
         ]
     compact["service_queue"] = _compact_service_queue(value.get("service_queue"))

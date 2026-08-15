@@ -40,9 +40,14 @@ class TacticConfig:
     exploration_rebalance_cooldown_ticks: int = 8
     exploration_return_stall_ticks: int = 2
     exploration_return_loop_backoff_ticks: int = 8
-    # Empty Workers refresh a useful home vision belt.  They are scouts, not
-    # disposable expedition units: their stable UUID slot never grows beyond
-    # the 30-cell outer band.
+    # Non-saturated resource discovery is an unbounded frontier search.  A
+    # finer angular lattice lets a large Worker pool keep spreading without
+    # coupling it to the mature 20/25/30 patrol rings.
+    resource_search_direction_slots: int = 64
+    resource_search_stall_ticks: int = 2
+    resource_search_edge_backoff_ticks: int = 8
+    # Mature, saturated economies refresh a useful home vision belt.  These
+    # radii do not constrain non-saturated resource-frontier search.
     exploration_sector_radii: tuple[int, ...] = (20, 25, 30)
     exploration_sector_step: int = 10
     # Known, safely reachable resources are economic destinations rather than
@@ -218,6 +223,9 @@ class TacticConfig:
             self.exploration_rebalance_cooldown_ticks,
             self.exploration_return_stall_ticks,
             self.exploration_return_loop_backoff_ticks,
+            self.resource_search_direction_slots,
+            self.resource_search_stall_ticks,
+            self.resource_search_edge_backoff_ticks,
             self.exploration_sector_step,
             self.resource_memory_ttl,
             self.resource_assignment_persistence_bonus,
@@ -373,6 +381,8 @@ class TacticConfig:
             raise ValueError("exploration sector radii must be unique and ordered")
         if self.exploration_sector_count != 8:
             raise ValueError("the current scout geometry requires eight sectors")
+        if self.resource_search_direction_slots < 8:
+            raise ValueError("resource search needs at least eight direction slots")
         if not 1 <= self.recovery_urgent_percent <= 100:
             raise ValueError("recovery threshold must be within 1..100")
         if self.worker_escape_clearance_radius <= self.worker_escape_trigger_radius:

@@ -396,6 +396,7 @@ def _sync_core_identity(
                     lease_until=0,
                 )
             memory.scout_return_route_leases.clear()
+            memory.resource_search_leases.clear()
             memory.scout_assignment_last_rebalance_tick = None
         memory.core_position = turn.core.position
 
@@ -559,6 +560,9 @@ def _sync_friendly_memory(
     for unit_id in tuple(memory.scout_return_route_leases):
         if unit_id not in living_ids:
             memory.scout_return_route_leases.pop(unit_id, None)
+    for unit_id in tuple(memory.resource_search_leases):
+        if unit_id not in living_ids:
+            memory.resource_search_leases.pop(unit_id, None)
     for unit_id in tuple(memory.worker_task_progress):
         if unit_id not in living_ids:
             memory.worker_task_progress.pop(unit_id, None)

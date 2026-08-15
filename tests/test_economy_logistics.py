@@ -31,13 +31,42 @@ from arena_tactic import (
 )
 from arena_tactic.models import MissionState, WorkerEscapeState
 from arena_tactic.geometry import add_direction, manhattan
-from arena_tactic.planning import weighted_route_to
+from arena_tactic.planning import scout_sector_index, weighted_route_to
 from arena_tactic.resource_allocator import minimum_cost_matching
 from arena_tactic.world import build_world_model
 from tests.helpers import enemy_core, friendly_core, make_turn, uid, unit
 
 
 class EconomyAndLogisticsTests(unittest.TestCase):
+    @staticmethod
+    def _mature_patrol_config(worker_count: int) -> TacticConfig:
+        return TacticConfig(
+            worker_only_population_threshold=1,
+            population_stockpile_threshold=worker_count + 12,
+            stockpile_worker_target=worker_count,
+            stockpile_combat_target=12,
+        )
+
+    @staticmethod
+    def _mature_patrol_support() -> tuple:
+        return tuple(
+            unit(10_000 + index, UnitType.VANGUARD, (20 + index, 20))
+            for index in range(6)
+        ) + tuple(
+            unit(20_000 + index, UnitType.RANGER, (20 + index, 22))
+            for index in range(6)
+        )
+
+    def _mature_patrol_turn(self, *, tick, core, workers, **kwargs):
+        units = (*workers, *self._mature_patrol_support())
+        return make_turn(
+            tick=tick,
+            core=core,
+            units=units,
+            resources=len(units) * 5,
+            **kwargs,
+        )
+
     def test_wounded_ranger_uses_full_health_ranger_cell_on_service_route(self) -> None:
         core = friendly_core(position=(3, 0))
         patient = unit(1, UnitType.RANGER, (0, 0), hp=1)
@@ -3703,12 +3732,12 @@ class EconomyAndLogisticsTests(unittest.TestCase):
 
         tactic.choose_actions(make_turn(tick=1, units=workers, resources=0))
         first_count = sum(
-            mission.mission is UnitMission.EXPLORE
+            mission.mission is UnitMission.RESOURCE_SEARCH
             for mission in tactic.memory.unit_missions.values()
         )
         tactic.choose_actions(make_turn(tick=2, units=workers, resources=0))
         second_count = sum(
-            mission.mission is UnitMission.EXPLORE
+            mission.mission is UnitMission.RESOURCE_SEARCH
             for mission in tactic.memory.unit_missions.values()
         )
 
@@ -3744,8 +3773,8 @@ class EconomyAndLogisticsTests(unittest.TestCase):
             for item in tactic.last_decision_trace["tasks"]
             if item["actor_id"] == str(worker.id)
         )
-        self.assertEqual(task["mission"], "EXPLORE")
-        self.assertEqual(task["reason"], "INFORMATION_GAIN")
+        self.assertEqual(task["mission"], "RESOURCE_SEARCH")
+        self.assertEqual(task["reason"], "RESOURCE_FRONTIER_SEARCH")
         self.assertNotEqual(task["mission"], "ESCAPE")
 
     def test_recent_fogged_threat_keeps_worker_in_escape_mission(self) -> None:
@@ -3827,7 +3856,7 @@ class EconomyAndLogisticsTests(unittest.TestCase):
 
         tactic.choose_actions(second)
 
-        state = tactic.memory.worker_scout_states[worker_id]
+        state = tactic.memory.resource_search_leases[worker_id]
         target = state.target
         self.assertIsNotNone(target)
         self.assertIsInstance(second.plan.unit_actions[worker_id], MoveAction)
@@ -3846,10 +3875,10 @@ class EconomyAndLogisticsTests(unittest.TestCase):
             resources=1,
         )
         tactic.choose_actions(third)
-        self.assertEqual(tactic.memory.worker_scout_states[worker_id].target, target)
+        self.assertEqual(tactic.memory.resource_search_leases[worker_id].target, target)
         self.assertEqual(
             tactic.memory.unit_missions[worker_id].mission,
-            UnitMission.EXPLORE,
+            UnitMission.RESOURCE_SEARCH,
         )
 
     def test_remote_stale_cells_cannot_displace_reachable_frontier(self) -> None:
@@ -3857,7 +3886,7 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         tactic = BalancedTactic()
         tactic.choose_actions(make_turn(tick=1, units=(worker,), resources=0))
         tactic.memory.unit_missions.clear()
-        tactic.memory.worker_scout_states.clear()
+        tactic.memory.resource_search_leases.clear()
         for x in range(80, 90):
             for y in range(80, 90):
                 tactic.memory.known_passable.add((x, y))
@@ -3867,7 +3896,7 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         tactic.choose_actions(turn)
 
         action = turn.plan.unit_actions[worker.id]
-        state = tactic.memory.worker_scout_states[worker.id]
+        state = tactic.memory.resource_search_leases[worker.id]
         self.assertIsInstance(action, MoveAction)
         self.assertIsNotNone(state.target)
         self.assertLess(manhattan(worker.position, state.target), 40)
@@ -3879,6 +3908,180 @@ class EconomyAndLogisticsTests(unittest.TestCase):
             ),
             "NO_REACHABLE_FRONTIER",
         )
+
+    def test_resource_search_beyond_thirty_does_not_return_to_patrol_band(self) -> None:
+        core = friendly_core(position=(0, 0))
+        worker = unit(1, UnitType.WORKER, (31, 0))
+        memory = TacticMemory(
+            core_id=core.id,
+            core_position=core.position,
+            opening_complete=True,
+        )
+        memory.known_passable.update((x, y) for x in range(0, 36) for y in range(-2, 3))
+        tactic = BalancedTactic(memory=memory)
+
+        turn = make_turn(tick=2, core=core, units=(worker,), resources=0)
+        tactic.choose_actions(turn)
+
+        action = turn.plan.unit_actions[worker.id]
+        decision = next(
+            row
+            for row in tactic.last_decision_trace["decisions"]
+            if row["actor_id"] == str(worker.id)
+        )
+        self.assertIsInstance(action, MoveAction)
+        self.assertNotEqual(decision["final"]["mission"], "RETURN_TO_SCOUT_BAND")
+        self.assertEqual(
+            tactic.memory.worker_economy_modes[worker.id],
+            WorkerEconomyMode.RESOURCE_SEARCH,
+        )
+        self.assertGreater(
+            manhattan(core.position, decision["final"]["metadata"]["goal"]),
+            30,
+        )
+
+    def test_two_initial_resource_searchers_take_opposite_frontiers(self) -> None:
+        core = friendly_core(position=(0, 0))
+        workers = (
+            unit(1, UnitType.WORKER, (-1, 0)),
+            unit(2, UnitType.WORKER, (1, 0)),
+        )
+        memory = TacticMemory(
+            core_id=core.id,
+            core_position=core.position,
+            opening_complete=True,
+        )
+        memory.known_passable.update(
+            (x, y) for x in range(-12, 13) for y in range(-12, 13)
+        )
+        tactic = BalancedTactic(memory=memory)
+
+        turn = make_turn(tick=2, core=core, units=workers, resources=0)
+        tactic.choose_actions(turn)
+
+        targets = []
+        for worker in workers:
+            decision = next(
+                row
+                for row in tactic.last_decision_trace["decisions"]
+                if row["actor_id"] == str(worker.id)
+            )
+            targets.append(tuple(decision["final"]["metadata"]["goal"]))
+        first_sector = scout_sector_index(core.position, targets[0])
+        second_sector = scout_sector_index(core.position, targets[1])
+        self.assertEqual((first_sector - second_sector) % 8, 4)
+
+    def test_resource_search_rejects_visible_three_wall_dead_end_target(self) -> None:
+        core = friendly_core(position=(405, -156))
+        worker = unit(1, UnitType.WORKER, (394, -167))
+        dead_end = (394, -166)
+        memory = TacticMemory(
+            core_id=core.id,
+            core_position=core.position,
+            opening_complete=True,
+            worker_scout_states={
+                worker.id: WorkerScoutState(
+                    worker_id=worker.id,
+                    slot=0,
+                    sector_index=0,
+                    stage=0,
+                    phase=WorkerScoutPhase.STALE_REVISIT,
+                    target=dead_end,
+                    assigned_tick=1,
+                )
+            },
+        )
+        memory.known_passable.update(
+            {
+                worker.position,
+                dead_end,
+                (393, -167),
+                (392, -167),
+                (392, -168),
+                (391, -168),
+            }
+        )
+        memory.known_obstacles.update(
+            {(393, -166), (395, -166), (394, -165)}
+        )
+        tactic = BalancedTactic(memory=memory)
+        turn = make_turn(
+            tick=2,
+            core=core,
+            units=(worker,),
+            obstacle_cells=((393, -166), (395, -166), (394, -165)),
+            resources=0,
+        )
+
+        tactic.choose_actions(turn)
+
+        action = turn.plan.unit_actions[worker.id]
+        self.assertIsInstance(action, MoveAction)
+        self.assertNotEqual(action.direction, Direction.DOWN)
+        decision = next(
+            row
+            for row in tactic.last_decision_trace["decisions"]
+            if row["actor_id"] == str(worker.id)
+        )
+        self.assertTrue(decision["final"]["metadata"]["continuation_reachable"])
+        self.assertFalse(decision["final"]["metadata"]["dead_end_rejected"])
+
+    def test_mature_patrol_releases_to_unbounded_search_when_headroom_reaches_five(
+        self,
+    ) -> None:
+        core = friendly_core(position=(0, 0))
+        worker = unit(1, UnitType.WORKER, (20, 0))
+        config = self._mature_patrol_config(1)
+        tactic = BalancedTactic(config)
+        saturated = self._mature_patrol_turn(
+            tick=1,
+            core=core,
+            workers=(worker,),
+        )
+        tactic.choose_actions(saturated)
+        self.assertEqual(
+            tactic.memory.worker_economy_modes[worker.id],
+            WorkerEconomyMode.SATURATED_PATROL,
+        )
+
+        units = (worker, *self._mature_patrol_support())
+        searching = make_turn(
+            tick=2,
+            core=core,
+            units=units,
+            resources=len(units) * 5 - 5,
+        )
+        tactic.choose_actions(searching)
+
+        decision = next(
+            row
+            for row in tactic.last_decision_trace["decisions"]
+            if row["actor_id"] == str(worker.id)
+        )
+        self.assertEqual(decision["final"]["mission"], "RESOURCE_SEARCH")
+        self.assertNotEqual(decision["final"]["reason"], "RETURN_TO_SCOUT_BAND")
+        self.assertIn(worker.id, tactic.memory.resource_search_leases)
+
+    def test_every_resource_search_move_carries_a_viability_proof(self) -> None:
+        workers = tuple(
+            unit(index, UnitType.WORKER, (index + 1, 0))
+            for index in range(1, 7)
+        )
+        tactic = BalancedTactic()
+        turn = make_turn(tick=1, units=workers, resources=0)
+
+        tactic.choose_actions(turn)
+
+        decisions = {
+            row["actor_id"]: row["final"]
+            for row in tactic.last_decision_trace["decisions"]
+        }
+        for worker in workers:
+            final = decisions[str(worker.id)]
+            self.assertEqual(final["mission"], "RESOURCE_SEARCH")
+            self.assertTrue(final["metadata"]["continuation_reachable"])
+            self.assertFalse(final["metadata"]["dead_end_rejected"])
+            self.assertGreater(final["metadata"]["information_gain"], 0)
 
     def test_far_persisted_scout_is_recalled_to_a_bounded_patrol_band(self) -> None:
         core = friendly_core(position=(0, 0))
@@ -3901,8 +4104,15 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         memory.known_passable.update(
             (x, y) for x in range(-5, 91) for y in range(-5, 6)
         )
-        tactic = BalancedTactic(memory=memory)
-        turn = make_turn(tick=2, core=core, units=(worker,), resources=0)
+        tactic = BalancedTactic(
+            self._mature_patrol_config(1),
+            memory=memory,
+        )
+        turn = self._mature_patrol_turn(
+            tick=2,
+            core=core,
+            workers=(worker,),
+        )
 
         tactic.choose_actions(turn)
 
@@ -3937,9 +4147,9 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         self.assertTrue(
             all(isinstance(turn.plan.unit_actions[worker.id], MoveAction) for worker in workers)
         )
-        self.assertEqual(len(tactic.memory.worker_scout_states), len(workers))
+        self.assertEqual(len(tactic.memory.resource_search_leases), len(workers))
         self.assertTrue(
-            all(state.target is not None for state in tactic.memory.worker_scout_states.values())
+            all(state.target is not None for state in tactic.memory.resource_search_leases.values())
         )
 
     def test_scout_slots_remain_unique_while_workers_are_busy(self) -> None:
@@ -3954,8 +4164,8 @@ class EconomyAndLogisticsTests(unittest.TestCase):
                 resources=0,
             )
         )
-        self.assertIn(uid(1), tactic.memory.worker_scout_states)
-        self.assertNotIn(uid(2), tactic.memory.worker_scout_states)
+        self.assertIn(uid(1), tactic.memory.resource_search_leases)
+        self.assertNotIn(uid(2), tactic.memory.resource_search_leases)
         tactic.choose_actions(
             make_turn(
                 tick=2,
@@ -3979,7 +4189,10 @@ class EconomyAndLogisticsTests(unittest.TestCase):
             )
         )
 
-        slots = [state.slot for state in tactic.memory.worker_scout_states.values()]
+        slots = [
+            state.direction_slot
+            for state in tactic.memory.resource_search_leases.values()
+        ]
         self.assertEqual(len(slots), len(set(slots)))
 
     def test_active_empty_scouts_are_balanced_across_all_eight_sectors(self) -> None:
@@ -3987,9 +4200,15 @@ class EconomyAndLogisticsTests(unittest.TestCase):
             unit(index, UnitType.WORKER, ((index % 5) - 2, index // 5 + 2))
             for index in range(1, 21)
         )
-        tactic = BalancedTactic()
+        tactic = BalancedTactic(self._mature_patrol_config(len(workers)))
 
-        tactic.choose_actions(make_turn(tick=1, units=workers, resources=0))
+        tactic.choose_actions(
+            self._mature_patrol_turn(
+                tick=1,
+                core=friendly_core(),
+                workers=workers,
+            )
+        )
 
         states = tuple(tactic.memory.worker_scout_states.values())
         sector_counts = Counter(state.sector_index for state in states)
@@ -4014,10 +4233,13 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         memory.known_passable.update(
             (x, y) for x in range(-35, 36) for y in range(-35, 36)
         )
-        tactic = BalancedTactic(memory=memory)
+        tactic = BalancedTactic(
+            self._mature_patrol_config(len(workers)),
+            memory=memory,
+        )
 
         tactic.choose_actions(
-            make_turn(tick=1, core=core, units=workers, resources=0)
+            self._mature_patrol_turn(tick=1, core=core, workers=workers)
         )
 
         states = tuple(
@@ -4042,9 +4264,15 @@ class EconomyAndLogisticsTests(unittest.TestCase):
             unit(index, UnitType.WORKER, (index, 1), cargo=(1 if index == 9 else 0))
             for index in range(1, 10)
         )
-        tactic = BalancedTactic()
+        tactic = BalancedTactic(self._mature_patrol_config(8))
 
-        tactic.choose_actions(make_turn(tick=1, units=workers, resources=0))
+        tactic.choose_actions(
+            self._mature_patrol_turn(
+                tick=1,
+                core=friendly_core(),
+                workers=workers,
+            )
+        )
 
         active = tuple(
             state
@@ -4078,13 +4306,15 @@ class EconomyAndLogisticsTests(unittest.TestCase):
             (x, y) for x in range(-4, 5) for y in range(-34, 2)
         )
         memory.known_obstacles.add((0, -31))
-        tactic = BalancedTactic(memory=memory)
-        first = make_turn(
+        tactic = BalancedTactic(
+            self._mature_patrol_config(1),
+            memory=memory,
+        )
+        first = self._mature_patrol_turn(
             tick=2,
             core=core,
-            units=(unit(1, UnitType.WORKER, (0, -32)),),
+            workers=(unit(1, UnitType.WORKER, (0, -32)),),
             obstacle_cells=((0, -31),),
-            resources=0,
         )
 
         tactic.choose_actions(first)
@@ -4092,12 +4322,11 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         self.assertIsInstance(first_action, MoveAction)
         self.assertEqual(first_action.direction, Direction.LEFT)
 
-        second = make_turn(
+        second = self._mature_patrol_turn(
             tick=3,
             core=core,
-            units=(unit(1, UnitType.WORKER, (-1, -32)),),
+            workers=(unit(1, UnitType.WORKER, (-1, -32)),),
             obstacle_cells=((0, -31),),
-            resources=0,
         )
         tactic.choose_actions(second)
         second_action = second.plan.unit_actions[worker_id]
@@ -4127,8 +4356,15 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         memory.known_passable.update(
             (x, y) for x in range(-3, 4) for y in range(-32, 2)
         )
-        tactic = BalancedTactic(memory=memory)
-        turn = make_turn(tick=2, core=core, units=(worker,), resources=0)
+        tactic = BalancedTactic(
+            self._mature_patrol_config(1),
+            memory=memory,
+        )
+        turn = self._mature_patrol_turn(
+            tick=2,
+            core=core,
+            workers=(worker,),
+        )
 
         tactic.choose_actions(turn)
 
@@ -4180,10 +4416,17 @@ class EconomyAndLogisticsTests(unittest.TestCase):
         memory.known_passable.update(
             (x, y) for x in range(-4, 5) for y in range(-34, 2)
         )
-        tactic = BalancedTactic(memory=memory)
+        tactic = BalancedTactic(
+            self._mature_patrol_config(1),
+            memory=memory,
+        )
 
         tactic.choose_actions(
-            make_turn(tick=5, core=core, units=(worker,), resources=0)
+            self._mature_patrol_turn(
+                tick=5,
+                core=core,
+                workers=(worker,),
+            )
         )
 
         lease = tactic.memory.scout_return_route_leases[worker.id]

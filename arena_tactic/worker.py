@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from math import atan2, pi
 from uuid import UUID
 
 from arena_hero import CoreState, Direction, Position, UnitType
@@ -18,6 +19,7 @@ from .models import (
     IntentAction,
     MissionState,
     ResourceWorkOrder,
+    ResourceSearchLease,
     UnitMission,
     WorkerEconomyMode,
     WorkerSurvivalLease,
@@ -219,6 +221,7 @@ class WorkerPlanner:
             self.memory.worker_parking_assignments.clear()
 
         if economy_policy.saturated_patrol_active:
+            self._suspend_resource_search_leases(workers)
             self.memory.resource_work_orders.clear()
             self.memory.resource_candidate_counts.clear()
             self.memory.resource_rejection_counts.clear()
@@ -254,6 +257,16 @@ class WorkerPlanner:
                 }
             )
         else:
+            # Legacy ring missions belong exclusively to mature saturated
+            # patrol.  They must never pull an active resource searcher back
+            # toward the 20/25/30 belt.
+            self.memory.scout_return_route_leases.clear()
+            for worker_id, mission in tuple(self.memory.unit_missions.items()):
+                if mission.mission in {
+                    UnitMission.EXPLORE,
+                    UnitMission.RETURN_TO_SCOUT_BAND,
+                }:
+                    self.memory.unit_missions.pop(worker_id, None)
             available = tuple(
                 worker
                 for worker in workers
@@ -589,9 +602,26 @@ class WorkerPlanner:
                 else set()
             ),
         )
+        blocked, _ = self._exploration_navigation(
+            world,
+            projection,
+            worker,
+            service,
+        )
+        route_viability = None
+        if route is not None and route.first_position is not None:
+            route_viability = self._worker_move_viability(
+                world,
+                worker.position,
+                route.first_position,
+                target=target,
+                blocked=blocked,
+            )
         if (
             route is not None
             and route.first_direction is not None
+            and route_viability is not None
+            and route_viability.viable
             and self._manual_allowed(worker.id, route.first_direction, world.tick)
         ):
             intents = [
@@ -608,7 +638,7 @@ class WorkerPlanner:
                     metadata=(
                         ("staging_post", target),
                         ("allow_protected", True),
-                    ),
+                    ) + route_viability.metadata,
                 )
             ]
         else:
@@ -639,6 +669,15 @@ class WorkerPlanner:
             ):
                 continue
             immediate, future, remembered = projection.worker_exposure(destination)
+            viability = self._worker_move_viability(
+                world,
+                worker.position,
+                destination,
+                target=target,
+                blocked=blocked,
+            )
+            if not viability.viable:
+                continue
             home_distance = manhattan(destination, world.core.position)
             home_progress = (
                 home_distance
@@ -658,10 +697,17 @@ class WorkerPlanner:
                     ),
                     direction,
                     destination,
+                    viability,
                 )
             )
-        preferred_step = None if route is None else route.first_position
-        for score, direction, destination in sorted(options)[:4]:
+        preferred_step = (
+            route.first_position
+            if route is not None
+            and route_viability is not None
+            and route_viability.viable
+            else None
+        )
+        for score, direction, destination, viability in sorted(options)[:4]:
             if destination == preferred_step:
                 continue
             intents.append(
@@ -678,7 +724,7 @@ class WorkerPlanner:
                     metadata=(
                         ("staging_post", target),
                         ("allow_protected", destination in service_cells),
-                    ),
+                    ) + viability.metadata,
                 )
             )
         intents.append(
@@ -1245,7 +1291,7 @@ class WorkerPlanner:
         explorers = tuple(
             worker for worker in available if worker.id not in resources
         )
-        exploration = self._exploration_assignments(
+        exploration = self._resource_search_assignments(
             world,
             projection,
             explorers,
@@ -1605,13 +1651,7 @@ class WorkerPlanner:
                 index,
             )
             rows.append((score, direction, destination, gain, viability))
-        scout_state = self.memory.worker_scout_states.get(worker.id)
-        mission = (
-            UnitMission.RETURN_TO_SCOUT_BAND
-            if scout_state is not None
-            and scout_state.phase is WorkerScoutPhase.RETURN_TO_BAND
-            else UnitMission.EXPLORE
-        )
+        mission = UnitMission.RESOURCE_SEARCH
         intents = [
             ActionIntent.move(
                 worker.id,
@@ -1636,7 +1676,7 @@ class WorkerPlanner:
             ActionIntent.simple(
                 worker.id,
                 IntentAction.WAIT,
-                UnitMission.EXPLORE,
+                UnitMission.RESOURCE_SEARCH,
                 73,
                 target_position=old_target,
                 reason=(
@@ -1666,11 +1706,44 @@ class WorkerPlanner:
         ):
             return []
         scout_state = self.memory.worker_scout_states.get(worker.id)
+        search_lease = self.memory.resource_search_leases.get(worker.id)
         mission = (
-            UnitMission.RETURN_TO_SCOUT_BAND
-            if scout_state is not None
-            and scout_state.phase is WorkerScoutPhase.RETURN_TO_BAND
-            else UnitMission.EXPLORE
+            UnitMission.RESOURCE_SEARCH
+            if search_lease is not None and search_lease.target == target
+            else (
+                UnitMission.RETURN_TO_SCOUT_BAND
+                if scout_state is not None
+                and scout_state.phase is WorkerScoutPhase.RETURN_TO_BAND
+                else UnitMission.EXPLORE
+            )
+        )
+        blocked, costs = self._exploration_navigation(
+            world,
+            projection,
+            worker,
+            service,
+        )
+        viability = route.viability or self._worker_move_viability(
+            world,
+            worker.position,
+            route.first_position,
+            target=target,
+            blocked=blocked,
+        )
+        if not viability.viable:
+            if mission is UnitMission.RESOURCE_SEARCH:
+                self._invalidate_resource_search_target(
+                    worker.id,
+                    world.tick,
+                    target,
+                    edge=(worker.position, route.first_position),
+                )
+            return []
+        route = Route(
+            route.distance,
+            route.first_direction,
+            route.first_position,
+            viability,
         )
         intents = [
             ActionIntent.move(
@@ -1682,29 +1755,23 @@ class WorkerPlanner:
                 risk=self._risk(projection, route.first_position),
                 tie_break=(-gain, route.distance),
                 reason=(
-                    "RETURN_TO_SCOUT_BAND"
-                    if mission is UnitMission.RETURN_TO_SCOUT_BAND
-                    else "INFORMATION_GAIN"
+                    "RESOURCE_FRONTIER_SEARCH"
+                    if mission is UnitMission.RESOURCE_SEARCH
+                    else (
+                        "RETURN_TO_SCOUT_BAND"
+                        if mission is UnitMission.RETURN_TO_SCOUT_BAND
+                        else "INFORMATION_GAIN"
+                    )
                 ),
                 metadata=(("information_gain", gain), ("goal", target))
                 + (() if route.viability is None else route.viability.metadata),
             ),
         ]
-        blocked, costs = self._exploration_navigation(
-            world,
-            projection,
-            worker,
-            service,
-        )
         previous = None
         history = self.memory.position_history.get(worker.id, ())
         if len(history) >= 2:
             previous = history[-2]
         alternatives = []
-        require_continuation = (
-            manhattan(worker.position, target)
-            <= self.config.exploration_search_radius
-        )
         for index, (direction, destination) in enumerate(
             cardinal_neighbors(worker.position)
         ):
@@ -1737,7 +1804,7 @@ class WorkerPlanner:
                 )
                 if remaining_route is None:
                     continue
-            viability = move_viability(
+            viability = self._worker_move_viability(
                 world,
                 worker.position,
                 destination,
@@ -1745,15 +1812,12 @@ class WorkerPlanner:
                 blocked=blocked,
                 node_limit=(
                     self.config.path_node_limit
-                    if mission is UnitMission.RETURN_TO_SCOUT_BAND
+                    if mission in {
+                        UnitMission.RETURN_TO_SCOUT_BAND,
+                        UnitMission.RESOURCE_SEARCH,
+                    }
                     else min(self.config.path_node_limit, 512)
                 ),
-                require_continuation=(
-                    True
-                    if mission is UnitMission.RETURN_TO_SCOUT_BAND
-                    else require_continuation
-                ),
-                require_open_area=not require_continuation,
             )
             if not viability.viable:
                 continue
@@ -1782,9 +1846,13 @@ class WorkerPlanner:
                 risk=score[0] * 100 + score[1] * 10 + score[2],
                 tie_break=score,
                 reason=(
-                    "RETURN_TO_SCOUT_BAND_ALTERNATE"
-                    if mission is UnitMission.RETURN_TO_SCOUT_BAND
-                    else "EXPLORATION_ALTERNATE_STEP"
+                    "RESOURCE_FRONTIER_ALTERNATE"
+                    if mission is UnitMission.RESOURCE_SEARCH
+                    else (
+                        "RETURN_TO_SCOUT_BAND_ALTERNATE"
+                        if mission is UnitMission.RETURN_TO_SCOUT_BAND
+                        else "EXPLORATION_ALTERNATE_STEP"
+                    )
                 ),
                 metadata=(("information_gain", gain), ("goal", target))
                 + viability.metadata,
@@ -3484,6 +3552,668 @@ class WorkerPlanner:
             )
         )
         return intents
+
+    def _suspend_resource_search_leases(
+        self,
+        workers: tuple[EntitySnapshot, ...],
+    ) -> None:
+        """Keep angular identity while removing non-saturated search targets."""
+
+        living = {worker.id for worker in workers}
+        for worker_id, lease in tuple(self.memory.resource_search_leases.items()):
+            if worker_id not in living:
+                self.memory.resource_search_leases.pop(worker_id, None)
+                continue
+            self.memory.resource_search_leases[worker_id] = replace(
+                lease,
+                target=None,
+                waypoint=None,
+                last_route_distance=None,
+                stalled_ticks=0,
+                blocked_edge=None,
+                backoff_until=0,
+                information_gain=0,
+                visible_gain=0,
+                overlap_cells=0,
+            )
+            mission = self.memory.unit_missions.get(worker_id)
+            if mission is not None and mission.mission is UnitMission.RESOURCE_SEARCH:
+                self.memory.unit_missions.pop(worker_id, None)
+
+    def _resource_search_assignments(
+        self,
+        world: WorldModel,
+        projection: TacticalMap,
+        workers: tuple[EntitySnapshot, ...],
+        service: CoreServiceQueue,
+    ) -> dict[UUID, tuple[Position, Route, int]]:
+        """Assign sticky, unbounded and angularly dispersed frontier work.
+
+        This is intentionally independent from ``_exploration_assignments``:
+        the latter is the bounded mature-stockpile patrol.  A resource search
+        advances from one proven reachable frontier to the next and therefore
+        has no Core-radius ceiling.
+        """
+
+        assert world.core is not None
+        self._sync_resource_search_leases(
+            workers,
+            world.tick,
+            world.core.position,
+        )
+        if not workers:
+            return {}
+
+        assignments: dict[UUID, tuple[Position, Route, int]] = {}
+        claimed: set[Position] = set()
+        claimed_visible: set[Position] = set()
+        last_visible = dict(world.cell_last_visible)
+        global_frontiers_by_slot: dict[int, list[Position]] | None = None
+
+        for worker in sorted(
+            workers,
+            key=lambda item: (
+                self.memory.resource_search_leases[item.id].direction_slot,
+                item.id.bytes,
+            ),
+        ):
+            lease = self.memory.resource_search_leases[worker.id]
+            blocked, costs = self._exploration_navigation(
+                world,
+                projection,
+                worker,
+                service,
+            )
+            history = self.memory.position_history.get(worker.id, ())
+            loop_period = self._loop_period(history)
+            if (
+                loop_period is not None
+                and lease.target is not None
+                and (loop_period > 1 or lease.stalled_ticks >= 1)
+            ):
+                edge = (
+                    (history[-1], history[-2])
+                    if len(history) >= 2
+                    else None
+                )
+                self._invalidate_resource_search_target(
+                    worker.id,
+                    world.tick,
+                    lease.target,
+                    edge=edge,
+                )
+                lease = self.memory.resource_search_leases[worker.id]
+
+            if lease.target is not None:
+                target_observed = (
+                    lease.target in world.visible_cells
+                    and lease.target not in world.visible_resources
+                )
+                target_exhausted = (
+                    lease.target in world.known_passable
+                    and information_gain(
+                        lease.target,
+                        tick=world.tick,
+                        last_visible=last_visible,
+                        refresh_ticks=self.config.exploration_refresh_ticks,
+                    ) <= 0
+                )
+                if target_observed or target_exhausted:
+                    self._invalidate_resource_search_target(
+                        worker.id,
+                        world.tick,
+                        lease.target,
+                    )
+                    lease = self.memory.resource_search_leases[worker.id]
+
+            routed = None
+            if (
+                lease.target is not None
+                and lease.target not in claimed
+                and self.memory.target_backoff_until.get(lease.target, -1) < world.tick
+            ):
+                routed = self._resource_search_route(
+                    world,
+                    worker,
+                    lease.target,
+                    blocked,
+                    costs,
+                )
+                if routed is not None:
+                    route, waypoint, estimate = routed
+                    progressed = bool(
+                        lease.last_route_distance is None
+                        or estimate < lease.last_route_distance
+                    )
+                    stalled = 0 if progressed else lease.stalled_ticks + 1
+                    if stalled >= self.config.resource_search_stall_ticks:
+                        self._invalidate_resource_search_target(
+                            worker.id,
+                            world.tick,
+                            lease.target,
+                            edge=(worker.position, route.first_position),
+                        )
+                        lease = self.memory.resource_search_leases[worker.id]
+                        routed = None
+                    else:
+                        lease = replace(
+                            lease,
+                            waypoint=waypoint,
+                            last_position=worker.position,
+                            last_route_distance=estimate,
+                            stalled_ticks=stalled,
+                        )
+
+            if routed is None:
+                distances, parents = weighted_distance_field(
+                    world,
+                    worker.position,
+                    node_limit=min(
+                        self.config.path_node_limit,
+                        self.config.distance_field_node_limit,
+                    ),
+                    blocked=blocked,
+                    cell_costs=costs,
+                )
+                local = exploration_candidates(
+                    world,
+                    worker.position,
+                    distances=distances,
+                    # Search every cell actually reached by this bounded field;
+                    # the Core distance is deliberately irrelevant.
+                    search_radius=1 << 20,
+                    limit=max(32, self.config.exploration_candidate_limit),
+                    backoff=frozenset(self.memory.target_backoff_until),
+                )
+                search_candidates = local
+                if not search_candidates:
+                    if global_frontiers_by_slot is None:
+                        global_frontiers_by_slot = {}
+                        for frontier in self._global_resource_frontiers(world):
+                            slot = self._resource_search_direction_slot(
+                                world.core.position,
+                                frontier,
+                                self.config.resource_search_direction_slots,
+                            )
+                            global_frontiers_by_slot.setdefault(slot, []).append(
+                                frontier
+                            )
+                    rows: list[Position] = []
+                    slot_count = self.config.resource_search_direction_slots
+                    for offset in range(slot_count // 2 + 1):
+                        slot_rows = (
+                            (lease.direction_slot + offset) % slot_count,
+                            (lease.direction_slot - offset) % slot_count,
+                        )
+                        for slot in dict.fromkeys(slot_rows):
+                            rows.extend(global_frontiers_by_slot.get(slot, ())[:16])
+                        if len(rows) >= 64:
+                            break
+                    search_candidates = tuple(rows[:64])
+                ordered_candidates = self._rank_resource_frontiers(
+                    world,
+                    worker,
+                    lease,
+                    search_candidates,
+                    claimed,
+                    claimed_visible,
+                    last_visible,
+                )
+                chosen = None
+                for target, gain, visible_gain, overlap in ordered_candidates[:12]:
+                    route = route_from_field(
+                        worker.position,
+                        target,
+                        distances,
+                        parents,
+                        obstacles=world.known_obstacles,
+                        allow_unknown_endpoint=True,
+                    )
+                    routed_candidate = None
+                    if route is not None and route.first_direction is not None:
+                        viability = self._worker_move_viability(
+                            world,
+                            worker.position,
+                            route.first_position,
+                            target=target,
+                            blocked=blocked,
+                        )
+                        if viability.viable:
+                            routed_candidate = (
+                                Route(
+                                    route.distance,
+                                    route.first_direction,
+                                    route.first_position,
+                                    viability,
+                                ),
+                                target,
+                                route.distance,
+                            )
+                    if routed_candidate is None:
+                        routed_candidate = self._resource_search_route(
+                            world,
+                            worker,
+                            target,
+                            blocked,
+                            costs,
+                        )
+                    if routed_candidate is None:
+                        continue
+                    chosen = (
+                        target,
+                        gain,
+                        visible_gain,
+                        overlap,
+                        routed_candidate,
+                    )
+                    break
+                if chosen is None:
+                    local_rows = []
+                    for index, (direction, target) in enumerate(
+                        cardinal_neighbors(worker.position)
+                    ):
+                        if (
+                            target in blocked
+                            or target in world.known_obstacles
+                            or target not in world.known_passable
+                            or target in claimed
+                        ):
+                            continue
+                        gain = information_gain(
+                            target,
+                            tick=world.tick,
+                            last_visible=last_visible,
+                            refresh_ticks=self.config.exploration_refresh_ticks,
+                        )
+                        if gain <= 0:
+                            continue
+                        viability = self._worker_move_viability(
+                            world,
+                            worker.position,
+                            target,
+                            target=target,
+                            blocked=blocked,
+                            node_limit=max(1, self.config.path_node_limit),
+                        )
+                        if not viability.viable:
+                            continue
+                        visible = scout_visible_cells(
+                            target,
+                            world.known_obstacles,
+                        )
+                        visible_gain = len(visible - claimed_visible)
+                        overlap = len(visible & claimed_visible)
+                        candidate_slot = self._resource_search_direction_slot(
+                            world.core.position,
+                            target,
+                            self.config.resource_search_direction_slots,
+                        )
+                        angular_gap = min(
+                            (
+                                candidate_slot - lease.direction_slot
+                            ) % self.config.resource_search_direction_slots,
+                            (
+                                lease.direction_slot - candidate_slot
+                            ) % self.config.resource_search_direction_slots,
+                        )
+                        local_rows.append(
+                            (
+                                (
+                                    angular_gap,
+                                    -visible_gain,
+                                    overlap,
+                                    -gain,
+                                    index,
+                                ),
+                                target,
+                                gain,
+                                visible_gain,
+                                overlap,
+                                Route(1, direction, target, viability),
+                            )
+                        )
+                    if local_rows:
+                        _, target, gain, visible_gain, overlap, local_route = min(
+                            local_rows,
+                            key=lambda row: row[0],
+                        )
+                        chosen = (
+                            target,
+                            gain,
+                            visible_gain,
+                            overlap,
+                            (local_route, target, 1),
+                        )
+                if chosen is None:
+                    self.memory.resource_search_leases[worker.id] = replace(
+                        lease,
+                        target=None,
+                        waypoint=None,
+                        last_position=worker.position,
+                        last_route_distance=None,
+                        stalled_ticks=lease.stalled_ticks + 1,
+                    )
+                    continue
+                target, gain, visible_gain, overlap, routed = chosen
+                route, waypoint, estimate = routed
+                lease = replace(
+                    lease,
+                    target=target,
+                    waypoint=waypoint,
+                    assigned_tick=world.tick,
+                    last_position=worker.position,
+                    last_route_distance=estimate,
+                    stalled_ticks=0,
+                    route_version=lease.route_version + 1,
+                    blocked_edge=None,
+                    backoff_until=0,
+                    information_gain=gain,
+                    visible_gain=visible_gain,
+                    overlap_cells=overlap,
+                )
+
+            if routed is None or lease.target is None:
+                self.memory.resource_search_leases[worker.id] = lease
+                continue
+            route, waypoint, estimate = routed
+            lease = replace(
+                lease,
+                waypoint=waypoint,
+                last_position=worker.position,
+                last_route_distance=estimate,
+            )
+            self.memory.resource_search_leases[worker.id] = lease
+            self.memory.unit_missions[worker.id] = MissionState(
+                UnitMission.RESOURCE_SEARCH,
+                lease.target,
+                lease.assigned_tick,
+                failures=lease.stalled_ticks,
+            )
+            claimed.add(lease.target)
+            claimed_visible.update(
+                scout_visible_cells(lease.target, world.known_obstacles)
+            )
+            assignments[worker.id] = (
+                lease.target,
+                route,
+                lease.information_gain,
+            )
+        return assignments
+
+    def _sync_resource_search_leases(
+        self,
+        workers: tuple[EntitySnapshot, ...],
+        tick: int,
+        core_position: Position,
+    ) -> None:
+        active = tuple(sorted(workers, key=lambda item: item.id.bytes))
+        active_ids = {worker.id for worker in active}
+        for worker_id in tuple(self.memory.resource_search_leases):
+            if worker_id not in active_ids:
+                self.memory.resource_search_leases.pop(worker_id, None)
+                mission = self.memory.unit_missions.get(worker_id)
+                if mission is not None and mission.mission is UnitMission.RESOURCE_SEARCH:
+                    self.memory.unit_missions.pop(worker_id, None)
+
+        slots = self.config.resource_search_direction_slots
+        used = {
+            lease.direction_slot % slots
+            for lease in self.memory.resource_search_leases.values()
+        }
+        for worker in active:
+            if worker.id in self.memory.resource_search_leases:
+                continue
+            slot = (
+                self._resource_search_direction_slot(
+                    core_position,
+                    worker.position,
+                    slots,
+                )
+                if not used and worker.position != core_position
+                else self._largest_search_gap_slot(used, slots)
+            )
+            used.add(slot)
+            self.memory.resource_search_leases[worker.id] = ResourceSearchLease(
+                worker_id=worker.id,
+                direction_slot=slot,
+                target=None,
+                waypoint=None,
+                assigned_tick=tick,
+                last_position=worker.position,
+            )
+
+    @staticmethod
+    def _largest_search_gap_slot(used: set[int], slots: int) -> int:
+        if not used:
+            return 0
+        ordered = sorted(used)
+        rows = []
+        for index, start in enumerate(ordered):
+            end = ordered[(index + 1) % len(ordered)]
+            gap = (end - start) % slots
+            if len(ordered) == 1:
+                gap = slots
+            rows.append((-gap, start, (start + max(1, gap // 2)) % slots))
+        for _, _, candidate in sorted(rows):
+            if candidate not in used:
+                return candidate
+        return next(slot for slot in range(slots) if slot not in used)
+
+    def _global_resource_frontiers(self, world: WorldModel) -> tuple[Position, ...]:
+        rows: set[Position] = set()
+        for cell in world.known_passable:
+            for _, neighbor in cardinal_neighbors(cell):
+                if (
+                    neighbor not in world.known_passable
+                    and neighbor not in world.known_obstacles
+                    and neighbor not in world.visible_cells
+                    and self.memory.target_backoff_until.get(neighbor, -1) < world.tick
+                ):
+                    rows.add(neighbor)
+        return tuple(sorted(rows))
+
+    def _rank_resource_frontiers(
+        self,
+        world: WorldModel,
+        worker: EntitySnapshot,
+        lease: ResourceSearchLease,
+        candidates: tuple[Position, ...],
+        claimed: set[Position],
+        claimed_visible: set[Position],
+        last_visible: dict[Position, int],
+    ) -> tuple[tuple[Position, int, int, int], ...]:
+        assert world.core is not None
+        slots = self.config.resource_search_direction_slots
+        rows = []
+        for candidate in candidates:
+            if (
+                candidate in claimed
+                or candidate in world.known_obstacles
+                or self.memory.target_backoff_until.get(candidate, -1) >= world.tick
+            ):
+                continue
+            gain = information_gain(
+                candidate,
+                tick=world.tick,
+                last_visible=last_visible,
+                refresh_ticks=self.config.exploration_refresh_ticks,
+            )
+            if gain <= 0:
+                continue
+            visible = scout_visible_cells(candidate, world.known_obstacles)
+            visible_gain = len(visible - claimed_visible)
+            overlap = len(visible & claimed_visible)
+            candidate_slot = self._resource_search_direction_slot(
+                world.core.position,
+                candidate,
+                slots,
+            )
+            angular_gap = min(
+                (candidate_slot - lease.direction_slot) % slots,
+                (lease.direction_slot - candidate_slot) % slots,
+            )
+            rows.append(
+                (
+                    (
+                        angular_gap,
+                        -visible_gain,
+                        overlap,
+                        -gain,
+                        manhattan(worker.position, candidate),
+                        # Core range is a weak deterministic tie break only.
+                        -manhattan(world.core.position, candidate),
+                        candidate,
+                    ),
+                    candidate,
+                    gain,
+                    visible_gain,
+                    overlap,
+                )
+            )
+        rows.sort(key=lambda row: row[0])
+        return tuple((target, gain, visible_gain, overlap) for _, target, gain, visible_gain, overlap in rows)
+
+    @staticmethod
+    def _resource_search_direction_slot(
+        core: Position,
+        target: Position,
+        slots: int,
+    ) -> int:
+        if target == core:
+            return 0
+        angle = (atan2(target[1] - core[1], target[0] - core[0]) + pi / 2) % (
+            2 * pi
+        )
+        width = 2 * pi / slots
+        return int((angle + width / 2) // width) % slots
+
+    def _resource_search_route(
+        self,
+        world: WorldModel,
+        worker: EntitySnapshot,
+        target: Position,
+        blocked: frozenset[Position],
+        costs: dict[Position, int],
+    ) -> tuple[Route, Position, int] | None:
+        lease = self.memory.resource_search_leases.get(worker.id)
+        effective = set(blocked)
+        if (
+            lease is not None
+            and lease.blocked_edge is not None
+            and worker.position == lease.blocked_edge[0]
+            and world.tick <= lease.backoff_until
+        ):
+            effective.add(lease.blocked_edge[1])
+        effective.discard(worker.position)
+        route = weighted_route_to(
+            world,
+            worker.position,
+            target,
+            node_limit=self.config.path_node_limit,
+            blocked=frozenset(effective),
+            cell_costs=costs,
+            allow_unknown_endpoint=True,
+        )
+        waypoint = target
+        segmented = False
+        if route is None:
+            progress = weighted_progress_route(
+                world,
+                worker.position,
+                target,
+                node_limit=self.config.path_node_limit,
+                blocked=frozenset(effective),
+                cell_costs=costs,
+            )
+            if progress is None:
+                return None
+            route, waypoint = progress
+            segmented = True
+        if route.first_direction is None or route.first_position is None:
+            return None
+        viability = self._worker_move_viability(
+            world,
+            worker.position,
+            route.first_position,
+            target=waypoint,
+            blocked=frozenset(effective),
+        )
+        if not viability.viable:
+            return None
+        proved = Route(
+            route.distance,
+            route.first_direction,
+            route.first_position,
+            viability,
+        )
+        estimate = route.distance + (manhattan(waypoint, target) if segmented else 0)
+        return proved, waypoint, estimate
+
+    def _invalidate_resource_search_target(
+        self,
+        worker_id: UUID,
+        tick: int,
+        target: Position,
+        *,
+        edge: tuple[Position, Position] | None = None,
+    ) -> None:
+        lease = self.memory.resource_search_leases.get(worker_id)
+        if lease is None:
+            return
+        backoff_until = tick + self.config.resource_search_edge_backoff_ticks
+        self.memory.target_backoff_until[target] = backoff_until
+        self.memory.resource_search_leases[worker_id] = replace(
+            lease,
+            target=None,
+            waypoint=None,
+            assigned_tick=tick,
+            last_route_distance=None,
+            stalled_ticks=0,
+            route_version=lease.route_version + 1,
+            blocked_edge=edge,
+            backoff_until=backoff_until,
+            information_gain=0,
+            visible_gain=0,
+            overlap_cells=0,
+        )
+        mission = self.memory.unit_missions.get(worker_id)
+        if mission is not None and mission.mission is UnitMission.RESOURCE_SEARCH:
+            self.memory.unit_missions.pop(worker_id, None)
+
+    @staticmethod
+    def _loop_period(history: tuple[Position, ...]) -> int | None:
+        for period in range(1, min(4, len(history) // 2) + 1):
+            if history[-period:] == history[-2 * period : -period]:
+                return period
+        return None
+
+    def _worker_move_viability(
+        self,
+        world: WorldModel,
+        origin: Position,
+        destination: Position,
+        *,
+        target: Position,
+        blocked: frozenset[Position],
+        node_limit: int | None = None,
+        terminal_exception: str | None = None,
+    ) -> MoveViability:
+        """Single proof gate used by primary and alternate Worker routes."""
+
+        return move_viability(
+            world,
+            origin,
+            destination,
+            target=target,
+            blocked=blocked,
+            node_limit=(
+                min(self.config.path_node_limit, 512)
+                if node_limit is None
+                else node_limit
+            ),
+            require_continuation=terminal_exception is None,
+            terminal_exception=terminal_exception,
+        )
 
     def _exploration_assignments(self, world, projection, workers, service):
         assert world.core is not None

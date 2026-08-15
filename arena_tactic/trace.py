@@ -508,6 +508,8 @@ class DecisionTraceBuilder:
             and core_position is not None
             and manhattan(unit.position, core_position) > scout_limit
             for unit in world.friendlies
+            if economy_policy is not None
+            and economy_policy.saturated_patrol_active
         )
         cargo_beyond_staging = sum(
             unit.unit_type is UnitType.WORKER
@@ -589,6 +591,34 @@ class DecisionTraceBuilder:
         ) and not (
             economy_policy is not None
             and economy_policy.saturated_patrol_active
+        )
+        resource_searches = tuple(
+            (worker_id, lease)
+            for worker_id, lease in self.memory.resource_search_leases.items()
+            if (unit := world.friendly(worker_id)) is not None
+            and unit.unit_type is UnitType.WORKER
+            and unit.cargo == 0
+            and unit.hp >= UNIT_MAX_HP[UnitType.WORKER]
+        )
+        resource_search_moves = tuple(
+            intent
+            for intent in resolution.selected
+            if intent.mission is UnitMission.RESOURCE_SEARCH
+            and intent.action is IntentAction.MOVE
+        )
+
+        def intent_metadata(intent: ActionIntent) -> dict[str, object]:
+            return dict(intent.metadata)
+
+        zero_information_moves = sum(
+            int(intent_metadata(intent).get("information_gain", 0)) <= 0
+            for intent in resource_search_moves
+        )
+        resource_search_ids = {worker_id for worker_id, _ in resource_searches}
+        dead_end_rejections = sum(
+            dict(row.intent.metadata).get("dead_end_rejected") is True
+            for row in resolution.rejected
+            if row.intent.actor_id in resource_search_ids
         )
         return {
             "workers": workers,
@@ -722,6 +752,7 @@ class DecisionTraceBuilder:
             "worker_bounds": {
                 "scout_radii": list(self.config.exploration_sector_radii),
                 "max_scout_radius": scout_limit,
+                "resource_frontier_search_max_radius": None,
                 "full_storage_staging": [
                     self.config.worker_full_storage_parking_min_radius,
                     staging_limit,
@@ -755,6 +786,28 @@ class DecisionTraceBuilder:
                     if angular_gaps
                     else None
                 ),
+                "resource_searchers": len(resource_searches),
+                "unbounded_frontier_targets": sum(
+                    lease.target is not None
+                    for _, lease in resource_searches
+                ),
+                "resource_search_zero_information_moves": zero_information_moves,
+                "resource_search_zero_information_rate": (
+                    round(
+                        zero_information_moves * 100 / len(resource_search_moves),
+                        2,
+                    )
+                    if resource_search_moves
+                    else 0.0
+                ),
+                "resource_search_two_step_reversals": sum(
+                    cycle_period(worker_id) == 2
+                    for worker_id, _ in resource_searches
+                ),
+                "resource_search_new_visibility": sum(
+                    lease.visible_gain for _, lease in resource_searches
+                ),
+                "worker_dead_end_rejections": dead_end_rejections,
             },
             "worker_home_guard_radii": list(
                 sorted(
@@ -974,6 +1027,48 @@ class DecisionTraceBuilder:
                 )
                 if world.friendly(worker_id) is not None
             ],
+            "resource_searches": [
+                {
+                    "worker_id": str(worker_id),
+                    "direction_slot": lease.direction_slot,
+                    "target": None if lease.target is None else list(lease.target),
+                    "target_core_distance": (
+                        None
+                        if world.core is None or lease.target is None
+                        else manhattan(lease.target, world.core.position)
+                    ),
+                    "waypoint": (
+                        None if lease.waypoint is None else list(lease.waypoint)
+                    ),
+                    "route_distance": lease.last_route_distance,
+                    "stalled_ticks": lease.stalled_ticks,
+                    "route_version": lease.route_version,
+                    "blocked_edge": (
+                        None
+                        if lease.blocked_edge is None
+                        else [list(cell) for cell in lease.blocked_edge]
+                    ),
+                    "backoff_until": lease.backoff_until,
+                    "information_gain": lease.information_gain,
+                    "visible_gain": lease.visible_gain,
+                    "overlap_cells": lease.overlap_cells,
+                    "cycle_period": cycle_period(worker_id),
+                    "action": (
+                        None
+                        if worker_id not in selected_by_actor
+                        else selected_by_actor[worker_id].action.value
+                    ),
+                    "reason": (
+                        None
+                        if worker_id not in selected_by_actor
+                        else selected_by_actor[worker_id].reason
+                    ),
+                }
+                for worker_id, lease in sorted(
+                    resource_searches,
+                    key=lambda item: item[0].bytes,
+                )
+            ],
             "resource_assignments": [
                 {
                     "worker_id": str(unit_id),
@@ -1007,7 +1102,11 @@ class DecisionTraceBuilder:
                 for unit_id, mission in sorted(
                     self.memory.unit_missions.items(), key=lambda item: item[0].bytes
                 )
-                if mission.mission in {UnitMission.HARVEST, UnitMission.EXPLORE}
+                if mission.mission in {
+                    UnitMission.HARVEST,
+                    UnitMission.RESOURCE_SEARCH,
+                    UnitMission.EXPLORE,
+                }
             ],
             "worker_task_progress": [
                 {

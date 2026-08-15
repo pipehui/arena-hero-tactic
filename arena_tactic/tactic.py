@@ -120,6 +120,17 @@ class BalancedTactic:
                     best_route_cost=None,
                     stalled_ticks=0,
                 )
+            search = self.memory.resource_search_leases.get(unit_id)
+            if search is not None:
+                self.memory.resource_search_leases[unit_id] = replace(
+                    search,
+                    target=None,
+                    waypoint=None,
+                    assigned_tick=receipt.tick,
+                    last_route_distance=None,
+                    stalled_ticks=0,
+                    route_version=search.route_version + 1,
+                )
             if self.memory.beacon_mission_actor_id == unit_id:
                 self.memory.beacon_mission_actor_id = None
                 self.memory.beacon_mission_target = None

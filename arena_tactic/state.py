@@ -22,6 +22,7 @@ from .models import (
     PeacefulFormationAssignment,
     RangerStanceLease,
     ResourceWorkOrder,
+    ResourceSearchLease,
     ScreeningContactDecision,
     WorkerTaskProgress,
     SquadRendezvousLease,
@@ -102,6 +103,9 @@ class TacticMemory:
     worker_disengage_leases: dict[UUID, WorkerDisengageLease] = field(default_factory=dict)
     worker_scout_states: dict[UUID, WorkerScoutState] = field(default_factory=dict)
     scout_return_route_leases: dict[UUID, ScoutReturnRouteLease] = field(
+        default_factory=dict
+    )
+    resource_search_leases: dict[UUID, ResourceSearchLease] = field(
         default_factory=dict
     )
     scout_assignment_last_rebalance_tick: int | None = None
@@ -264,6 +268,7 @@ class TacticMemory:
         self.worker_disengage_leases.clear()
         self.worker_scout_states.clear()
         self.scout_return_route_leases.clear()
+        self.resource_search_leases.clear()
         self.scout_assignment_last_rebalance_tick = None
         self.worker_task_progress.clear()
         self.worker_resource_backoff.clear()

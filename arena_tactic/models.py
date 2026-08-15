@@ -96,6 +96,7 @@ class UnitMission(str, Enum):
     COUNTER_SIEGE = "COUNTER_SIEGE"
     RAID = "RAID"
     RETURN_HOME = "RETURN_HOME"
+    RESOURCE_SEARCH = "RESOURCE_SEARCH"
     EXPLORE = "EXPLORE"
     PATROL = "PATROL"
     PRODUCTION = "PRODUCTION"
@@ -1141,6 +1142,32 @@ class ScoutReturnRouteLease:
     route_version: int = 0
     blocked_edge: tuple[Position, Position] | None = None
     backoff_until: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceSearchLease:
+    """Sticky, unbounded resource-frontier search owned by one empty Worker.
+
+    ``direction_slot`` is deliberately independent from the mature-stockpile
+    scout rings.  The target may be arbitrarily far from the Core, while the
+    optional waypoint lets bounded pathfinding make monotonic progress without
+    replacing the strategic frontier every Tick.
+    """
+
+    worker_id: UUID
+    direction_slot: int
+    target: Position | None
+    waypoint: Position | None
+    assigned_tick: int
+    last_position: Position
+    last_route_distance: int | None = None
+    stalled_ticks: int = 0
+    route_version: int = 0
+    blocked_edge: tuple[Position, Position] | None = None
+    backoff_until: int = 0
+    information_gain: int = 0
+    visible_gain: int = 0
+    overlap_cells: int = 0
 
 
 @dataclass(frozen=True, slots=True)

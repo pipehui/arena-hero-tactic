@@ -26,6 +26,7 @@ from .models import (
     RaidDistanceBand,
     RaidReconMission,
     ResourceWorkOrder,
+    ResourceSearchLease,
     SiegeApproachPlan,
     ThreatHeatCell,
     WorkerScoutPhase,
@@ -175,6 +176,32 @@ class ExplorationMemoryStore:
                 }
                 for worker_id, order in sorted(
                     memory.resource_work_orders.items(),
+                    key=lambda item: item[0].bytes,
+                )
+            ],
+            "resource_search_leases": [
+                {
+                    "worker_id": str(worker_id),
+                    "direction_slot": lease.direction_slot,
+                    "target": None if lease.target is None else list(lease.target),
+                    "waypoint": None if lease.waypoint is None else list(lease.waypoint),
+                    "assigned_tick": lease.assigned_tick,
+                    "last_position": list(lease.last_position),
+                    "last_route_distance": lease.last_route_distance,
+                    "stalled_ticks": lease.stalled_ticks,
+                    "route_version": lease.route_version,
+                    "blocked_edge": (
+                        None
+                        if lease.blocked_edge is None
+                        else [list(lease.blocked_edge[0]), list(lease.blocked_edge[1])]
+                    ),
+                    "backoff_until": lease.backoff_until,
+                    "information_gain": lease.information_gain,
+                    "visible_gain": lease.visible_gain,
+                    "overlap_cells": lease.overlap_cells,
+                }
+                for worker_id, lease in sorted(
+                    memory.resource_search_leases.items(),
                     key=lambda item: item[0].bytes,
                 )
             ],
@@ -525,6 +552,71 @@ class ExplorationMemoryStore:
                     failures=failures,
                 )
                 memory.resource_memory.setdefault(target, last_confirmed_tick)
+
+        if schema >= 19:
+            for raw in payload.get("resource_search_leases", []):
+                if not isinstance(raw, dict):
+                    continue
+                worker_id = _uuid(raw.get("worker_id"))
+                target = _position(raw.get("target"))
+                waypoint = _position(raw.get("waypoint"))
+                last_position = _position(raw.get("last_position"))
+                integer_fields = {
+                    key: raw.get(key, 0)
+                    for key in (
+                        "direction_slot",
+                        "assigned_tick",
+                        "stalled_ticks",
+                        "route_version",
+                        "backoff_until",
+                        "information_gain",
+                        "visible_gain",
+                        "overlap_cells",
+                    )
+                }
+                if (
+                    worker_id is None
+                    or last_position is None
+                    or any(
+                        not isinstance(value, int) or isinstance(value, bool)
+                        for value in integer_fields.values()
+                    )
+                    or integer_fields["direction_slot"] < 0
+                    or integer_fields["stalled_ticks"] < 0
+                    or integer_fields["route_version"] < 0
+                ):
+                    continue
+                last_route_distance = raw.get("last_route_distance")
+                if not isinstance(last_route_distance, int) or isinstance(
+                    last_route_distance, bool
+                ):
+                    last_route_distance = None
+                blocked_edge = None
+                raw_edge = raw.get("blocked_edge")
+                if isinstance(raw_edge, (list, tuple)) and len(raw_edge) == 2:
+                    edge_start = _position(raw_edge[0])
+                    edge_end = _position(raw_edge[1])
+                    if edge_start is not None and edge_end is not None:
+                        blocked_edge = edge_start, edge_end
+                memory.resource_search_leases[worker_id] = ResourceSearchLease(
+                    worker_id=worker_id,
+                    direction_slot=(
+                        integer_fields["direction_slot"]
+                        % self.config.resource_search_direction_slots
+                    ),
+                    target=target,
+                    waypoint=waypoint,
+                    assigned_tick=integer_fields["assigned_tick"],
+                    last_position=last_position,
+                    last_route_distance=last_route_distance,
+                    stalled_ticks=integer_fields["stalled_ticks"],
+                    route_version=integer_fields["route_version"],
+                    blocked_edge=blocked_edge,
+                    backoff_until=integer_fields["backoff_until"],
+                    information_gain=integer_fields["information_gain"],
+                    visible_gain=integer_fields["visible_gain"],
+                    overlap_cells=integer_fields["overlap_cells"],
+                )
 
         if schema >= 9:
             for raw in payload.get("threat_heat", []):
